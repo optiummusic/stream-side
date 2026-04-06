@@ -65,16 +65,10 @@ impl Encoder {
         let buf_size = (width * height * 4) as usize;
         free_tx.send(vec![0u8; buf_size]).unwrap();
         free_tx.send(vec![0u8; buf_size]).unwrap();
+        ffmpeg::init().unwrap();
+
 
         let worker = thread::spawn(move || {
-            // current_thread достаточно: у нас один поток, parallelism не нужен
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            ffmpeg::init().unwrap();
-
             let codec = codec::encoder::find_by_name("hevc_vaapi")
                 .expect("hevc_vaapi not found");
 
@@ -87,12 +81,15 @@ impl Encoder {
                 (*raw).time_base = AVRational { num: 1, den: 60 };
                 (*raw).pix_fmt   = AVPixelFormat::AV_PIX_FMT_VAAPI;
 
-                let br = 25_000_000i64;
+                let br = 5_000_000i64;
                 (*raw).bit_rate        = br;
-                (*raw).rc_max_rate     = br;
-                (*raw).rc_buffer_size  = (br / 10) as i32; // малый буфер = быстрая реакция
-                (*raw).refs            = 1;
-                (*raw).global_quality  = 20;
+                (*raw).max_b_frames = 0;
+                (*raw).delay = 0;
+
+                (*raw).flags &= !ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                let key = std::ffi::CString::new("extradata_idr").unwrap();
+                let val = std::ffi::CString::new("1").unwrap();
+                ffmpeg_next::ffi::av_opt_set((*raw).priv_data, key.as_ptr(), val.as_ptr(), 0);
             }
 
             let hw_frames_ref = unsafe {
@@ -102,7 +99,6 @@ impl Encoder {
 
             let mut opts = ffmpeg::Dictionary::new();
             opts.set("async_depth", "1");
-            opts.set("intra_refresh", "1");
             opts.set("low_delay_brc", "1");
 
             let mut encoder = enc_ctx
@@ -113,14 +109,14 @@ impl Encoder {
                 .unwrap();
 
             unsafe {
-                (*encoder.as_mut_ptr()).gop_size = 60;
+                (*encoder.as_mut_ptr()).gop_size = 20;
             }
 
             // Scaler BGRA → NV12
             let mut scaler = scaling::Context::get(
                 Pixel::BGRA, width, height,
                 Pixel::NV12, width, height,
-                scaling::Flags::FAST_BILINEAR,
+                scaling::Flags::BILINEAR,
             ).unwrap();
 
             ready_tx.send(()).unwrap();
@@ -129,45 +125,59 @@ impl Encoder {
             let frame_duration = std::time::Duration::from_micros(16_667); // ~60 fps
             let mut next_tick  = std::time::Instant::now();
 
+            let mut src_frame  = Video::new(Pixel::BGRA, width, height);
+            let mut nv12_frame = Video::new(Pixel::NV12, width, height);
+
+            let mut started = false;
             loop {
                 // Дренируем канал — берём только последний кадр, остальные возвращаем в пул
                 let mut last_bgra: Option<Vec<u8>> = None;
-                let mut received_any = false;
 
                 while let Ok(frame) = rx.try_recv() {
                     if let Some(old) = last_bgra.take() {
                         let _ = free_tx.send(old);
                     }
                     last_bgra = Some(frame);
-                    received_any = true;
                 }
 
                 if let Some(bgra) = last_bgra {
-                    if received_any {
-                        let mut src = Video::new(Pixel::BGRA, width, height);
-                        src.data_mut(0)[..bgra.len()].copy_from_slice(&bgra);
+                    src_frame.data_mut(0)[..bgra.len()].copy_from_slice(&bgra);
 
-                        let mut nv12 = Video::new(Pixel::NV12, width, height);
-                        scaler.run(&src, &mut nv12).unwrap();
-                        nv12.set_pts(Some(frame_idx));
-                        frame_idx += 1;
+                    // 3. Цветокоррекция (всё еще CPU, но без аллокаций контекста)
+                    scaler.run(&src_frame, &mut nv12_frame).unwrap();
+                    nv12_frame.set_pts(Some(frame_idx));
+                    
+                    unsafe {
+                        let mut hw_frame_raw = av_frame_alloc(); // Или Video::empty()
+                        if av_hwframe_get_buffer(hw_frames_ref, hw_frame_raw, 0) == 0 {
+            
+                            // Копируем NV12 в HW кадр
+                            av_hwframe_transfer_data(hw_frame_raw, nv12_frame.as_ptr(), 0);
+                            
+                            (*hw_frame_raw).pts = frame_idx;
 
-                        let mut hw_frame = Video::new(Pixel::VAAPI, width, height);
-                        unsafe {
-                            av_hwframe_get_buffer(hw_frames_ref, hw_frame.as_mut_ptr(), 0);
-                            av_hwframe_transfer_data(hw_frame.as_mut_ptr(), nv12.as_ptr(), 0);
-                            (*hw_frame.as_mut_ptr()).pts = frame_idx - 1;
-                        }
-
-                        encoder.send_frame(&hw_frame).unwrap();
-
-                        let mut pkt = ffmpeg::Packet::empty();
-                        while encoder.receive_packet(&mut pkt).is_ok() {
-                            if let Some(data) = pkt.data() {
-                                server.send(data.to_vec());
+                            if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame_raw) >= 0 {
+                                let mut pkt = ffmpeg::Packet::empty();
+                                while encoder.receive_packet(&mut pkt).is_ok() {
+                                    // ДОБАВИТЬ BYTES ВМЕСТО TO_VEC
+                                    let keyframe = pkt.is_key();
+                                    if !started {
+                                        if !keyframe {
+                                            continue;
+                                        }
+                                        started = true;
+                                        log::info!("[Encoder] Первый I-frame найден");
+                                    }
+                                    if let Some(data) = pkt.data() {
+                                        // Передаем флаг в сервер
+                                        server.send(data.to_vec(), keyframe);
+                                    }
+                                }
                             }
                         }
+                        av_frame_free(&mut hw_frame_raw);
                     }
+                    frame_idx += 1;
                     let _ = free_tx.send(bgra);
                 }
 

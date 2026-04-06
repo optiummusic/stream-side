@@ -4,22 +4,21 @@
 // Компилируется ТОЛЬКО при `--features desktop`.
 //
 // Поток исполнения:
-//   ┌────────────────────────────────────────────────────────┐
-//   │  main()                                                 │
-//   │    │                                                    │
-//   │    ├── thread::spawn → tokio RT → run_quic_receiver     │
-//   │    │       подключается к sender'у (QUIC-клиент)        │
-//   │    │       DesktopFfmpegBackend + mpsc::SyncSender       │
-//   │    │                                                    │
-//   │    └── EventLoop::run_app (winit, главный поток)        │
-//   │            RedrawRequested → try_recv → upload YUV      │
-//   │                           → wgpu render                 │
-//   └────────────────────────────────────────────────────────┘
+//   ┌─────────────────────────────────────────────────────┐
+//   │  main()                                              │
+//   │    │                                                 │
+//   │    ├── thread::spawn → tokio RT → run_quic_receiver  │
+//   │    │       (DesktopFfmpegBackend + mpsc::SyncSender) │
+//   │    │                                                 │
+//   │    └── EventLoop::run_app (winit, главный поток)     │
+//   │            RedrawRequested → try_recv → upload YUV  │
+//   │                           → wgpu render             │
+//   └─────────────────────────────────────────────────────┘
 
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::{mpsc, Arc, Mutex};
-use std::env;
+use std::net::ToSocketAddrs;
 
 use winit::{
     application::ApplicationHandler,
@@ -32,7 +31,7 @@ use stream_receiver::backend::{desktop::DesktopFfmpegBackend, VideoBackend, YuvF
 use stream_receiver::network::run_quic_receiver;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WGPU State
+// WGPU State (без изменений по сравнению с исходным кодом)
 // ─────────────────────────────────────────────────────────────────────────────
 struct WgpuState {
     surface:            wgpu::Surface<'static>,
@@ -86,12 +85,54 @@ impl WgpuState {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label:   Some("YUV Bind Group Layout"),
                 entries: &[
-                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                    wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                    wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                    wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                    wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                    wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -107,10 +148,10 @@ impl WgpuState {
                 label:  Some("Render Pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module:              &shader,
-                    entry_point:         Some("vs_main"),
-                    buffers:             &[],
-                    compilation_options: Default::default(),
+                    module:               &shader,
+                    entry_point:          Some("vs_main"),
+                    buffers:              &[],
+                    compilation_options:  Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module:              &shader,
@@ -132,12 +173,24 @@ impl WgpuState {
                     conservative:       false,
                 },
                 depth_stencil: None,
-                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multisample:   wgpu::MultisampleState {
+                    count:                     1,
+                    mask:                      !0,
+                    alpha_to_coverage_enabled: false,
+                },
                 multiview_mask: None,
                 cache:          None,
             });
 
-        Self { surface, device, queue, config, render_pipeline, bind_group_layout, textures: None }
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            render_pipeline,
+            bind_group_layout,
+            textures: None,
+        }
     }
 
     fn update_textures(&mut self, frame: &YuvFrame) {
@@ -153,18 +206,18 @@ impl WgpuState {
 
             let create_tex = |label, w, h| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
-                    label:           Some(label),
-                    size:            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count:    1,
-                    dimension:       wgpu::TextureDimension::D2,
-                    format:          wgpu::TextureFormat::R8Unorm,
-                    usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats:    &[],
+                    label:             Some(label),
+                    size:              wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count:   1,
+                    sample_count:      1,
+                    dimension:         wgpu::TextureDimension::D2,
+                    format:            wgpu::TextureFormat::R8Unorm,
+                    usage:             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats:      &[],
                 })
             };
 
-            let t_y = create_tex("Y", frame.width,     frame.height);
+            let t_y = create_tex("Y", frame.width, frame.height);
             let t_u = create_tex("U", frame.width / 2, frame.height / 2);
             let t_v = create_tex("V", frame.width / 2, frame.height / 2);
 
@@ -198,16 +251,16 @@ impl WgpuState {
             let write = |tex: &wgpu::Texture, data: &[u8], w, h, stride| {
                 self.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture:   tex,
-                        mip_level: 0,
-                        origin:    wgpu::Origin3d::ZERO,
-                        aspect:    wgpu::TextureAspect::All,
+                        texture:    tex,
+                        mip_level:  0,
+                        origin:     wgpu::Origin3d::ZERO,
+                        aspect:     wgpu::TextureAspect::All,
                     },
                     data,
                     wgpu::TexelCopyBufferLayout {
-                        offset:         0,
-                        bytes_per_row:  Some(stride),
-                        rows_per_image: Some(h),
+                        offset:          0,
+                        bytes_per_row:   Some(stride),
+                        rows_per_image:  Some(h),
                     },
                     wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 )
@@ -232,11 +285,11 @@ impl WgpuState {
             _ => return,
         };
 
-        let view    = surface_texture.texture.create_view(&Default::default());
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let view = surface_texture.texture.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &view,
@@ -247,10 +300,10 @@ impl WgpuState {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
-                occlusion_query_set:      None,
-                timestamp_writes:         None,
-                multiview_mask:           None,
+                depth_stencil_attachment:  None,
+                occlusion_query_set:       None,
+                timestamp_writes:          None,
+                multiview_mask:            None,
             });
 
             if let Some((_, _, _, bind_group)) = &self.textures {
@@ -260,7 +313,7 @@ impl WgpuState {
             }
         }
 
-        self.queue.submit(std::iter::once(enc.finish()));
+        self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
     }
 }
@@ -327,26 +380,25 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+    let args: Vec<String> = std::env::args().collect();
+    let input_addr = &args[1];
+    let addr = input_addr
+        .to_socket_addrs()
+        .expect("Failed to resolve domain")
+        .next() // Берем первый найденный IP
+        .ok_or("Could not find any IP for this domain")?;
 
-    let args: Vec<String> = env::args().collect();
-
-    // Адрес sender'а: первый аргумент или дефолт
-    let sender_addr: SocketAddr = args
-        .get(1)
-        .map(|s| s.as_str())
-        .unwrap_or("192.168.1.100:4433")
-        .parse()
-        .unwrap_or_else(|_| {
-            eprintln!("❌ Неверный адрес sender'а. Используем 192.168.1.100:4433");
-            "192.168.1.100:4433".parse().unwrap()
-        });
-
-    eprintln!("🔌 Receiver подключается к sender'у на {}", sender_addr);
-
-    // Канал между сетевым потоком и рендер-потоком (размер 3 = low-latency)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+    // Канал между сетевым потоком и рендер-потоком.
+    // Размер 3: если рендер отстаёт, старые кадры выбрасываются (low-latency!).
     let (tx, rx) = mpsc::sync_channel::<YuvFrame>(3);
 
-    let backend       = Arc::new(Mutex::new(DesktopFfmpegBackend::new()?));
+    // Инициализируем бекенд
+    let backend = DesktopFfmpegBackend::new()?;
+    let backend = Arc::new(Mutex::new(backend));
+
     let backend_clone = backend.clone();
     let tx_clone      = tx.clone();
 
@@ -361,14 +413,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                // run_quic_receiver никогда не возвращается (reconnect loop внутри)
-                if let Err(e) = run_quic_receiver(backend_clone, sender_addr, Some(tx_clone)).await {
-                    eprintln!("❌ QUIC receiver fatal error: {e}");
-                }
+                // На десктопе передаём Some(tx) — YUV-кадры идут в рендер-поток
+                run_quic_receiver(backend_clone, addr, Some(tx_clone)).await;
             }));
         })?;
 
-    // Рендер-поток (главный поток — требование winit)
+    // Рендер-поток (главный поток, требование winit)
     let event_loop = EventLoop::new()?;
     let mut app = App {
         state:           None,

@@ -25,21 +25,20 @@
 //     получают только Arc::clone() — O(1), без копирования данных.
 //   - watch вместо broadcast: watch автоматически выбрасывает старые кадры,
 //     если клиент не успевает — именно то что нужно для low-latency видео.
-
+use tokio::sync::broadcast;
 use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
+use bytes::Bytes;
 use std::sync::Arc;
 use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::sync::watch;
-use common::VideoPacket;
+use common::{DatagramChunk, VideoPacket};
 use std::time::{SystemTime, UNIX_EPOCH};
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct QuicServer {
     /// Отправитель закодированных HEVC-кадров.
     /// Используется из синхронного потока энкодера через try_send.
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<(Vec<u8>, bool)>,
 }
 
 impl QuicServer {
@@ -47,43 +46,37 @@ impl QuicServer {
     ///
     /// Возвращает немедленно — все async-задачи работают в фоне.
     pub async fn new(listen_addr: SocketAddr) -> Self {
-        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, bool)>(4);
 
-        // watch несёт уже сериализованный + length-prefixed пакет
-        let (watch_tx, watch_rx) = watch::channel::<Option<Arc<Vec<u8>>>>(None);
+        let (broadcast_tx, _) = broadcast::channel::<Arc<(u64, Bytes, bool)>>(32);
+        let server_broadcast_tx = broadcast_tx.clone();
 
         // ── Задача сериализации ──────────────────────────────────────────────
         //
         // Сериализуем VideoPacket ОДИН РАЗ для всех клиентов.
         // Результат (length-prefix + postcard-байты) упаковывается в Arc,
         // чтобы клиентские таски могли дёшево его клонировать.
+        // ── Задача сериализации ──────────────────────────────────────────────
         tokio::spawn(async move {
             let mut frame_id = 0u64;
-
-            while let Some(payload) = frame_rx.recv().await {
+ 
+            while let Some((payload, is_key)) = frame_rx.recv().await {
                 frame_id += 1;
                 let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
                 let packet = VideoPacket {
+                    timestamp,
                     frame_id,
                     payload,
-                    timestamp,
+                    is_key,
                 };
 
-                let encoded = match postcard::to_allocvec(&packet) {
-                    Ok(b)  => b,
-                    Err(e) => { eprintln!("❌ Serialization error: {e}"); continue; }
-                };
-
-                // length-prefix (4 байта LE) + тело
-                let mut msg = Vec::with_capacity(4 + encoded.len());
-                msg.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                msg.extend_from_slice(&encoded);
-
-                // watch автоматически вытеснит старый кадр если клиент тупит
-                let _ = watch_tx.send(Some(Arc::new(msg)));
+                if let Ok(bin) = postcard::to_allocvec(&packet) {
+                    // Рассылаем данные ВМЕСТЕ с флагом ключевого кадра
+                    let _ = server_broadcast_tx.send(Arc::new((frame_id, Bytes::from(bin), is_key)));
+                }
             }
         });
 
@@ -93,7 +86,7 @@ impl QuicServer {
 
         tokio::spawn(async move {
             while let Some(connecting) = endpoint.accept().await {
-                let rx = watch_rx.clone();
+                let client_rx = broadcast_tx.subscribe();
 
                 tokio::spawn(async move {
                     match connecting.await {
@@ -103,7 +96,7 @@ impl QuicServer {
 
                             // Открываем ОДИН персистентный стрим для этого клиента
                             match conn.open_uni().await {
-                                Ok(stream) => send_to_client(stream, rx).await,
+                                Ok(stream) => send_datagrams_to_client(conn, client_rx).await,
                                 Err(e)     => eprintln!("❌ open_uni для {remote}: {e}"),
                             }
 
@@ -122,9 +115,9 @@ impl QuicServer {
     ///
     /// Вызывается из синхронного потока энкодера.
     /// Если очередь заполнена — кадр **молча выбрасывается** (backpressure).
-    pub fn send(&self, data: Vec<u8>) {
+    pub fn send(&self, data: Vec<u8>, is_key: bool) {
         use tokio::sync::mpsc::error::TrySendError;
-        match self.tx.try_send(data) {
+        match self.tx.try_send((data, is_key)) {
             Ok(_) => {}
             Err(TrySendError::Full(_))   => { /* сеть не успевает — дропаем */ }
             Err(TrySendError::Closed(_)) => eprintln!("❌ QuicServer channel closed"),
@@ -132,29 +125,60 @@ impl QuicServer {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Обслуживание одного клиента
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Читает кадры из watch и пишет их в персистентный SendStream.
-///
-/// Функция возвращается когда клиент отключается или watch-канал закрыт.
-async fn send_to_client(
-    mut stream: quinn::SendStream,
-    mut rx:     watch::Receiver<Option<Arc<Vec<u8>>>>,
+async fn send_datagrams_to_client(
+    conn: quinn::Connection,
+    mut rx: broadcast::Receiver<Arc<(u64, Bytes, bool)>>,
 ) {
+    let mut started = false;
     loop {
-        // Ждём изменения (нового кадра)
-        if rx.changed().await.is_err() {
-            break; // watch::Sender дропнут — сервер завершил работу
+        let msg = match rx.recv().await {
+            Ok(m) => m,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("⚠️ Клиент отстал на {n} кадров, картинка может рассыпаться");
+                // Если клиент отстал, сбрасываем started, чтобы дождаться нового I-кадра
+                // и не пытаться декодировать битые P-кадры.
+                started = false; 
+                continue;
+            }
+            Err(_) => break, 
+        };
+        let (frame_id, ref data, is_key) = *msg;
+        if !started {
+            if !is_key {
+                // Игнорируем P-кадры, пока не придет первый I-кадр
+                continue;
+            }
+            // Как только пришел I-кадр, разрешаем отправку всех последующих кадров
+            started = true;
+            eprintln!("🚀 Отправка данных клиенту {} началась с I-frame #{}", conn.remote_address(), frame_id);
         }
-
-        // Arc::clone() — O(1), данные не копируются
-        let msg = rx.borrow_and_update().clone();
-
-        if let Some(msg) = msg {
-            if stream.write_all(&msg).await.is_err() {
-                break; // клиент отключился
+        // Определяем максимальный размер полезных данных в одном датаграмме.
+        // max_datagram_size() учитывает согласованный MTU и QUIC-оверхед.
+        // Вычитаем ~20 байт для заголовка DatagramChunk (postcard varint).
+        let max_chunk_data = conn
+            .max_datagram_size()
+            .unwrap_or(1200)
+            .saturating_sub(50);
+ 
+        let chunks: Vec<&[u8]> = data.chunks(max_chunk_data).collect();
+        let total_chunks = chunks.len() as u16;
+ 
+        for (idx, chunk_data) in chunks.iter().enumerate() {
+            let dgram = DatagramChunk {
+                frame_id,
+                chunk_idx:    idx as u16,
+                total_chunks,
+                data:         chunk_data.to_vec(),
+            };
+ 
+            if let Ok(bytes) = postcard::to_allocvec(&dgram) {
+                if let Err(e) = conn.send_datagram(Bytes::from(bytes)) {
+                    // Если буфер ОС переполнен, Quinn может вернуть ошибку.
+                    // В real-time мы просто игнорируем этот чанк — пусть дропается.
+                    if !matches!(e, quinn::SendDatagramError::TooLarge) {
+                        return; // Фатальная ошибка связи
+                    }
+                }
             }
         }
     }
@@ -184,10 +208,7 @@ fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
     let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
 
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
-    // Разрешаем миграцию путей (полезно для Wi-Fi/Tailscale)
-    transport.keep_alive_interval(Some(Duration::from_secs(3)));
-    
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     server_cfg.transport_config(Arc::new(transport));
 
     Endpoint::server(server_cfg, addr).expect("Failed to bind QUIC server")

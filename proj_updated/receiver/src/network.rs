@@ -1,33 +1,40 @@
-// src/network.rs
-//
-// Кроссплатформенный сетевой цикл приёма видеопотока.
-//
-// Receiver теперь — QUIC-КЛИЕНТ: подключается к sender'у (серверу).
-//
-// Поток исполнения:
-//
-//   run_quic_receiver(sender_addr)
-//       │
-//       ├── reconnect loop
-//       │       │
-//       │       ├── endpoint.connect(sender_addr) → connection
-//       │       │
-//       │       └── connection.accept_uni() → RecvStream
-//       │               │
-//       │               └── handle_stream (читает пакеты в цикле до закрытия стрима)
-//       │                       │
-//       │                       ├── backend.push_encoded(payload)
-//       │                       └── backend.poll_output() → frame_tx или Surface
-//       │
-//       └── при потере соединения — пауза 2с → reconnect
+//! QUIC receiver — client-side transport loop.
+//!
+//! # Architecture
+//!
+//! ```text
+//! run_quic_receiver(sender_addr)
+//!     │
+//!     ├── build_quic_client_endpoint()   ← built ONCE, reused across reconnects
+//!     │
+//!     └── reconnect loop
+//!             │
+//!             ├── endpoint.connect(sender_addr)
+//!             │
+//!             └── receive_datagrams(conn, backend, frame_tx)
+//!                     │
+//!                     ├── conn.read_datagram() → DatagramChunk::decode (zero-copy)
+//!                     ├── ReassemblyBuf per frame_id (HashMap)
+//!                     ├── on complete → postcard::from_bytes → VideoPacket
+//!                     └── backend.push_encoded() + backend.poll_output()
+//! ```
+//!
+//! # Reconnect behaviour
+//! If the connection drops, the loop sleeps 2 s and reconnects automatically.
+//! The QUIC `Endpoint` itself is created once and reused — TLS session tickets
+//! are cached by rustls, making subsequent connections cheaper (0-RTT eligible).
 
-use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    error::Error,
+    net::SocketAddr,
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
+};
 
-use common::VideoPacket;
-use quinn::{ClientConfig, Endpoint};
+use bytes::Bytes;
+use common::{DatagramChunk, VideoPacket};
+use quinn::Endpoint;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
@@ -35,16 +42,68 @@ use rustls::DigitallySignedStruct;
 use crate::backend::{FrameOutput, VideoBackend};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Точка входа
+// Datagram reassembly buffer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Запустить QUIC-клиент и подключиться к sender'у на `sender_addr`.
+struct ReassemblyBuf {
+    /// Slot per chunk index; `None` until the chunk arrives.
+    chunks:   Vec<Option<Bytes>>,
+    received: u16,
+    total:    u16,
+}
+
+impl ReassemblyBuf {
+    fn new(total_chunks: u16) -> Self {
+        Self {
+            chunks:   vec![None; total_chunks as usize],
+            received: 0,
+            total:    total_chunks,
+        }
+    }
+
+    /// Insert a chunk.  Returns `true` when all chunks have arrived.
+    fn insert(&mut self, idx: u16, data: Bytes) -> bool {
+        let slot = &mut self.chunks[idx as usize];
+        if slot.is_none() {
+            *slot = Some(data);
+            self.received += 1;
+        }
+        self.received == self.total
+    }
+
+    /// Concatenate all chunks into a contiguous buffer.
+    ///
+    /// Must only be called when `insert` returned `true`.
+    fn assemble(self) -> Vec<u8> {
+        let total_len: usize = self.chunks.iter()
+            .filter_map(|c| c.as_ref())
+            .map(|b| b.len())
+            .sum();
+
+        let mut out = Vec::with_capacity(total_len);
+        for chunk in self.chunks {
+            out.extend_from_slice(&chunk.expect("assemble: incomplete chunk"));
+        }
+        out
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start the QUIC receiver and connect to the sender at `sender_addr`.
 ///
-/// При потере соединения автоматически переподключается.
+/// Automatically reconnects on connection loss.
 ///
-/// - `backend`   — платформо-специфичный декодер.
-/// - `sender_addr` — адрес QUIC-сервера (sender): "192.168.1.5:4433"
-/// - `frame_tx`  — `Some(tx)` на десктопе, `None` на Android.
+/// - `backend`     — platform-specific HEVC decoder + renderer.
+/// - `sender_addr` — address of the QUIC server (sender): `"192.168.1.5:4433"`.
+/// - `frame_tx`    — `Some(tx)` on desktop (YUV frames → render thread),
+///                   `None` on Android (frames decoded directly to Surface).
+///
+/// # Errors
+/// Returns only if endpoint construction fails (TLS config error, port bind
+/// failure).  Connection errors and decode errors are logged and retried.
 pub async fn run_quic_receiver<B: VideoBackend>(
     backend:     Arc<Mutex<B>>,
     sender_addr: SocketAddr,
@@ -52,119 +111,146 @@ pub async fn run_quic_receiver<B: VideoBackend>(
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
+    // Build the endpoint ONCE.  Reusing it across reconnects preserves the
+    // TLS session cache, which allows 0-RTT on subsequent connections and
+    // avoids re-parsing the certificate on every attempt.
+    let endpoint = build_quic_client_endpoint()?;
+
     loop {
-        eprintln!("🔌 Подключаемся к sender'у {}...", sender_addr);
+        log::info!("[QUIC] Connecting to {sender_addr}...");
 
-        let endpoint = match build_quic_client_endpoint() {
-            Ok(ep) => ep,
-            Err(e) => {
-                eprintln!("❌ Не удалось создать QUIC endpoint: {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        let connection = match endpoint.connect(sender_addr, "localhost") {
-            Ok(connecting) => match connecting.await {
-                Ok(conn) => conn,
-                Err(e)   => {
-                    eprintln!("❌ Ошибка подключения к {sender_addr}: {e}");
+        let conn = match endpoint.connect(sender_addr, "localhost") {
+            Ok(c) => match c.await {
+                Ok(c)  => c,
+                Err(e) => {
+                    log::warn!("[QUIC] Connect failed: {e}");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             },
             Err(e) => {
-                eprintln!("❌ connect() error: {e}");
+                log::warn!("[QUIC] endpoint.connect error: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
 
-        eprintln!("✅ Подключились к {}!", connection.remote_address());
-
-        // Sender открывает uni-стримы и посылает в них данные.
-        // Нам нужно их принимать.
-        while let Ok(mut stream) = connection.accept_uni().await {
-            let backend_clone  = backend.clone();
-            let frame_tx_clone = frame_tx.clone();
-
-            tokio::spawn(async move {
-                handle_stream(&mut stream, backend_clone, frame_tx_clone).await;
-            });
-        }
-
-        eprintln!("⚠️  Соединение разорвано, переподключаемся через 2с...");
+        log::info!("[QUIC] Connected to {}", conn.remote_address());
+        receive_datagrams(conn, backend.clone(), frame_tx.clone()).await;
+        log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Обработка одного QUIC-стрима
+// Per-connection datagram loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn handle_stream<B: VideoBackend>(
-    stream:   &mut quinn::RecvStream,
+async fn receive_datagrams<B: VideoBackend>(
+    conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
     frame_tx: Option<mpsc::SyncSender<crate::backend::YuvFrame>>,
 ) {
-    let mut len_buf = [0u8; 4];
+    // Hold at most MAX_BUFFERED_FRAMES incomplete frames simultaneously.
+    // Older frames are evicted when this limit is reached or when a newer
+    // frame_id implies their chunks were lost.
+    const MAX_BUFFERED_FRAMES: usize = 8;
+
+    let mut reassembly: HashMap<u64, ReassemblyBuf> = HashMap::new();
 
     loop {
-        // ── Читаем 4-байтный length-prefix ───────────────────────────────
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            break; // стрим закрыт
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-
-        if len == 0 || len > 10_000_000 {
-            log::warn!("[QUIC] Suspicious packet length: {len}");
-            break;
-        }
-
-        // ── Читаем тело пакета ────────────────────────────────────────────
-        let mut buf = vec![0u8; len];
-        if stream.read_exact(&mut buf).await.is_err() {
-            break;
-        }
-
-        // ── Десериализация через postcard ─────────────────────────────────
-        let packet: VideoPacket = match postcard::from_bytes(&buf) {
-            Ok(p)  => p,
+        let raw: Bytes = match conn.read_datagram().await {
+            Ok(b)  => b,
             Err(e) => {
-                log::error!("[QUIC] Deserialization error: {e}");
+                log::info!("[QUIC] read_datagram: {e}");
+                break;
+            }
+        };
+
+        // ── Zero-copy decode ─────────────────────────────────────────────────
+        let chunk = match DatagramChunk::decode(raw) {
+            Some(c) => c,
+            None    => {
+                log::warn!("[QUIC] Datagram too short, discarding");
                 continue;
             }
         };
 
-        // Логируем задержку каждые 60 кадров
-        if let Ok(elapsed) = packet.send_time.elapsed() {
-            if packet.frame_id % 60 == 0 {
-                log::info!(
-                    "Frame #{} | latency={}ms | size={}KB",
-                    packet.frame_id,
-                    elapsed.as_millis(),
-                    packet.payload.len() / 1024,
-                );
+        let frame_id = chunk.frame_id;
+
+        // ── Stale-frame eviction ─────────────────────────────────────────────
+        //
+        // Any buffered frame with id < (frame_id - MAX_BUFFERED_FRAMES) can
+        // never be completed: its remaining chunks are gone.  Evict eagerly to
+        // bound memory usage and avoid delivering P-frames without their IDR.
+        reassembly.retain(|&id, _| {
+            id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64)
+        });
+
+        // Hard cap: evict the oldest entry if the map would overflow.
+        if reassembly.len() >= MAX_BUFFERED_FRAMES {
+            if let Some(&oldest) = reassembly.keys().min() {
+                reassembly.remove(&oldest);
+                log::debug!("[Reassembly] Evicted stale frame #{oldest}");
             }
         }
 
-        // ── Передаём payload в декодер ────────────────────────────────────
+        // ── Guard against malformed headers ──────────────────────────────────
+        let buf = reassembly
+            .entry(frame_id)
+            .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks));
+
+        if chunk.chunk_idx >= buf.total || chunk.total_chunks != buf.total {
+            log::warn!(
+                "[Reassembly] Bad chunk {}/{} for frame #{frame_id}",
+                chunk.chunk_idx, chunk.total_chunks,
+            );
+            continue;
+        }
+
+        // ── Insert; decode when complete ─────────────────────────────────────
+        if !buf.insert(chunk.chunk_idx, chunk.data) {
+            continue; // waiting for more chunks
+        }
+
+        let serialised = reassembly.remove(&frame_id).unwrap().assemble();
+
+        let packet: VideoPacket = match postcard::from_bytes(&serialised) {
+            Ok(p)  => p,
+            Err(e) => {
+                log::error!("[Reassembly] Deserialise frame #{frame_id}: {e}");
+                continue;
+            }
+        };
+
+        // ── Latency measurement (sampled at every 100th frame) ────────────────
+        if packet.frame_id % 100 == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let latency_ms = now.saturating_sub(packet.timestamp);
+            log::info!("[Latency] Frame #{} | {latency_ms} ms", packet.frame_id);
+        }
+
+        // ── Push to decoder ───────────────────────────────────────────────────
         {
             let mut b = backend.lock().unwrap();
 
             match b.push_encoded(&packet.payload, packet.frame_id) {
                 Ok(()) => {}
                 Err(crate::backend::BackendError::BufferFull) => {
-                    log::warn!("[Decoder] Buffer full, dropping frame #{}", packet.frame_id);
+                    log::debug!("[Decoder] Buffer full, dropping frame #{}", packet.frame_id);
                     continue;
                 }
                 Err(e) => {
-                    log::error!("[Decoder] push_encoded error: {e}");
+                    log::error!("[Decoder] push_encoded: {e}");
                     continue;
                 }
             }
 
-            // ── Дренируем выходную очередь декодера ──────────────────────
+            // Drain the decoder output queue.
+            // On Android this is mandatory — it releases MediaCodec buffers.
             loop {
                 match b.poll_output() {
                     Ok(FrameOutput::Yuv(frame)) => {
@@ -176,12 +262,12 @@ async fn handle_stream<B: VideoBackend>(
                     Ok(FrameOutput::Pending) | Err(_) => break,
                 }
             }
-        } // мьютекс отпущен
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUIC client endpoint (skip-verify для LAN / self-signed)
+// Client endpoint construction
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
@@ -196,16 +282,38 @@ fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
     crypto.alpn_protocols = vec![b"video-stream".to_vec()];
 
     let quic_crypto = QuicClientConfig::try_from(crypto)?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(ClientConfig::new(Arc::new(quic_crypto)));
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
+    // ── Transport — mirror the server settings for symmetrical behaviour ──────
+    let mut t = quinn::TransportConfig::default();
+
+    t.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
+
+    // Match the server's initial MTU probe so the first handshake uses the
+    // optimal path MTU immediately rather than starting at 1200.
+    t.initial_mtu(1400);
+
+    // Keep-alive: same period as server so both sides detect dead connections
+    // within a consistent window.
+    t.keep_alive_interval(Some(Duration::from_millis(500)));
+
+    t.max_idle_timeout(Some(
+        Duration::from_secs(8)
+            .try_into()
+            .expect("idle timeout"),
+    ));
+
+    client_cfg.transport_config(Arc::new(t));
+
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
 }
 
-use std::sync::Arc;
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS skip-verify (LAN / self-signed, NOT for production over untrusted networks)
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// TLS-верификатор, принимающий любые сертификаты.
-/// Используется только в разработке / LAN!
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -239,3 +347,5 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             .supported_schemes()
     }
 }
+
+use std::sync::Arc;
