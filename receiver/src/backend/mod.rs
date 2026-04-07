@@ -16,7 +16,7 @@
 // Трейт VideoBackend скрывает эту фундаментальную разницу.
 
 use std::fmt;
-
+use common::FrameTrace;
 // ─────────────────────────────────────────
 // Типы ошибок
 // ─────────────────────────────────────────
@@ -54,6 +54,9 @@ impl std::error::Error for BackendError {}
 /// Используется ТОЛЬКО десктопным бекендом —
 /// на Android кадры уходят прямо в Surface и в Rust не попадают.
 pub struct YuvFrame {
+    pub frame_id: u64,
+    pub trace:    FrameTrace,
+
     pub width:    u32,
     pub height:   u32,
     // Три раздельных плоскости — именно этого ждёт наш WGSL-шейдер
@@ -118,7 +121,7 @@ pub trait VideoBackend: Send + 'static {
     ///
     /// На десктопе: передаёт пакет в ffmpeg-декодер.
     /// На Android:  копирует данные во входной буфер AMediaCodec.
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64) -> Result<(), BackendError>;
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>,) -> Result<(), BackendError>;
 
     /// Получить один декодированный кадр из выходной очереди (если готов).
     ///

@@ -42,6 +42,8 @@ use pipewire::{
 use pw::properties::properties;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::encode::EncodedFrame;
+
 use super::SenderError;
 use super::super::encode::Encoder;
 
@@ -76,7 +78,7 @@ impl super::VideoSender for LinuxPipeWireSender {
 
     async fn run(
         self,
-        sink: mpsc::Sender<(Vec<u8>, bool)>,
+        sink: mpsc::Sender<EncodedFrame>,
     ) -> Result<(), SenderError> {
         // 1. Negotiate the XDG Portal screencast session.
         let (node_id, raw_fd) = run_portal()
@@ -148,7 +150,7 @@ fn run_pipewire(
     raw_fd:  i32,
     width:   u32,
     height:  u32,
-    sink:    mpsc::Sender<(Vec<u8>, bool)>,
+    sink:    mpsc::Sender<EncodedFrame>,
 ) -> Result<(), SenderError> {
     pw::init();
 
@@ -176,18 +178,19 @@ fn run_pipewire(
     let mut fps_counter = 0u32;
     let mut fps_tick    = std::time::Instant::now();
 
+    use common::FrameTrace;
     let _listener = stream
         .add_local_listener::<()>()
         .process(move |stream, _| {
             let raw = unsafe { stream.dequeue_raw_buffer() };
             if raw.is_null() { return; }
-
+            let capture_us = FrameTrace::now_us();
             unsafe {
                 crate::encode::process_frame_from_pw_buffer(raw, |src| {
                     let enc = encoder.get_or_insert_with(|| {
                         Encoder::new(width, height, sink.clone())
                     });
-                    enc.encode(src);
+                    enc.encode(src, capture_us);
                     fps_counter += 1;
                 });
 

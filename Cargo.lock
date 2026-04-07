@@ -2731,6 +2731,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "common",
+ "env_logger",
  "ffmpeg-next",
  "libc",
  "log",

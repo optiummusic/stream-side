@@ -1,60 +1,73 @@
-// src/network.rs
-//
-// Кроссплатформенный сетевой цикл приёма видеопотока.
-//
-// Receiver теперь — QUIC-КЛИЕНТ: подключается к sender'у (серверу).
-//
-// Поток исполнения:
-//
-//   run_quic_receiver(sender_addr)
-//       │
-//       ├── reconnect loop
-//       │       │
-//       │       ├── endpoint.connect(sender_addr) → connection
-//       │       │
-//       │       └── connection.accept_uni() → RecvStream
-//       │               │
-//       │               └── handle_stream (читает пакеты в цикле до закрытия стрима)
-//       │                       │
-//       │                       ├── backend.push_encoded(payload)
-//       │                       └── backend.poll_output() → frame_tx или Surface
-//       │
-//       └── при потере соединения — пауза 2с → reconnect
+//! QUIC receiver — client-side transport loop.
+//!
+//! # Architecture
+//!
+//! ```text
+//! run_quic_receiver(sender_addr)
+//!     │
+//!     ├── build_quic_client_endpoint()   ← built ONCE, reused across reconnects
+//!     │
+//!     └── reconnect loop
+//!             │
+//!             ├── endpoint.connect(sender_addr)
+//!             │
+//!             └── receive_datagrams(conn, backend, frame_tx)
+//!                     │
+//!                     ├── conn.read_datagram() → DatagramChunk::decode (zero-copy)
+//!                     ├── ReassemblyBuf per frame_id (HashMap)
+//!                     ├── on complete → postcard::from_bytes → VideoPacket
+//!                     └── backend.push_encoded() + backend.poll_output()
+//! ```
+//!
+//! # Reconnect behaviour
+//! If the connection drops, the loop sleeps 2 s and reconnects automatically.
+//! The QUIC `Endpoint` itself is created once and reused — TLS session tickets
+//! are cached by rustls, making subsequent connections cheaper (0-RTT eligible).
 
-use std::collections::HashMap;
-use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    error::Error,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use common::{DatagramChunk, VideoPacket};
-use quinn::{Endpoint};
+use tokio::sync::mpsc;
+use bytes::Bytes;
+use common::{DatagramChunk, VideoPacket, FrameTrace};
+use quinn::Endpoint;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
-use tokio::time::timeout;
-use bytes::Bytes;
 
 use crate::backend::{FrameOutput, VideoBackend};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Datagram reassembly buffer
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct ReassemblyBuf {
-    chunks:   Vec<Option<Vec<u8>>>, // слоты по chunk_idx
+    /// Slot per chunk index; `None` until the chunk arrives.
+    chunks:   Vec<Option<Bytes>>,
     received: u16,
     total:    u16,
+    is_key:       bool,   // ← НОВОЕ: чтобы не эвиктировать IDR
+    first_us:     u64,
 }
- 
+
 impl ReassemblyBuf {
-    fn new(total_chunks: u16) -> Self {
+    fn new(total_chunks: u16, is_key: bool) -> Self {
         Self {
             chunks:   vec![None; total_chunks as usize],
             received: 0,
             total:    total_chunks,
+            is_key,
+            first_us: FrameTrace::now_us(),
         }
     }
- 
-    /// Вставить чанк. Возвращает true если кадр собран полностью.
-    fn insert(&mut self, idx: u16, data: Vec<u8>) -> bool {
+
+    /// Insert a chunk.  Returns `true` when all chunks have arrived.
+    fn insert(&mut self, idx: u16, data: Bytes) -> bool {
         let slot = &mut self.chunks[idx as usize];
         if slot.is_none() {
             *slot = Some(data);
@@ -62,191 +75,205 @@ impl ReassemblyBuf {
         }
         self.received == self.total
     }
- 
-    /// Склеить все чанки в единый буфер (только после insert вернул true).
+
+    /// Concatenate all chunks into a contiguous buffer.
+    ///
+    /// Must only be called when `insert` returned `true`.
     fn assemble(self) -> Vec<u8> {
-        self.chunks
-            .into_iter()
-            .map(|c| c.expect("Logic error: assembling incomplete frame")) // Тут должен быть Some
-            .flatten()
-            .collect()
+        let total_len: usize = self.chunks.iter()
+            .filter_map(|c| c.as_ref())
+            .map(|b| b.len())
+            .sum();
+
+        let mut out = Vec::with_capacity(total_len);
+        for chunk in self.chunks {
+            out.extend_from_slice(&chunk.expect("assemble: incomplete chunk"));
+        }
+        out
     }
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Точка входа
+// Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Запустить QUIC-клиент и подключиться к sender'у на `sender_addr`.
+/// Start the QUIC receiver and connect to the sender at `sender_addr`.
 ///
-/// При потере соединения автоматически переподключается.
+/// Automatically reconnects on connection loss.
 ///
-/// - `backend`   — платформо-специфичный декодер.
-/// - `sender_addr` — адрес QUIC-сервера (sender): "192.168.1.5:4433"
-/// - `frame_tx`  — `Some(tx)` на десктопе, `None` на Android.
+/// - `backend`     — platform-specific HEVC decoder + renderer.
+/// - `sender_addr` — address of the QUIC server (sender): `"192.168.1.5:4433"`.
+/// - `frame_tx`    — `Some(tx)` on desktop (YUV frames → render thread),
+///                   `None` on Android (frames decoded directly to Surface).
+///
+/// # Errors
+/// Returns only if endpoint construction fails (TLS config error, port bind
+/// failure).  Connection errors and decode errors are logged and retried.
 pub async fn run_quic_receiver<B: VideoBackend>(
     backend:     Arc<Mutex<B>>,
     sender_addr: SocketAddr,
-    frame_tx:    Option<mpsc::SyncSender<crate::backend::YuvFrame>>,
+    frame_tx:    Option<mpsc::Sender<crate::backend::YuvFrame>>,
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
- 
+
+    // Build the endpoint ONCE.  Reusing it across reconnects preserves the
+    // TLS session cache, which allows 0-RTT on subsequent connections and
+    // avoids re-parsing the certificate on every attempt.
+    let endpoint = build_quic_client_endpoint()?;
     loop {
-        eprintln!("🔌 Подключаемся к {}...", sender_addr);
- 
-        let endpoint = match build_quic_client_endpoint() {
-            Ok(ep) => ep,
-            Err(e) => {
-                eprintln!("❌ Endpoint error: {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
- 
+        log::info!("[QUIC] Connecting to {sender_addr}...");
+
         let conn = match endpoint.connect(sender_addr, "localhost") {
             Ok(c) => match c.await {
                 Ok(c)  => c,
                 Err(e) => {
-                    eprintln!("❌ Connect failed: {e}");
+                    log::warn!("[QUIC] Connect failed: {e}");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             },
             Err(e) => {
-                eprintln!("❌ connect() error: {e}");
+                log::warn!("[QUIC] endpoint.connect error: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
- 
-        eprintln!("✅ Подключились к {}!", conn.remote_address());
- 
+
+        log::info!("[QUIC] Connected to {}", conn.remote_address());
+        
         receive_datagrams(conn, backend.clone(), frame_tx.clone()).await;
- 
-        eprintln!("⚠️  Соединение разорвано, переподключаемся через 2с...");
+        log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
+
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Обработка одного QUIC-стрима
+// Per-connection datagram loop
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn receive_datagrams<B: VideoBackend>(
     conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
-    frame_tx: Option<mpsc::SyncSender<crate::backend::YuvFrame>>,
+    frame_tx: Option<mpsc::Sender<crate::backend::YuvFrame>>,
 ) {
-    // HashMap<frame_id → буфер сборки>
-    // Держим не более MAX_BUFFERED_FRAMES кадров одновременно.
-    // Если получаем кадр с frame_id намного впереди — старые выбрасываем.
+    let mut waiting_for_key = false;
+    let mut expected_frame_id: Option<u64> = None;
     const MAX_BUFFERED_FRAMES: usize = 8;
- 
+
     let mut reassembly: HashMap<u64, ReassemblyBuf> = HashMap::new();
- 
+
     loop {
-        // read_datagram() — неблокирующий await, возвращает целый датаграмм
-        let bytes: Bytes = match conn.read_datagram().await {
+        let raw: Bytes = match conn.read_datagram().await {
             Ok(b)  => b,
             Err(e) => {
-                eprintln!("⚠️  read_datagram: {e}");
-                break; // соединение закрыто
+                log::info!("[QUIC] read_datagram: {e}");
+                break;
             }
         };
- 
-        // ── Десериализуем чанк ────────────────────────────────────────────
-        let chunk: DatagramChunk = match postcard::from_bytes(&bytes) {
-            Ok(c)  => c,
-            Err(e) => {
-                log::warn!("[QUIC] Bad datagram: {e}");
-                continue;
-            }
+
+        let chunk = match DatagramChunk::decode(raw) {
+            Some(c) => c,
+            None    => continue,
         };
- 
+
         let frame_id = chunk.frame_id;
-        // ── Выбрасываем устаревшие незавершённые кадры ────────────────────
-        //
-        // Если пришёл кадр с frame_id = N, все буферы с id < N бесполезны:
-        // их чанки потеряны, и декодировать их незачем.
-        if reassembly.len() >= MAX_BUFFERED_FRAMES {
-            let oldest = reassembly.keys().copied().min().unwrap_or(0);
-            reassembly.remove(&oldest);
-            log::debug!("[Reassembly] Evicted stale frame #{}", oldest);
+
+        if chunk.is_key && chunk.chunk_idx == 0 {
+            for (id, buf) in reassembly.drain() {
+                let missing = buf.total - buf.received;
+                if missing > 0 {
+                    log::debug!("[Reassembly] Clearing incomplete frame #{} for new IDR (missing {} chunks)", id, missing);
+                }
+            }
         }
-        reassembly.retain(|&id, _| id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64));
- 
-        // ── Вставляем чанк в буфер ────────────────────────────────────────
-        let buf = reassembly
-            .entry(frame_id)
-            .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks));
- 
-        // Защита от чанка с неверным total_chunks (мало ли — сеть)
-        if chunk.chunk_idx >= buf.total || chunk.total_chunks != buf.total {
-            log::warn!("[Reassembly] Bad chunk idx {}/{} for frame #{}", chunk.chunk_idx, chunk.total_chunks, frame_id);
+
+        reassembly.retain(|&id, buf| {
+            let keep = buf.is_key || id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64);
+            if !keep {
+                waiting_for_key = true;
+            }
+            keep
+        });
+
+        if reassembly.len() >= MAX_BUFFERED_FRAMES {
+            let evict_id = reassembly.iter().filter(|(_, buf)| !buf.is_key).map(|(&id, _)| id).min()
+                .or_else(|| reassembly.keys().copied().min());
+            if let Some(id) = evict_id {
+                reassembly.remove(&id);
+            }
+        }
+
+        let buf = reassembly.entry(frame_id).or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, chunk.is_key));
+
+        if chunk.chunk_idx >= buf.total || chunk.total_chunks != buf.total { continue; }
+
+        // Если не все куски собраны — уходим на следующую итерацию
+        if !buf.insert(chunk.chunk_idx, chunk.data) { continue; }
+
+        // === КАДР СОБРАН ===
+        let buf = reassembly.remove(&frame_id).unwrap();
+        let first_us = buf.first_us;
+        let serialised = buf.assemble();
+
+        let mut packet: VideoPacket = match postcard::from_bytes(&serialised) {
+            Ok(p)  => p,
+            Err(_) => continue,
+        };
+        
+        packet.trace.as_mut().map(|t| {
+            t.receive_us     = first_us;
+            t.reassembled_us = FrameTrace::now_us();
+        });
+
+        // === ИНЛАЙН ДЕКОДИРОВАНИЕ ===
+        // Берем лок, закидываем кадр, забираем YUV и СРАЗУ отдаем лок.
+        let mut backend_lock = backend.lock().unwrap();
+
+        if packet.is_key {
+            waiting_for_key = false;
+            expected_frame_id = Some(packet.frame_id);
+        } else if waiting_for_key {
+            continue;
+        } else if packet.frame_id != expected_frame_id.unwrap_or_default() {
+            log::warn!("[Decoder] Sequence broken. Dropping frames until next IDR.");
+            waiting_for_key = true;
             continue;
         }
- 
-        let complete = buf.insert(chunk.chunk_idx, chunk.data);
- 
-        if !complete {
-            continue; // ждём остальные чанки
-        }
-        // ── Кадр собран — вынимаем из map и собираем ─────────────────────
-        let serialized = reassembly.remove(&frame_id).unwrap().assemble();
- 
-        let packet: VideoPacket = match postcard::from_bytes(&serialized) {
-            Ok(p)  => p,
-            Err(e) => {
-                log::error!("[Reassembly] Deserialize frame #{}: {e}", frame_id);
+        expected_frame_id = Some(packet.frame_id + 1);
+
+        match backend_lock.push_encoded(&packet.payload, packet.frame_id, packet.trace.take()) {
+            Ok(()) => {}
+            Err(crate::backend::BackendError::BufferFull) => {
+                waiting_for_key = true;
                 continue;
             }
-        };
- 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-        let latency = now.saturating_sub(packet.timestamp);
-        if packet.frame_id % 100 == 0 {
-            log::info!("[Latency] Frame #{} | Network + Queue: {}ms", packet.frame_id, latency);
-        }
- 
-        // ── Передаём в декодер ────────────────────────────────────────────
-        {
-            let mut b = backend.lock().unwrap();
- 
-            match b.push_encoded(&packet.payload, packet.frame_id) {
-                Ok(())  => {}
-                Err(crate::backend::BackendError::BufferFull) => {
-                    log::warn!("[Decoder] Buffer full, dropping frame #{}", packet.frame_id);
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("[Decoder] push_encoded: {e}");
-                    continue;
-                }
+            Err(_) => {
+                waiting_for_key = true;
+                continue;
             }
- 
-            loop {
-                match b.poll_output() {
-                    Ok(FrameOutput::Yuv(frame)) => {
-                        if let Some(ref tx) = frame_tx {
-                            let _ = tx.try_send(frame);
-                        }
+        }
+
+        loop {
+            match backend_lock.poll_output() {
+                Ok(FrameOutput::Yuv(frame)) => {
+                    if let Some(ref tx) = frame_tx {
+                        let _ = tx.try_send(frame);
                     }
-                    Ok(FrameOutput::DirectToSurface) => {}
-                    Ok(FrameOutput::Pending) | Err(_) => break,
                 }
+                Ok(FrameOutput::DirectToSurface) => {}
+                Ok(FrameOutput::Pending) | Err(_) => break,
             }
         }
+        drop(backend_lock); // Важно освободить Mutex ДО того, как уйдем на conn.read_datagram().await!
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUIC client endpoint (skip-verify для LAN / self-signed)
+// Client endpoint construction
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
-    // 1. Настройка TLS (уже есть)
     let mut crypto = rustls::ClientConfig::builder_with_provider(
         Arc::new(rustls::crypto::ring::default_provider()),
     )
@@ -257,30 +284,39 @@ fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
 
     crypto.alpn_protocols = vec![b"video-stream".to_vec()];
 
-
-    
-    // Если тестируешь через VPN/Tailscale, иногда полезно ограничить MTU
-    // transport_config.initial_mtu(1200); 
-
     let quic_crypto = QuicClientConfig::try_from(crypto)?;
-    
-    // 3. Собираем ClientConfig, объединяя крипту и транспорт
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
-    // 2. Создаем транспортный конфиг
-    let mut transport = quinn::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    client_config.transport_config(Arc::new(transport));
+    // ── Transport — mirror the server settings for symmetrical behaviour ──────
+    let mut t = quinn::TransportConfig::default();
 
-    // 4. Создаем эндпоинт
+    t.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
+
+    // Match the server's initial MTU probe so the first handshake uses the
+    // optimal path MTU immediately rather than starting at 1200.
+    t.initial_mtu(1400);
+
+    // Keep-alive: same period as server so both sides detect dead connections
+    // within a consistent window.
+    t.keep_alive_interval(Some(Duration::from_millis(500)));
+
+    t.max_idle_timeout(Some(
+        Duration::from_secs(8)
+            .try_into()
+            .expect("idle timeout"),
+    ));
+
+    client_cfg.transport_config(Arc::new(t));
+
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
+    endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
 }
 
-/// TLS-верификатор, принимающий любые сертификаты.
-/// Используется только в разработке / LAN!
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS skip-verify (LAN / self-signed, NOT for production over untrusted networks)
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug)]
 struct SkipServerVerification;
 

@@ -150,7 +150,7 @@ impl AndroidMediaCodecBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl VideoBackend for AndroidMediaCodecBackend {
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64) -> Result<(), BackendError> {
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, _trace: FrameTrace) -> Result<(), BackendError> {
         let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
 
         unsafe {

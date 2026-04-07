@@ -24,6 +24,8 @@
 use std::{fmt, future::Future};
 use tokio::sync::mpsc;
 
+use crate::encode::EncodedFrame;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
@@ -88,6 +90,6 @@ pub trait VideoSender: Send + 'static {
     /// Each encoded HEVC NAL packet is delivered via `sink`.
     fn run(
         self,
-        sink: mpsc::Sender<(Vec<u8>, bool)>,
+        sink: mpsc::Sender<EncodedFrame>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

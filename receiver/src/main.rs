@@ -17,9 +17,10 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::net::ToSocketAddrs;
-
+use common::FrameTrace;
+use tokio::sync::mpsc;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -69,7 +70,7 @@ impl WgpuState {
             format:                       caps.formats[0],
             width:                        size.width.max(1),
             height:                       size.height.max(1),
-            present_mode:                 wgpu::PresentMode::Fifo,
+            present_mode:                 wgpu::PresentMode::Immediate,
             alpha_mode:                   wgpu::CompositeAlphaMode::Opaque,
             view_formats:                 vec![],
             desired_maximum_frame_latency: 2,
@@ -358,12 +359,14 @@ impl ApplicationHandler for App {
                 while let Ok(f) = self.frame_rx.try_recv() { latest = Some(f); }
 
                 if let Some(frame) = latest {
+                
                     state.update_textures(&frame);
-                }
+                    let mut trace = frame.trace;
+                    trace.present_us = FrameTrace::now_us();
 
-                self.frames_rendered += 1;
-                if self.frames_rendered % 300 == 0 {
-                    log::debug!("Rendered {} frames", self.frames_rendered);
+                    if frame.frame_id % 120 == 0 {
+                        log_trace(frame.frame_id, &trace);
+                    }
                 }
 
                 state.render();
@@ -393,7 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("Failed to install rustls crypto provider");
     // Канал между сетевым потоком и рендер-потоком.
     // Размер 3: если рендер отстаёт, старые кадры выбрасываются (low-latency!).
-    let (tx, rx) = mpsc::sync_channel::<YuvFrame>(3);
+    let (tx, rx) = mpsc::channel::<YuvFrame>(3);
 
     // Инициализируем бекенд
     let backend = DesktopFfmpegBackend::new()?;
@@ -429,4 +432,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+fn log_trace(frame_id: u64, t: &FrameTrace) {
+    log::info!(
+        "#{frame_id}: From capture to encoded={:.1}ms, From encoded to serialized={:.1}ms,
+        From serialized to received by the client={:.1}ms, From received to assembled={:.1}ms, 
+        From assembled to decoded={:.1}ms, From decoded to presented={:.1}ms
+        TOTAL LATENCY={:.1}ms",
+        FrameTrace::ms(t.capture_us, t.encode_us),
+        FrameTrace::ms(t.encode_us, t.serialize_us),
+        FrameTrace::ms(t.serialize_us, t.receive_us),
+        FrameTrace::ms(t.receive_us, t.reassembled_us),
+        FrameTrace::ms(t.reassembled_us, t.decode_us),
+        FrameTrace::ms(t.decode_us, t.present_us),
+        FrameTrace::ms(t.capture_us, t.present_us),
+    );
 }
