@@ -17,6 +17,8 @@
 
 use std::fmt;
 use common::FrameTrace;
+pub use crate::types::DmaBufFrame;
+
 // ─────────────────────────────────────────
 // Типы ошибок
 // ─────────────────────────────────────────
@@ -76,6 +78,8 @@ pub struct YuvFrame {
 pub enum FrameOutput {
     /// YUV420P кадр для загрузки в WGPU-текстуры (десктоп)
     Yuv(YuvFrame),
+
+    DmaBuf(DmaBufFrame),
 
     /// Кадр отрендерен напрямую в ANativeWindow/Surface (Android zero-copy)
     DirectToSurface,

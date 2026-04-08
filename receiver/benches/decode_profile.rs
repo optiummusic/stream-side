@@ -61,6 +61,7 @@ fn decode_one_frame(
             FrameOutput::Yuv(_frame) => return Ok(()),
             FrameOutput::Pending => continue,
             FrameOutput::DirectToSurface => continue,
+            _ => continue,
         }
     }
 }

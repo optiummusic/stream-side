@@ -1,24 +1,46 @@
 // src/main.rs
 //
 // Десктопная точка входа (Linux / Windows).
-// Компилируется ТОЛЬКО при `--features desktop`.
 //
-// Поток исполнения:
-//   ┌─────────────────────────────────────────────────────┐
-//   │  main()                                              │
-//   │    │                                                 │
-//   │    ├── thread::spawn → tokio RT → run_quic_receiver  │
-//   │    │       (DesktopFfmpegBackend + mpsc::SyncSender) │
-//   │    │                                                 │
-//   │    └── EventLoop::run_app (winit, главный поток)     │
-//   │            RedrawRequested → try_recv → upload YUV  │
-//   │                           → wgpu render             │
-//   └─────────────────────────────────────────────────────┘
+// ## Потоки
+//
+// ```text
+// main()
+//   ├── thread::spawn → tokio RT → run_quic_receiver
+//   │       (DesktopFfmpegBackend + mpsc::SyncSender<DecodedFrame>)
+//   │
+//   └── EventLoop::run_app (winit, главный поток)
+//           about_to_wait → try_recv DecodedFrame:
+//             ├── Yuv(YuvFrame)    → queue.write_texture (старый CPU-путь)
+//             └── DmaBuf(frame)   → Vulkan import fd → wgpu::Texture (zero-copy)
+// ```
+//
+// ## Добавить в Cargo.toml
+//
+// ```toml
+// [dependencies]
+// ash = "0.38"           # Vulkan bindings (должна совпадать с версией внутри wgpu)
+// ```
+//
+// ## DMA-BUF → Vulkan import
+//
+// 1. При старте WgpuState::new() извлекаем из wgpu::Device raw ash::Device +
+//    ash::Instance через адаптер. Строим DmaBufAllocator.
+// 2. На каждый DmaBufFrame дважды дублируем fd (Y и UV плоскости) и вызываем
+//    `vkImportMemoryFdKHR` для каждой плоскости.
+// 3. Создаём два VkImage (R8Unorm/Rg8Unorm) и привязываем к ним память
+//    через vkBindImageMemory с соответствующими offset.
+// 4. Оборачиваем VkImage в wgpu::Texture через device.create_texture_from_hal.
+//    drop_guard в wgpu::hal::vulkan::Texture уничтожает VkImage + VkDeviceMemory
+//    при drop().
+// 5. Создаём BindGroup и рендерим — шейдер не меняется.
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::net::ToSocketAddrs;
+use std::sync::{Arc, Mutex};
+
+use ash::vk;
 use common::FrameTrace;
 use tokio::sync::mpsc;
 use winit::{
@@ -28,27 +50,424 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use stream_receiver::backend::{desktop::DesktopFfmpegBackend, VideoBackend, YuvFrame};
+use stream_receiver::backend::{
+    desktop::{DesktopFfmpegBackend},
+    VideoBackend, YuvFrame,
+};
 use stream_receiver::network::run_quic_receiver;
+use stream_receiver::types::{DmaBufFrame, DecodedFrame};
+// ─────────────────────────────────────────────────────────────────────────────
+// Канальный тип: CPU-кадр или zero-copy DMA-BUF кадр
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Декодированный кадр, передаваемый из сетевого потока в рендер-поток.
+///
+/// Вариант определяется в рантайме: если `DesktopFfmpegBackend` смог поднять
+/// zero-copy путь (DRM-производный VAAPI + DMA-BUF), то приходит `DmaBuf`.
+/// Иначе — `Yuv` (CPU-копирование, старый путь).
+
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WGPU State (без изменений по сравнению с исходным кодом)
+// DMA-BUF Allocator (Vulkan import)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Держит raw Vulkan handles для импорта DMA-BUF fd в wgpu-текстуры.
+///
+/// Создаётся один раз при инициализации WgpuState если необходимые
+/// Vulkan-расширения доступны:
+/// - `VK_KHR_external_memory`
+/// - `VK_KHR_external_memory_fd`
+/// - `VK_EXT_external_memory_dma_buf`
+struct DmaBufAllocator {
+    device:    ash::Device,
+    ext_mem:   ash::khr::external_memory_fd::Device,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
+}
+
+/// Drop-guard передаётся в wgpu-текстуру через `texture_from_raw`.
+/// Освобождает VkImage + VkDeviceMemory когда wgpu уничтожает текстуру.
+struct VkTextureDropGuard {
+    device: ash::Device,
+    image:  vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl Drop for VkTextureDropGuard {
+    fn drop(&mut self) {
+        unsafe {
+            // Порядок важен: сначала memory, потом image (image не должен быть
+            // bound к существующей памяти при уничтожении — хотя Vulkan
+            // допускает и обратный порядок, строгий порядок безопаснее).
+            self.device.destroy_image(self.image, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+// SAFETY: raw Vulkan handles (vk::Image, vk::DeviceMemory) являются числами;
+// ash::Device — тонкая обёртка над указателем, не имеет собственных данных.
+unsafe impl Send for VkTextureDropGuard {}
+unsafe impl Sync for VkTextureDropGuard {}
+
+impl DmaBufAllocator {
+    /// Инициализируем из raw Vulkan handles, извлечённых из wgpu HAL.
+    ///
+    /// Возвращает None если Vulkan не активен или расширения недоступны.
+    unsafe fn new(
+        device:    ash::Device,
+        instance:  &ash::Instance,
+        phys_dev:  vk::PhysicalDevice,
+    ) -> Option<Self> {
+        // Проверяем, что нужные расширения задекларированы в устройстве.
+        let ext_mem = ash::khr::external_memory_fd::Device::new(instance, &device);
+        let mem_props = instance.get_physical_device_memory_properties(phys_dev);
+        Some(Self { device, ext_mem, mem_props })
+    }
+
+    /// Импортирует одну плоскость DMA-BUF как wgpu::Texture.
+    ///
+    /// - `fd`         — исходный fd (будет dup-нут внутри; оригинал не тронут)
+    /// - `total_size` — полный размер DMA-BUF объекта (из AVDRMObjectDescriptor.size)
+    /// - `bind_offset`— смещение в байтах до начала плоскости (y_offset / uv_offset)
+    /// - `modifier`   — DRM format modifier (0 = LINEAR)
+    /// - `vk_format`  — VK_FORMAT_R8_UNORM (Y) / VK_FORMAT_R8G8_UNORM (UV)
+    /// - `wgpu_format`— соответствующий wgpu формат
+    ///
+    /// # Safety
+    /// `fd` должен быть валидным DMA-BUF дескриптором.
+    /// `wgpu_device` должен использовать Vulkan бэкенд.
+    unsafe fn import_plane(
+        &self,
+        wgpu_device: &wgpu::Device,
+        fd:          std::os::unix::io::RawFd,
+        total_size:  usize,
+        bind_offset: u64,
+        row_pitch:   u64,
+        modifier:    u64,
+        width:       u32,
+        height:      u32,
+        vk_format:   vk::Format,
+        wgpu_format: wgpu::TextureFormat,
+    ) -> Option<wgpu::Texture> {
+        // ── 1. Tiling ────────────────────────────────────────────────────────
+        //
+        // DRM_FORMAT_MOD_LINEAR = 0: линейный layout, VK_IMAGE_TILING_LINEAR.
+        // Другие модификаторы (Intel Y-тайл, AFBC и т.д.) требуют
+        // VK_EXT_image_drm_format_modifier — это расширение опционально.
+        // Для простоты текущей реализации поддерживаем только LINEAR.
+        // Нелинейные модификаторы возвращают None → fallback на CPU путь.
+
+        const DRM_FORMAT_MOD_LINEAR:  u64 = 0;
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+        // 1. Выбираем Tiling
+        let is_linear = modifier == DRM_FORMAT_MOD_LINEAR || modifier == DRM_FORMAT_MOD_INVALID;
+        let tiling = if is_linear {
+            vk::ImageTiling::LINEAR
+        } else {
+            // Для тайловых форматов (Intel Tile4 и др.) используем расширение
+            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+        };
+
+        // 2. Подготавливаем расширенную информацию о формате
+        let plane_layouts = [vk::SubresourceLayout {
+            offset:    0,         // Смещение будем указывать при бинде памяти
+            size:      0,         // Вычисляется драйвером
+            row_pitch,            // Наш y_pitch или uv_pitch
+            array_pitch: 0,
+            depth_pitch: 0,
+        }];
+
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+
+        let mut ext_image_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        // Собираем цепочку pNext
+        let mut image_info = vk::ImageCreateInfo::default()
+            .push_next(&mut ext_image_info)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(tiling)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        if !is_linear {
+            image_info = image_info.push_next(&mut modifier_info);
+        }
+
+        let vk_image = match self.device.create_image(&image_info, None) {
+            Ok(img) => img,
+            Err(e) => {
+                log::error!("[DMA-BUF] vkCreateImage failed (mod {modifier:#x}): {e}");
+                return None;
+            }
+        };
+
+        // ── 3. Требования к памяти ───────────────────────────────────────────
+
+        let mem_reqs = self.device.get_image_memory_requirements(vk_image);
+
+        // Ищем тип памяти: совместимый с image + DEVICE_LOCAL.
+        let mem_type = match find_memory_type(
+            &self.mem_props,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Some(t) => t,
+            None => {
+                log::warn!("[DMA-BUF] нет подходящего memory type (DEVICE_LOCAL)");
+                self.device.destroy_image(vk_image, None);
+                return None;
+            }
+        };
+
+        // ── 4. Проверяем необходимость dedicated allocation ──────────────────
+
+        let mut dedicated_reqs = vk::MemoryDedicatedRequirements::default();
+        let mut mem_reqs2 = vk::MemoryRequirements2::default().push_next(&mut dedicated_reqs);
+        self.device.get_image_memory_requirements2(
+            &vk::ImageMemoryRequirementsInfo2::default().image(vk_image),
+            &mut mem_reqs2,
+        );
+        let needs_dedicated = dedicated_reqs.requires_dedicated_allocation != 0
+            || dedicated_reqs.prefers_dedicated_allocation != 0;
+
+        // ── 5. Импортируем DMA-BUF fd как VkDeviceMemory ─────────────────────
+        //
+        // `vkImportMemoryFdKHR` потребляет fd (ядро закрывает его при
+        // уничтожении VkDeviceMemory). Поэтому мы dup-аем fd здесь, чтобы
+        // исходный `frame.fd` (OwnedFd) остался валидным для второй плоскости.
+
+        let dup_fd = libc::dup(fd);
+        if dup_fd < 0 {
+            log::warn!("[DMA-BUF] dup(fd) failed");
+            self.device.destroy_image(vk_image, None);
+            return None;
+        }
+
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dup_fd);
+
+        // allocation_size = размер всего DMA-BUF объекта (не только плоскости!).
+        // Vulkan ожидает полный размер импортируемого буфера.
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
+            .push_next(&mut import_info)
+            .allocation_size(total_size as u64)
+            .memory_type_index(mem_type);
+
+        // Dedicated allocation struct живёт в том же scope.
+        let mut dedicated_info;
+        if needs_dedicated {
+            dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(vk_image);
+            // Нужно вставить перед import_info в цепочку pNext.
+            // ash 0.38 поддерживает множественные push_next через .push_next().
+            alloc_info = alloc_info.push_next(&mut dedicated_info);
+        }
+
+        let vk_memory = match self.device.allocate_memory(&alloc_info, None) {
+            Ok(m) => m,
+            Err(e) => {
+                // dup_fd уже передан Vulkan-у и будет закрыт ядром при неудаче
+                // (если ошибка после импорта), но если ошибка до — закрываем сами.
+                // Безопаснее всего: при ошибке allocate_memory fd НЕ закрывается
+                // автоматически, поэтому закрываем его явно.
+                libc::close(dup_fd);
+                log::warn!("[DMA-BUF] vkAllocateMemory failed: {e}");
+                self.device.destroy_image(vk_image, None);
+                return None;
+            }
+        };
+        // С этого момента dup_fd принадлежит vk_memory (Vulkan закроет его при free).
+
+        // ── 6. Привязываем память к image с нужным offset ────────────────────
+        //
+        // bind_offset — это смещение начала плоскости внутри DMA-BUF буфера.
+        // Для Y-плоскости обычно 0, для UV — stride * height (или с выравниванием).
+        // Требование: bind_offset должен быть кратен mem_reqs.alignment.
+
+        let mem_reqs = self.device.get_image_memory_requirements(vk_image);
+        let aligned_offset = align_up(bind_offset, mem_reqs.alignment);
+
+        if let Err(e) = self.device.bind_image_memory(vk_image, vk_memory, aligned_offset) {
+            log::error!("[DMA-BUF] vkBindImageMemory failed: {e}");
+            self.device.destroy_image(vk_image, None);
+            self.device.free_memory(vk_memory, None);
+            return None;
+        }
+
+        // ── 7. Оборачиваем VkImage в wgpu::Texture ───────────────────────────
+        //
+        // wgpu::hal::vulkan::Device::texture_from_raw:
+        //   - drop_guard=Some(...)  → wgpu НЕ вызывает vkDestroyImage;
+        //     деструктор drop_guard отвечает за полную очистку.
+        //   - drop_guard=None       → wgpu вызывает vkDestroyImage сам.
+        //
+        // Нам нужен Some(drop_guard) потому что мы сами управляем памятью.
+
+        let drop_guard: Box<dyn std::any::Any + Send + Sync> = Box::new(VkTextureDropGuard {
+            device: self.device.clone(),
+            image:  vk_image,
+            memory: vk_memory,
+        });
+
+        let hal_tex_desc = wgpu::hal::TextureDescriptor {
+            label:         Some("DMA-BUF plane"),
+            size:          wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count:  1,
+            dimension:     wgpu::TextureDimension::D2,
+            format:        wgpu_format,
+            usage:         wgpu::TextureUses::RESOURCE,
+            memory_flags:  wgpu::hal::MemoryFlags::empty(),
+            view_formats:  vec![],
+        };
+
+        let hal_device = unsafe { wgpu_device.as_hal::<wgpu::hal::api::Vulkan>() }?;
+        let hal_memory = wgpu::hal::vulkan::TextureMemory::External; // Unit-вариант
+        
+        let hal_texture = unsafe { 
+            (&*hal_device).texture_from_raw(
+                vk_image,
+                &hal_tex_desc,
+                Some(Box::new(move || { drop(drop_guard); }) as Box<dyn FnOnce() + Send + Sync>),
+                hal_memory,
+            ) 
+        };
+
+        let wgpu_tex_desc = wgpu::TextureDescriptor {
+            label:           Some("DMA-BUF plane"),
+            size:            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count:    1,
+            dimension:       wgpu::TextureDimension::D2,
+            format:          wgpu_format,
+            usage:           wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats:    &[],
+        };
+
+        Some(unsafe {
+            wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_tex_desc)
+        })
+    }
+
+    /// Импортирует NV12 DMA-BUF кадр как пару wgpu::Texture (Y + UV).
+    ///
+    /// Возвращает (y_tex, uv_tex) или None при любой ошибке.
+    /// При None вызывающий должен откатиться на CPU-путь.
+    pub unsafe fn import_nv12(
+        &self,
+        wgpu_device: &wgpu::Device,
+        frame:       &DmaBufFrame,
+    ) -> Option<(wgpu::Texture, wgpu::Texture)> {
+        use std::os::unix::io::AsRawFd;
+        let raw_fd = frame.fd.as_raw_fd();
+
+        // Y-плоскость: R8Unorm, полный размер
+        let y_tex = self.import_plane(
+            wgpu_device,
+            raw_fd,
+            frame.total_size,
+            frame.y_offset  as u64,
+            frame.y_pitch  as u64,
+            frame.modifier,
+            frame.width,
+            frame.height,
+            vk::Format::R8_UNORM,
+            wgpu::TextureFormat::R8Unorm,
+        )?;
+
+        // UV-плоскость: Rg8Unorm, половинный размер
+        let uv_tex = self.import_plane(
+            wgpu_device,
+            raw_fd,
+            frame.total_size,
+            frame.uv_offset as u64,
+            frame.uv_pitch  as u64,
+            frame.modifier,
+            frame.width  / 2,
+            frame.height / 2,
+            vk::Format::R8G8_UNORM,
+            wgpu::TextureFormat::Rg8Unorm,
+        )?;
+
+        Some((y_tex, uv_tex))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Вспомогательные функции
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn find_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    for i in 0..props.memory_type_count {
+        let mt = &props.memory_types[i as usize];
+        if (type_bits & (1 << i)) != 0 && mt.property_flags.contains(required) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[inline]
+fn align_up(value: u64, align: u64) -> u64 {
+    if align == 0 { return value; }
+    (value + align - 1) & !(align - 1)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WGPU State
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct WgpuState {
-    surface:            wgpu::Surface<'static>,
-    device:             wgpu::Device,
-    queue:              wgpu::Queue,
-    config:             wgpu::SurfaceConfiguration,
-    render_pipeline:    wgpu::RenderPipeline,
-    bind_group_layout:  wgpu::BindGroupLayout,
-    textures:           Option<(wgpu::Texture, wgpu::Texture, wgpu::BindGroup)>,
+    surface:           wgpu::Surface<'static>,
+    device:            wgpu::Device,
+    queue:             wgpu::Queue,
+    config:            wgpu::SurfaceConfiguration,
+    render_pipeline:   wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler:           wgpu::Sampler,
+    textures:          Option<(wgpu::Texture, wgpu::Texture, wgpu::BindGroup)>,
+
+    // ── Zero-copy DMA-BUF ────────────────────────────────────────────────────
+
+    /// None — Vulkan-расширения недоступны или бэкенд не Vulkan.
+    dmabuf: Option<DmaBufAllocator>,
+
+    /// Удерживает wgpu-текстуры предыдущего DMA-BUF кадра до тех пор, пока
+    /// GPU гарантированно завершит чтение (swap происходит на следующем кадре).
+    /// Необходимо, потому что queue.submit() — неблокирующий вызов.
+    _prev_dmabuf_textures: Option<(wgpu::Texture, wgpu::Texture)>,
 }
 
 impl WgpuState {
     async fn new(window: Arc<Window>) -> Self {
-        let size     = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface  = instance.create_surface(window.clone()).unwrap();
+        let size = window.inner_size();
+
+        // Требуем Vulkan-бэкенд явно — DMA-BUF import работает только через Vulkan.
+        // Если Vulkan недоступен, wgpu автоматически выберет другой бэкенд,
+        // а DmaBufAllocator останется None.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: Default::default()
+        });
+
+        let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -64,15 +483,63 @@ impl WgpuState {
             .await
             .unwrap();
 
+        // ── Извлекаем raw Vulkan handles для DMA-BUF allocator ───────────────
+        //
+        // adapter.as_hal   → ash::Instance + vk::PhysicalDevice + mem_props
+        // device.as_hal    → ash::Device
+        //
+        // Все three нужны для vkImportMemoryFdKHR и vkAllocateMemory.
+
+        let dmabuf: Option<DmaBufAllocator> = unsafe {
+            // Извлекаем device handle из device closure.
+            let mut ash_device_opt: Option<ash::Device> = None;
+            unsafe {
+                if let Some(hal_dev) = device.as_hal::<wgpu::hal::api::Vulkan>() {
+                    ash_device_opt = Some(hal_dev.raw_device().clone());
+                }
+            }
+
+            // Извлекаем instance + phys_device из adapter closure.
+            let mut adapter_data: Option<(ash::Instance, vk::PhysicalDevice)> = None;
+            unsafe {
+                if let Some(hal_adapter) = adapter.as_hal::<wgpu::hal::api::Vulkan>() {
+                    let instance = hal_adapter.shared_instance().raw_instance().clone();
+                    let phys = hal_adapter.raw_physical_device();
+                    adapter_data = Some((instance, phys));
+                }
+            }
+
+            match (ash_device_opt, adapter_data) {
+                (Some(dev), Some((inst, phys))) => {
+                    match DmaBufAllocator::new(dev, &inst, phys) {
+                        Some(alloc) => {
+                            log::info!("[Render] DMA-BUF Vulkan allocator: READY");
+                            Some(alloc)
+                        }
+                        None => {
+                            log::warn!("[Render] DMA-BUF allocator init failed — CPU-path only");
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    log::warn!("[Render] wgpu backend is not Vulkan — DMA-BUF import unavailable");
+                    None
+                }
+            }
+        };
+
+        // ── Шейдер, pipeline, bind_group_layout (без изменений) ─────────────
+
         let caps   = surface.get_capabilities(&adapter);
         let config = wgpu::SurfaceConfiguration {
-            usage:                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format:                       caps.formats[0],
-            width:                        size.width.max(1),
-            height:                       size.height.max(1),
-            present_mode:                 wgpu::PresentMode::Immediate,
-            alpha_mode:                   wgpu::CompositeAlphaMode::Opaque,
-            view_formats:                 vec![],
+            usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format:                        caps.formats[0],
+            width:                         size.width.max(1),
+            height:                        size.height.max(1),
+            present_mode:                  wgpu::PresentMode::Immediate,
+            alpha_mode:                    wgpu::CompositeAlphaMode::Opaque,
+            view_formats:                  vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
@@ -86,36 +553,34 @@ impl WgpuState {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label:   Some("NV12 Bind Group Layout"),
                 entries: &[
-                    // Y Plane
                     wgpu::BindGroupLayoutEntry {
-                        binding: 0,
+                        binding:    0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                            multisampled:   false,
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 1,
+                        binding:    1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
-                    // UV Plane (Interleaved)
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2,
+                        binding:    2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                            multisampled:   false,
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 3,
+                        binding:    3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -123,11 +588,19 @@ impl WgpuState {
                 ],
             });
 
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter:     wgpu::FilterMode::Linear,
+            min_filter:     wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label:                Some("Render Pipeline Layout"),
-                bind_group_layouts:   &[Some(&bind_group_layout)],
-                immediate_size:       0,
+                label:              Some("Render Pipeline Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size:     0,
             });
 
         let render_pipeline =
@@ -135,10 +608,10 @@ impl WgpuState {
                 label:  Some("Render Pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module:               &shader,
-                    entry_point:          Some("vs_main"),
-                    buffers:              &[],
-                    compilation_options:  Default::default(),
+                    module:              &shader,
+                    entry_point:         Some("vs_main"),
+                    buffers:             &[],
+                    compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module:              &shader,
@@ -176,11 +649,16 @@ impl WgpuState {
             config,
             render_pipeline,
             bind_group_layout,
-            textures: None,
+            sampler,
+            textures:              None,
+            dmabuf,
+            _prev_dmabuf_textures: None,
         }
     }
 
-    fn update_textures(&mut self, frame: &YuvFrame) {
+    // ── CPU-путь: загружаем NV12 плоскости через queue.write_texture ─────────
+
+    fn update_textures_cpu(&mut self, frame: &YuvFrame) {
         let needs_recreate = match &self.textures {
             None => true,
             Some((t_y, _, _)) => {
@@ -189,108 +667,133 @@ impl WgpuState {
         };
 
         if needs_recreate {
-            log::info!("Creating NV12 textures {}x{}", frame.width, frame.height);
+            log::info!("[Render] Creating CPU NV12 textures {}×{}", frame.width, frame.height);
 
-            // Текстура Y (R8Unorm)
             let t_y = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Y Texture"),
-                size: wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+                label:           Some("Y Texture"),
+                size:            wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+                sample_count:    1,
+                dimension:       wgpu::TextureDimension::D2,
+                format:          wgpu::TextureFormat::R8Unorm,
+                usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats:    &[],
             });
 
-            // Текстура UV (Rg8Unorm) - ширина и высота в 2 раза меньше
             let t_uv = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("UV Texture"),
-                size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
+                label:           Some("UV Texture"),
+                size:            wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
                 mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rg8Unorm, // Двухканальный формат
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+                sample_count:    1,
+                dimension:       wgpu::TextureDimension::D2,
+                format:          wgpu::TextureFormat::Rg8Unorm,
+                usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats:    &[],
             });
 
-            let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            });
-
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.bind_group_layout,
-                label:  Some("NV12 Bind Group"),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&t_y.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&t_uv.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-                ],
-            });
-
-            self.textures = Some((t_y, t_uv, bind_group));
+            let bg = self.make_bind_group(&t_y, &t_uv);
+            self.textures = Some((t_y, t_uv, bg));
         }
 
-        if let Some((t_y, t_uv, _)) = &self.textures {
-            // Загружаем Y плоскость
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture:   t_y,
-                    mip_level: 0,
-                    origin:    wgpu::Origin3d::ZERO,
-                    aspect:    wgpu::TextureAspect::All,
-                },
-                &frame.y,
-                wgpu::TexelCopyBufferLayout {
-                    offset:         0,
-                    bytes_per_row:  Some(frame.y_stride),
-                    rows_per_image: Some(frame.height),
-                },
-                t_y.size(),
-            );
+        let (t_y, t_uv, _) = self.textures.as_ref().unwrap();
 
-            // Загружаем UV плоскость (используем frame.uv из нашего прошлого обсуждения)
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture:   t_uv,
-                    mip_level: 0,
-                    origin:    wgpu::Origin3d::ZERO,
-                    aspect:    wgpu::TextureAspect::All,
-                },
-                &frame.uv,
-                wgpu::TexelCopyBufferLayout {
-                    offset:         0,
-                    bytes_per_row:  Some(frame.uv_stride),
-                    rows_per_image: Some(frame.height / 2),
-                },
-                t_uv.size(),
-            );
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: t_y, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &frame.y,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.y_stride), rows_per_image: None },
+            wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+        );
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: t_uv, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &frame.uv,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.uv_stride), rows_per_image: None },
+            wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
+        );
+    }
+
+    // ── Zero-copy путь: импортируем DMA-BUF fd как Vulkan текстуры ───────────
+
+    fn update_textures_dmabuf(&mut self, frame: &DmaBufFrame) -> bool {
+        let alloc = match &self.dmabuf {
+            Some(a) => a,
+            None    => return false,   // Vulkan недоступен — вернёмся к CPU пути
+        };
+
+        let import_result = unsafe {
+            alloc.import_nv12(&self.device, frame)
+        };
+
+        let (y_tex, uv_tex) = match import_result {
+            Some(pair) => pair,
+            None => return false,   // import упал — CPU fallback
+        };
+
+        // Создаём bind group из новых Vulkan-текстур.
+        let bg = self.make_bind_group(&y_tex, &uv_tex);
+
+        // Старые текстуры переезжают в _prev_dmabuf_textures.
+        // Они будут удалены только при следующем кадре (после queue.submit).
+        // Это даёт GPU время завершить предыдущий draw call до освобождения
+        // VkDeviceMemory (VkTextureDropGuard).
+        if let Some((t_y, t_uv, _)) = self.textures.take() {
+            // Если предыдущие были тоже DMA-BUF — достаточно их просто дропнуть.
+            // Если CPU — тоже нормально.
+            self._prev_dmabuf_textures = Some((t_y, t_uv));
         }
+
+        self.textures = Some((y_tex, uv_tex, bg));
+        true
+    }
+
+    fn make_bind_group(&self, t_y: &wgpu::Texture, t_uv: &wgpu::Texture) -> wgpu::BindGroup {
+        let v_y  = t_y .create_view(&Default::default());
+        let v_uv = t_uv.create_view(&Default::default());
+
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("NV12 Bind Group"),
+            layout:  &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&v_y)  },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&v_uv) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
     }
 
     fn render(&mut self) {
         let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)    => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                self.surface.configure(&self.device, &self.config);
-                t
-            }
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t, // Можно рисовать, но лучше обновить конфиг
             wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return; 
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                // Здесь по-хорошему нужно пересоздать surface, 
+                // но для начала попробуем просто переконфигурировать
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
-            _ => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // Пропускаем кадр
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::error!("WGPU Validation error on get_current_texture");
+                return;
+            }
         };
 
-        let view = surface_texture.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // При swap кадров освобождаем _prev_dmabuf_textures ПОСЛЕ submit,
+        // поэтому достаточно дропнуть их здесь — queue.submit из предыдущего
+        // кадра к этому моменту уже «закоммичен» в драйвер.
+        self._prev_dmabuf_textures = None;
 
+        let view    = surface_texture.texture.create_view(&Default::default());
+        let mut enc = self.device.create_command_encoder(&Default::default());
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &view,
@@ -307,14 +810,14 @@ impl WgpuState {
                 multiview_mask:            None,
             });
 
-            if let Some((_, _, bind_group)) = &self.textures {
+            if let Some((_, _, bg)) = &self.textures {
                 pass.set_pipeline(&self.render_pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
+                pass.set_bind_group(0, bg, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(enc.finish()));
         surface_texture.present();
     }
 }
@@ -324,14 +827,15 @@ impl WgpuState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
-    state: Option<WgpuState>,
-    window: Option<Arc<Window>>,
-    frame_rx: mpsc::Receiver<YuvFrame>,
+    state:           Option<WgpuState>,
+    window:          Option<Arc<Window>>,
+    frame_rx:        mpsc::Receiver<DecodedFrame>,
     frames_rendered: u64,
 }
 
 impl App {
-    fn poll_latest_frame(&mut self) -> Option<YuvFrame> {
+    /// Дренируем канал, возвращаем самый свежий кадр.
+    fn poll_latest_frame(&mut self) -> Option<DecodedFrame> {
         let mut latest = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
@@ -348,7 +852,7 @@ impl ApplicationHandler for App {
                 .with_inner_size(winit::dpi::LogicalSize::new(1280.0f64, 720.0f64));
 
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
-            self.state = Some(pollster::block_on(WgpuState::new(window.clone())));
+            self.state  = Some(pollster::block_on(WgpuState::new(window.clone())));
             self.window = Some(window);
 
             if let Some(w) = &self.window {
@@ -358,17 +862,39 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(frame) = self.poll_latest_frame() {
-        
+        if let Some(decoded) = self.poll_latest_frame() {
             if let Some(state) = self.state.as_mut() {
-                state.update_textures(&frame);
 
-                let mut trace = frame.trace;
+                let (frame_id, mut trace) = match &decoded {
+                    DecodedFrame::Yuv(f)    => (f.frame_id, f.trace),
+                    DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                };
+
+                match decoded {
+                    DecodedFrame::Yuv(frame) => {
+                        // CPU-путь: пишем через queue.write_texture
+                        state.update_textures_cpu(&frame);
+                    }
+                    DecodedFrame::DmaBuf(frame) => {
+                        // Zero-copy путь: импортируем DMA-BUF fd в Vulkan
+                        if !state.update_textures_dmabuf(&frame) {
+                            // Vulkan import упал — пробрасываем через CPU (эмергентный fallback).
+                            // DmaBufFrame не содержит CPU данных, поэтому единственный вариант —
+                            // игнорировать этот кадр и ждать следующего.
+                            log::warn!(
+                                "[Render] DMA-BUF import failed for frame #{frame_id}; \
+                                 frame dropped. Check that VK_EXT_external_memory_dma_buf \
+                                 is available."
+                            );
+                            return;
+                        }
+                    }
+                }
+
                 trace.present_us = FrameTrace::now_us();
-
                 self.frames_rendered += 1;
-                if frame.frame_id % 120 == 0 {
-                    log_trace(frame.frame_id, &trace);
+                if frame_id % 120 == 0 {
+                    log_trace(frame_id, &trace);
                 }
 
                 if let Some(w) = &self.window {
@@ -381,34 +907,30 @@ impl ApplicationHandler for App {
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
+        event_loop:  &ActiveEventLoop,
+        _id:         WindowId,
+        event:       WindowEvent,
     ) {
         let state = match self.state.as_mut() {
             Some(s) => s,
-            None => return,
+            None    => return,
         };
 
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-
             WindowEvent::Resized(size) => {
-                state.config.width = size.width.max(1);
+                state.config.width  = size.width.max(1);
                 state.config.height = size.height.max(1);
                 state.surface.configure(&state.device, &state.config);
-
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
-
             WindowEvent::RedrawRequested => {
                 state.render();
             }
-
             _ => {}
         }
     }
@@ -420,29 +942,30 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+
     let args: Vec<String> = std::env::args().collect();
-    let input_addr = &args[1];
-    let addr = input_addr
-        .to_socket_addrs()
-        .expect("Failed to resolve domain")
-        .next() // Берем первый найденный IP
-        .ok_or("Could not find any IP for this domain")?;
+    let addr: SocketAddr = args[1]
+        .to_socket_addrs()?
+        .next()
+        .ok_or("Could not resolve address")?;
 
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
-    // Канал между сетевым потоком и рендер-потоком.
-    // Размер 3: если рендер отстаёт, старые кадры выбрасываются (low-latency!).
-    let (tx, rx) = mpsc::channel::<YuvFrame>(3);
 
-    // Инициализируем бекенд
+    // Канал несёт DecodedFrame (CPU или DMA-BUF).
+    // Capacity=3: при отставании рендера старые кадры выбрасываются → low-latency.
+    let (tx, rx) = mpsc::channel::<DecodedFrame>(3);
+
     let backend = DesktopFfmpegBackend::new()?;
     let backend = Arc::new(Mutex::new(backend));
-
     let backend_clone = backend.clone();
     let tx_clone      = tx.clone();
 
-    // Сетевой поток
+    // Сетевой поток.
+    // Примечание: network.rs::receive_datagrams нужно обновить:
+    //   FrameOutput::DmaBuf(frame) → tx.try_send(DecodedFrame::DmaBuf(frame))
+    //   FrameOutput::Yuv(frame)    → tx.try_send(DecodedFrame::Yuv(frame))
     std::thread::Builder::new()
         .name("quic-receiver".into())
         .spawn(move || {
@@ -453,12 +976,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                // На десктопе передаём Some(tx) — YUV-кадры идут в рендер-поток
                 run_quic_receiver(backend_clone, addr, Some(tx_clone)).await;
             }));
         })?;
 
-    // Рендер-поток (главный поток, требование winit)
+    // Рендер-поток (главный поток — требование winit).
     let event_loop = EventLoop::new()?;
     let mut app = App {
         state:           None,
@@ -473,16 +995,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn log_trace(frame_id: u64, t: &FrameTrace) {
     log::info!(
-        "\n#{frame_id}: From capture to encoded={:.1}ms, From encoded to serialized={:.1}ms,
-        From serialized to received by the client={:.1}ms, From received to assembled={:.1}ms, 
-        From assembled to decoded={:.1}ms, From decoded to presented={:.1}ms
-        TOTAL LATENCY={:.1}ms",
-        FrameTrace::ms(t.capture_us, t.encode_us),
-        FrameTrace::ms(t.encode_us, t.serialize_us),
-        FrameTrace::ms(t.serialize_us, t.receive_us),
-        FrameTrace::ms(t.receive_us, t.reassembled_us),
+        "\n#{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
+         serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
+         decode→present={:.1}ms  TOTAL={:.1}ms",
+        FrameTrace::ms(t.capture_us,    t.encode_us),
+        FrameTrace::ms(t.encode_us,     t.serialize_us),
+        FrameTrace::ms(t.serialize_us,  t.receive_us),
+        FrameTrace::ms(t.receive_us,    t.reassembled_us),
         FrameTrace::ms(t.reassembled_us, t.decode_us),
-        FrameTrace::ms(t.decode_us, t.present_us),
-        FrameTrace::ms(t.capture_us, t.present_us),
+        FrameTrace::ms(t.decode_us,     t.present_us),
+        FrameTrace::ms(t.capture_us,    t.present_us),
     );
 }

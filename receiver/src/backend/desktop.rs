@@ -2,24 +2,58 @@
 //
 // Десктопный бекенд: HEVC-декодер через ffmpeg-next + VAAPI hardware decode.
 //
-// Поток данных:
+// ## Потоки данных
+//
+// ### CPU-путь (fallback: VAAPI недоступна, либо av_hwframe_map не сработал)
+// ```text
 //   VideoPacket.payload (HEVC NAL)
 //     → avcodec (VAAPI hw decode)
 //     → AVFrame(VAAPI surface)
-//     → av_hwframe_transfer_data → AVFrame(NV12, CPU)  [reused each frame]
-//     → copy into pooled Vec<u8>                       [no malloc at steady state]
-//     → YuvFrame → WgpuState → экран
+//     → av_hwframe_transfer_data → AVFrame(NV12, CPU)   [reused each frame]
+//     → copy into pooled Vec<u8>                        [no malloc at steady state]
+//     → YuvFrame → WgpuState → queue.write_texture → экран
+// ```
 //
-// Ключевые оптимизации по сравнению с наивной реализацией:
+// ### Zero-copy DMA-BUF путь (приоритетный, Linux + VAAPI + Vulkan)
+// ```text
+//   VideoPacket.payload (HEVC NAL)
+//     → avcodec (VAAPI hw decode)
+//     → AVFrame(VAAPI surface)          — лежит в GPU-памяти
+//     → av_hwframe_map(DRM_PRIME)       — ноль копий CPU
+//     → AVDRMFrameDescriptor.objects[0].fd  ← DMA-BUF дескриптор
+//     → dup(fd)                         — берём своё владение
+//     → av_frame_free(drm_frame)        — VASurface возвращается в пул декодера
+//     → DmaBufFrame { fd, modifier, planes… }
+//     → Vulkan: vkImportMemoryFdKHR → VkImage → wgpu::Texture → экран
+// ```
 //
-// | Было                          | Стало                                   |
-// |-------------------------------|-----------------------------------------|
-// | av_frame_alloc() каждый кадр  | один *mut AVFrame, av_frame_unref()     |
-// | Video::new(NV12) каждый кадр  | один Video, переиспользуется scaler'ом  |
-// | .to_vec() × 2                 | copy_from_slice в пул + mem::replace     |
+// ## Ключевое условие работоспособности zero-copy (зеркало encode.rs)
+//
+// VAAPI-устройство должно быть **производным** от DRM-устройства
+// (`av_hwdevice_ctx_create_derived`), иначе DMA-BUF fd, выданный FFmpeg,
+// не может быть импортирован Vulkan-ом: они ссылались бы на разные
+// GEM-пространства. Именно поэтому `init_vaapi_from_drm` повторяет
+// логику `init_hw_contexts` из encode.rs.
+//
+// ## Добавить в backend/mod.rs
+// ```rust
+// pub use desktop::DmaBufFrame;
+//
+// pub enum FrameOutput {
+//     Yuv(YuvFrame),
+//     DmaBuf(DmaBufFrame),   // ← new variant
+//     DirectToSurface,
+//     Pending,
+// }
+// ```
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
+use std::os::unix::io::FromRawFd;
+use std::ptr;
+
 use common::FrameTrace;
+use crate::types::DmaBufFrame;
 use ffmpeg_next::{
     codec,
     format::Pixel,
@@ -27,40 +61,48 @@ use ffmpeg_next::{
     util::frame::video::Video,
     ffi::*,
 };
-use std::ptr;
+
 use super::{BackendError, FrameOutput, VideoBackend, YuvFrame};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DMA-BUF frame descriptor — передаётся в render-поток
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Struct
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct DesktopFfmpegBackend {
-    decoder:  ffmpeg_next::decoder::Video,
-    scaler:   Option<scaling::Context>,
-    last_fmt: Pixel,
+    decoder:        ffmpeg_next::decoder::Video,
+    scaler:         Option<scaling::Context>,
+    last_fmt:       Pixel,
     pending_traces: HashMap<u64, Option<FrameTrace>>,
 
-    // ── Zero-allocation pool ─────────────────────────────────────────────────
+    // ── CPU-путь (fallback) ──────────────────────────────────────────────────
 
     /// Переиспользуемый CPU AVFrame для av_hwframe_transfer_data.
-    /// Живёт всё время работы бекенда; av_frame_unref() сбрасывает данные
-    /// между кадрами без освобождения и повторного выделения памяти.
     transfer_frame: *mut AVFrame,
+    scaler_out:     Option<Video>,
+    y_pool:         Vec<u8>,
+    uv_pool:        Vec<u8>,
 
-    /// Переиспользуемый выходной кадр для SwsScale (только SW-путь).
-    scaler_out: Option<Video>,
+    // ── Zero-copy DMA-BUF путь ───────────────────────────────────────────────
 
-    /// Пул пиксельных буферов. Swap-паттерн:
-    ///   1. resize (no-op если размер совпадает)
-    ///   2. copy_from_slice из ffmpeg
-    ///   3. mem::replace → отдаём буфер в YuvFrame, в struct кладём пустой Vec
-    ///   4. следующий кадр: пустой Vec снова resize до нужного размера
-    ///      (первый раз — malloc; далее — realloc не нужен, capacity уже есть)
-    y_pool:  Vec<u8>,
-    uv_pool: Vec<u8>,
+    /// DRM-устройство (не null → VAAPI производен от DRM → DMA-BUF доступен).
+    /// Хранится только для удержания ссылки; не используется напрямую после init.
+    _drm_dev: *mut AVBufferRef,
+
+    /// Переиспользуемый AVFrame для av_hwframe_map.
+    /// av_frame_unref() сбрасывает DRM-дескриптор между кадрами без аллокации.
+    map_frame: *mut AVFrame,
+
+    /// true — VAAPI создана производной от DRM-устройства, DMA-BUF работает.
+    dmabuf_enabled: bool,
 }
 
-// SAFETY: *mut AVFrame управляется исключительно этим потоком.
+// SAFETY: все *mut AVBufferRef / *mut AVFrame управляются исключительно этим потоком.
 unsafe impl Send for DesktopFfmpegBackend {}
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,7 +110,10 @@ unsafe impl Send for DesktopFfmpegBackend {}
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl DesktopFfmpegBackend {
-    /// Инициализировать ffmpeg и открыть HEVC-декодер (VAAPI → software fallback).
+    /// Инициализировать ffmpeg и открыть HEVC-декодер.
+    ///
+    /// Пытается поднять zero-copy путь (DRM-производный VAAPI + DMA-BUF).
+    /// При неудаче включает прямой VAAPI с CPU-копированием (fallback).
     pub fn new() -> Result<Self, BackendError> {
         ffmpeg_next::init()
             .map_err(|e| BackendError::ConfigError(e.to_string()))?;
@@ -76,37 +121,36 @@ impl DesktopFfmpegBackend {
 
         let codec = codec::decoder::find(codec::Id::HEVC)
             .ok_or_else(|| BackendError::ConfigError(
-                "HEVC codec not found. Install ffmpeg with HEVC support.".into()
+                "HEVC codec not found. Install ffmpeg with HEVC support.".into(),
             ))?;
 
         let mut ctx = codec::context::Context::new();
 
         unsafe {
             let raw = ctx.as_mut_ptr();
-            // Убираем внутреннюю буферизацию кадров — минимальная задержка.
             (*raw).flags |= AV_CODEC_FLAG_LOW_DELAY as i32;
-            // Многопоточность добавляет задержку на одном кадре.
             (*raw).thread_count = 1;
         }
 
-        // ── VAAPI hardware decode ────────────────────────────────────────────
-        unsafe {
-            let mut hw_device_ctx: *mut AVBufferRef = ptr::null_mut();
-            let ret = av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            );
+        // ── Попытка 1: DRM → производный VAAPI (zero-copy DMA-BUF) ──────────
+        //
+        // Зеркало encode.rs: VAAPI должен разделять DRM fd с Vulkan,
+        // чтобы DMA-BUF экспортированный FFmpeg мог быть импортирован
+        // Vulkan без EINVAL.
 
-            if ret < 0 {
-                log::warn!("[Decoder] VAAPI init failed (ret={ret}), using software decode");
-            } else {
-                log::info!("[Decoder] VAAPI hardware decode active");
-                (*ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(hw_device_ctx);
-                av_buffer_unref(&mut hw_device_ctx);
-                (*ctx.as_mut_ptr()).get_format = Some(get_hw_format);
+        let (vaapi_dev, drm_dev, dmabuf_enabled) = unsafe {
+            init_vaapi_from_drm(ctx.as_mut_ptr())
+        };
+
+        unsafe {
+            if !vaapi_dev.is_null() {
+                let raw = ctx.as_mut_ptr();
+                // hw_device_ctx берёт ref; исходный vaapi_dev мы отдадим в _drm_dev.
+                (*raw).hw_device_ctx = av_buffer_ref(vaapi_dev);
+                (*raw).get_format    = Some(get_hw_format);
+                // vaapi_dev нам больше не нужен — декодер держит ref через codec ctx.
+                // Но мы должны вернуть его в поле, чтобы освободить при Drop.
+                // Поэтому НЕ делаем av_buffer_unref здесь; передаём владение в поле.
             }
         }
 
@@ -117,13 +161,24 @@ impl DesktopFfmpegBackend {
             .video()
             .map_err(|e| BackendError::ConfigError(e.to_string()))?;
 
-        // Единственный malloc AVFrame за всё время жизни бекенда.
+        // Единственный CPU AVFrame за всё время жизни бекенда (fallback path).
         let transfer_frame = unsafe { av_frame_alloc() };
         if transfer_frame.is_null() {
             return Err(BackendError::ConfigError("av_frame_alloc failed".into()));
         }
 
-        log::info!("[Decoder] DesktopFfmpegBackend ready");
+        // AVFrame для av_hwframe_map (zero-copy path).
+        let map_frame = unsafe { av_frame_alloc() };
+        if map_frame.is_null() {
+            return Err(BackendError::ConfigError("av_frame_alloc (map) failed".into()));
+        }
+
+        if dmabuf_enabled {
+            log::info!("[Decoder] Zero-copy DMA-BUF path: ACTIVE");
+        } else {
+            log::info!("[Decoder] Zero-copy DMA-BUF path: INACTIVE (CPU copy fallback)");
+        }
+
         Ok(Self {
             decoder,
             scaler:         None,
@@ -133,6 +188,9 @@ impl DesktopFfmpegBackend {
             scaler_out:     None,
             y_pool:         Vec::new(),
             uv_pool:        Vec::new(),
+            _drm_dev:       drm_dev,
+            map_frame,
+            dmabuf_enabled,
         })
     }
 }
@@ -142,6 +200,12 @@ impl Drop for DesktopFfmpegBackend {
         unsafe {
             if !self.transfer_frame.is_null() {
                 av_frame_free(&mut self.transfer_frame);
+            }
+            if !self.map_frame.is_null() {
+                av_frame_free(&mut self.map_frame);
+            }
+            if !self._drm_dev.is_null() {
+                av_buffer_unref(&mut self._drm_dev);
             }
         }
     }
@@ -170,7 +234,6 @@ impl VideoBackend for DesktopFfmpegBackend {
 
         self.pending_traces.insert(frame_id, trace);
 
-        // Защита от утечки: чистим трейсы кадров, которые декодер навсегда дропнул.
         const TRACE_HORIZON: u64 = 120;
         if frame_id > TRACE_HORIZON {
             self.pending_traces.retain(|&k, _| k >= frame_id - TRACE_HORIZON);
@@ -186,18 +249,47 @@ impl VideoBackend for DesktopFfmpegBackend {
             return Ok(FrameOutput::Pending);
         }
 
-        // ── 2. Если кадр на VAAPI surface — скачиваем в CPU NV12 ─────────────
+        // ── 2. Метаданные ─────────────────────────────────────────────────────
+
+        let (frame_id, fmt, w, h) = unsafe {
+            let f: &AVFrame = &*raw.as_ptr();
+            let fid = if f.pts != AV_NOPTS_VALUE { f.pts as u64 } else { 0 };
+            let fmt_sys: AVPixelFormat = std::mem::transmute(f.format);
+            (fid, Pixel::from(fmt_sys), f.width as u32, f.height as u32)
+        };
+
+        let trace = self.pending_traces
+            .remove(&frame_id)
+            .flatten()
+            .unwrap_or_default();
+        let mut trace = trace;
+        trace.decode_us = FrameTrace::now_us();
+
+        // ── 3. Zero-copy путь: VAAPI → av_hwframe_map → DRM_PRIME ────────────
         //
-        // Ключевая оптимизация: вместо av_frame_alloc() + av_frame_free() на
-        // каждом кадре используем один предварительно выделенный transfer_frame.
-        // av_frame_unref() освобождает ссылки на данные, но не саму структуру.
+        // Если VAAPI и DRM-устройство были подняты совместно (dmabuf_enabled),
+        // пытаемся экспортировать VASurface как DMA-BUF без участия CPU.
+        //
+        // Зеркало encode.rs encode_dmabuf_to_vaapi(), но в обратную сторону:
+        //   там:  DRM_PRIME(fd) → av_hwframe_map → VAAPI  (import)
+        //   здесь: VAAPI → av_hwframe_map → DRM_PRIME(fd)  (export)
 
-        let frame_ptr: *const AVFrame = if raw.format() == Pixel::VAAPI {
+        if fmt == Pixel::VAAPI && self.dmabuf_enabled {
+            match unsafe { try_map_vaapi_to_drm(self.map_frame, raw.as_ptr(), frame_id, trace, w, h) } {
+                Ok(frame) => return Ok(FrameOutput::DmaBuf(frame)),
+                Err(e) => {
+                    log::warn!("[Decoder] av_hwframe_map failed ({e}); falling back to CPU copy");
+                    // Сбрасываем map_frame на случай частичного заполнения.
+                    unsafe { av_frame_unref(self.map_frame) };
+                }
+            }
+        }
+
+        // ── 4. CPU-путь (fallback): VAAPI → NV12 CPU ─────────────────────────
+
+        let frame_ptr: *const AVFrame = if fmt == Pixel::VAAPI {
             unsafe {
-                // Сбрасываем данные предыдущего кадра (не освобождает struct).
                 av_frame_unref(self.transfer_frame);
-
-                // Запрашиваем NV12 — единственный формат, поддерживаемый нашим шейдером.
                 (*self.transfer_frame).format = AVPixelFormat::AV_PIX_FMT_NV12 as i32;
 
                 let ret = av_hwframe_transfer_data(
@@ -214,35 +306,14 @@ impl VideoBackend for DesktopFfmpegBackend {
                 self.transfer_frame as *const AVFrame
             }
         } else {
-            unsafe {raw.as_ptr()}
+            unsafe { raw.as_ptr() }
         };
 
-        // ── 3. Читаем метаданные ──────────────────────────────────────────────
-
-        let (frame_id, fmt, w, h) = unsafe {
-            let f: &AVFrame = &*frame_ptr;
-            let fid = if f.pts != AV_NOPTS_VALUE { f.pts as u64 } else { 0 };
-            // ffmpeg_next::format::Pixel::from(i32) через transmute безопасно:
-            // AVPixelFormat — repr(C) enum.
-            let fmt_sys: AVPixelFormat = std::mem::transmute(f.format);
-            let fmt = Pixel::from(fmt_sys);
-            (fid, fmt, f.width as u32, f.height as u32)
-        };
-
-        let trace = self.pending_traces
-            .remove(&frame_id)
-            .flatten()
-            .unwrap_or_default();
-        let mut trace = trace;
-        trace.decode_us = FrameTrace::now_us();
-
-        // ── 4. Конвертируем в NV12 если нужно (SW-путь) ──────────────────────
+        // ── 5. SW fallback: конвертируем в NV12 если нужно ───────────────────
 
         let nv12_ptr: *const AVFrame = if fmt == Pixel::NV12 {
-            // VAAPI путь: кадр уже NV12 в transfer_frame, конвертация не нужна.
             frame_ptr
         } else {
-            // SW fallback: конвертируем через SwsScale в переиспользуемый буфер.
             if fmt != self.last_fmt {
                 self.last_fmt = fmt;
                 self.scaler = Some(
@@ -253,7 +324,6 @@ impl VideoBackend for DesktopFfmpegBackend {
                     )
                     .map_err(|e| BackendError::DecodeError(e.to_string()))?,
                 );
-                // Переиспользуемый выходной буфер для скалера.
                 self.scaler_out = Some(Video::new(Pixel::NV12, w, h));
                 log::debug!("[Decoder] Scaler created: {:?} → NV12 {}×{}", fmt, w, h);
             }
@@ -261,18 +331,14 @@ impl VideoBackend for DesktopFfmpegBackend {
             let sc  = self.scaler.as_mut().unwrap();
             let out = self.scaler_out.as_mut().unwrap();
 
-            // Оборачиваем сырой указатель в Video на время вызова scaler.run.
-            // SAFETY: frame_ptr валиден на протяжении этого блока.
             let src_video = unsafe { Video::wrap(frame_ptr as *mut AVFrame) };
             sc.run(&src_video, out)
                 .map_err(|e| BackendError::DecodeError(e.to_string()))?;
-            // Не допускаем drop Video::wrap — он освободит чужой AVFrame.
             std::mem::forget(src_video);
-
-            unsafe {out.as_ptr()}
+            unsafe { out.as_ptr() }
         };
 
-        // ── 5. Копируем плоскости в пул буферов (ровно одно memcpy на плоскость)
+        // ── 6. Копируем плоскости в пул буферов ──────────────────────────────
 
         let (y_stride, uv_stride, y_len, uv_len) = unsafe {
             let f = &*nv12_ptr;
@@ -281,19 +347,17 @@ impl VideoBackend for DesktopFfmpegBackend {
             (ys, uvs, ys * h as usize, uvs * h as usize / 2)
         };
 
-        // resize: no-op если capacity уже достаточна (после первого кадра).
         self.y_pool.resize(y_len, 0);
         self.uv_pool.resize(uv_len, 0);
 
         unsafe {
             let f = &*nv12_ptr;
-            self.y_pool[..y_len].copy_from_slice(std::slice::from_raw_parts(f.data[0], y_len));
-            self.uv_pool[..uv_len].copy_from_slice(std::slice::from_raw_parts(f.data[1], uv_len));
+            self.y_pool[..y_len]
+                .copy_from_slice(std::slice::from_raw_parts(f.data[0], y_len));
+            self.uv_pool[..uv_len]
+                .copy_from_slice(std::slice::from_raw_parts(f.data[1], uv_len));
         }
 
-        // Swap: отдаём заполненные буферы в YuvFrame, в struct кладём пустые Vec.
-        // Пустой Vec не аллоцирует (capacity == 0); следующий resize восстановит
-        // capacity без malloc, потому что аллокатор вернёт тот же блок.
         let y  = std::mem::replace(&mut self.y_pool,  Vec::new());
         let uv = std::mem::replace(&mut self.uv_pool, Vec::new());
 
@@ -315,10 +379,240 @@ impl VideoBackend for DesktopFfmpegBackend {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Zero-copy: av_hwframe_map VAAPI → DRM_PRIME
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Экспортирует декодированный VAAPI-кадр как DMA-BUF без участия CPU.
+///
+/// # Что происходит
+/// 1. `av_hwframe_map(AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT)` просит
+///    VA-API экспортировать `VASurface` как DRM Prime FD.
+/// 2. Из `AVDRMFrameDescriptor` извлекаем fd, modifier и offsets плоскостей.
+/// 3. `libc::dup(fd)` — берём **своё** владение на fd. После этого можем
+///    безопасно освободить `map_frame` (который разблокирует VASurface).
+/// 4. Возвращаем `DmaBufFrame` с dup-нутым `OwnedFd`.
+///
+/// # Safety
+/// `map_frame` должен быть валидным предвыделенным AVFrame (переиспользуется).
+/// `src` — валидный AVFrame формата AV_PIX_FMT_VAAPI.
+unsafe fn try_map_vaapi_to_drm(
+    map_frame: *mut AVFrame,
+    src:       *const AVFrame,
+    frame_id:  u64,
+    trace:     FrameTrace,
+    width:     u32,
+    height:    u32,
+) -> Result<DmaBufFrame, &'static str> {
+    // Сбрасываем результат предыдущего маппинга.
+    av_frame_unref(map_frame);
+
+    // Указываем желаемый формат — FFmpeg найдёт маппер VAAPI → DRM_PRIME.
+    (*map_frame).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+    (*map_frame).width  = (*src).width;
+    (*map_frame).height = (*src).height;
+
+    // AV_HWFRAME_MAP_READ    = 1  — нам нужен read-доступ (для рендеринга)
+    // AV_HWFRAME_MAP_DIRECT  = 8  — прямой маппинг без промежуточных копий
+    let flags = 1 | 8;
+    let ret = av_hwframe_map(map_frame, src as *mut _, flags);
+    if ret < 0 {
+        return Err("av_hwframe_map returned error");
+    }
+
+    // data[0] → *AVDRMFrameDescriptor (alloced & owned by FFmpeg, живёт пока map_frame жив)
+    let desc_ptr = (*map_frame).data[0] as *const AVDRMFrameDescriptor;
+    if desc_ptr.is_null() {
+        av_frame_unref(map_frame);
+        return Err("AVDRMFrameDescriptor is null after mapping");
+    }
+    let desc = &*desc_ptr;
+
+    if desc.nb_objects < 1 || desc.nb_layers < 1 {
+        av_frame_unref(map_frame);
+        return Err("unexpected DRM descriptor: nb_objects or nb_layers < 1");
+    }
+
+    let obj      = &desc.objects[0];
+    let layer    = &desc.layers[0];
+
+    // Для NV12 обычно 1 layer, 2 planes (или иногда 2 layers × 1 plane каждый).
+    // Поддерживаем оба варианта.
+    let (y_offset, y_pitch, uv_offset, uv_pitch) = if layer.nb_planes >= 2 {
+        // 1 layer, 2 planes (Intel common case)
+        (
+            layer.planes[0].offset as u32,
+            layer.planes[0].pitch  as u32,
+            layer.planes[1].offset as u32,
+            layer.planes[1].pitch  as u32,
+        )
+    } else if desc.nb_layers >= 2 {
+        // 2 layers × 1 plane each (некоторые AMD/Mesa конфигурации)
+        (
+            desc.layers[0].planes[0].offset as u32,
+            desc.layers[0].planes[0].pitch  as u32,
+            desc.layers[1].planes[0].offset as u32,
+            desc.layers[1].planes[0].pitch  as u32,
+        )
+    } else {
+        av_frame_unref(map_frame);
+        return Err("NV12 DRM descriptor: expected 2 planes or 2 layers");
+    };
+
+    let fd_orig    = obj.fd;
+    let modifier   = obj.format_modifier;
+    let total_size = obj.size;
+
+    if fd_orig < 0 {
+        av_frame_unref(map_frame);
+        return Err("DRM object fd is invalid");
+    }
+
+    // dup fd — получаем собственный дескриптор, независимый от AVFrame.
+    let dup_fd = libc::dup(fd_orig);
+    if dup_fd < 0 {
+        av_frame_unref(map_frame);
+        return Err("libc::dup failed for DRM fd");
+    }
+
+    // Освобождаем map_frame: DRM-маппинг снимается, VASurface идёт обратно в
+    // пул декодера. Наш dup_fd продолжает удерживать GEM-объект в памяти GPU.
+    av_frame_unref(map_frame);
+
+    log::trace!(
+        "[DMA-BUF] frame #{frame_id} exported: fd={dup_fd} modifier={modifier:#018x} \
+         y=[off={y_offset} pitch={y_pitch}] uv=[off={uv_offset} pitch={uv_pitch}] \
+         total={total_size}B"
+    );
+
+    Ok(DmaBufFrame {
+        frame_id,
+        trace,
+        width,
+        height,
+        fd: OwnedFd::from_raw_fd(dup_fd),
+        modifier,
+        total_size,
+        y_offset,
+        y_pitch,
+        uv_offset,
+        uv_pitch,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Инициализация: DRM device → производный VAAPI device
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Зеркало init_hw_contexts из encode.rs.
+// Возвращает (vaapi_dev, drm_dev, dmabuf_enabled).
+//
+// vaapi_dev прописывается в codec_ctx и дополнительно возвращается
+// для хранения в поле `_drm_dev` (чтобы ссылка не обнулилась раньше времени).
+// drm_dev — удерживается в `_drm_dev` struct-поле; обнуляется при Drop.
+
+unsafe fn init_vaapi_from_drm(
+    codec_ctx: *mut AVCodecContext,
+) -> (*mut AVBufferRef, *mut AVBufferRef, bool) {
+    // ── Шаг 1: открываем DRM-устройство ─────────────────────────────────────
+
+    let drm_candidates = [
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/card0",
+        "/dev/dri/card1",
+    ];
+
+    let mut drm_dev: *mut AVBufferRef = ptr::null_mut();
+    for node in &drm_candidates {
+        let c = std::ffi::CString::new(*node).unwrap();
+        let ret = av_hwdevice_ctx_create(
+            &mut drm_dev,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+            c.as_ptr(),
+            ptr::null_mut(),
+            0,
+        );
+        if ret >= 0 {
+            log::info!("[Decoder] DRM device opened: {node}");
+            break;
+        }
+    }
+
+    if drm_dev.is_null() {
+        log::warn!(
+            "[Decoder] DRM device unavailable — DMA-BUF zero-copy disabled. \
+             Falling back to direct VAAPI."
+        );
+        // ── Fallback: прямой VAAPI без DRM ───────────────────────────────────
+        let mut vaapi_dev: *mut AVBufferRef = ptr::null_mut();
+        let node = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        let ret = av_hwdevice_ctx_create(
+            &mut vaapi_dev,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            node.as_ptr(),
+            ptr::null_mut(),
+            0,
+        );
+        if ret >= 0 {
+            log::info!("[Decoder] Direct VAAPI active (CPU copy path)");
+            (*codec_ctx).hw_device_ctx = av_buffer_ref(vaapi_dev);
+            (*codec_ctx).get_format    = Some(get_hw_format);
+            return (vaapi_dev, ptr::null_mut(), false);
+        }
+        log::warn!("[Decoder] VAAPI init failed — software decode only");
+        return (ptr::null_mut(), ptr::null_mut(), false);
+    }
+
+    // ── Шаг 2: производим VAAPI от DRM (shared fd — ключевое условие) ───────
+    //
+    // Без av_hwdevice_ctx_create_derived оба контекста использовали бы
+    // разные /dev/dri/renderDxxx fd, и DMA-BUF экспортированный FFmpeg
+    // не был бы импортируем Vulkan-ом (ядро не нашло бы GEM-объект в
+    // другом DRM-файловом-пространстве).
+
+    let mut vaapi_dev: *mut AVBufferRef = ptr::null_mut();
+    let ret = av_hwdevice_ctx_create_derived(
+        &mut vaapi_dev,
+        AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+        drm_dev,
+        0,
+    );
+
+    if ret < 0 {
+        log::warn!(
+            "[Decoder] av_hwdevice_ctx_create_derived(VAAPI←DRM) failed: {ret}. \
+             DMA-BUF zero-copy disabled."
+        );
+        av_buffer_unref(&mut drm_dev);
+
+        // Fallback: создаём VAAPI независимо.
+        let mut vaapi_fallback: *mut AVBufferRef = ptr::null_mut();
+        let node = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        av_hwdevice_ctx_create(
+            &mut vaapi_fallback,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            node.as_ptr(),
+            ptr::null_mut(),
+            0,
+        );
+        if !vaapi_fallback.is_null() {
+            (*codec_ctx).hw_device_ctx = av_buffer_ref(vaapi_fallback);
+            (*codec_ctx).get_format    = Some(get_hw_format);
+        }
+        return (vaapi_fallback, ptr::null_mut(), false);
+    }
+
+    log::info!("[Decoder] VAAPI derived from DRM — DMA-BUF zero-copy ENABLED");
+    // vaapi_dev и drm_dev оба нужны: codec_ctx держит ref на vaapi,
+    // _drm_dev поле держит drm открытым (пока есть производные устройства —
+    // не принципиально, но явно красивее).
+    (vaapi_dev, drm_dev, true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // get_hw_format callback
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Колбэк ffmpeg: выбирает VAAPI из списка форматов, предложенных декодером.
 unsafe extern "C" fn get_hw_format(
     _ctx:     *mut AVCodecContext,
     pix_fmts: *const AVPixelFormat,
@@ -331,7 +625,6 @@ unsafe extern "C" fn get_hw_format(
             }
             p = p.add(1);
         }
-        // Не нашли VAAPI — пусть ffmpeg выберет программный формат.
         AVPixelFormat::AV_PIX_FMT_NONE
     }
 }

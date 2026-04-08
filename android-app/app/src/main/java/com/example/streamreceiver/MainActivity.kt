@@ -22,9 +22,36 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import android.view.Choreographer
 
 private const val STREAM_WIDTH  = 1920
 private const val STREAM_HEIGHT = 1080
+
+private class VsyncBridge {
+    private var running = false
+
+    private val choreographer by lazy { Choreographer.getInstance() }
+
+    private val callback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!running) return
+            NativeLib.onVsync(frameTimeNanos)
+            choreographer.postFrameCallback(this)
+        }
+    }
+
+    fun start() {
+        if (running) return
+        running = true
+        choreographer.postFrameCallback(callback)
+    }
+
+    fun stop() {
+        if (!running) return
+        running = false
+        choreographer.removeFrameCallback(callback)
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,13 +82,29 @@ fun StreamReceiverScreen() {
     var port        by remember { mutableStateOf("4433") }
     var isConnected by remember { mutableStateOf(false) }
     var statusText  by remember { mutableStateOf("") }
+    var latencyStats by remember { mutableStateOf("") }
+    val vsyncBridge = remember { VsyncBridge() }
 
+    DisposableEffect(Unit) {
+        vsyncBridge.start()
+        onDispose {
+            vsyncBridge.stop()
+        }
+    }
     // Автоскрывать статусную плашку через 3 секунды
     LaunchedEffect(statusText) {
         if (statusText.isNotEmpty()) {
             kotlinx.coroutines.delay(3_000)
             statusText = ""
         }
+    }
+
+    LaunchedEffect(isConnected) {
+        while (isConnected) {
+            latencyStats = NativeLib.getLatencyStats()
+            kotlinx.coroutines.delay(500)
+        }
+        latencyStats = ""
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -174,6 +217,19 @@ fun StreamReceiverScreen() {
             ) {
                 Text("Отключить")
             }
+        }
+
+        if (latencyStats.isNotEmpty()) {
+            Text(
+                text = "Lat: $latencyStats",
+                color = Color.Green,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 16.dp, start = 16.dp)
+                    .background(Color.Black.copy(alpha = 0.6f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
         }
 
         // ── Статусная плашка (снизу, автоскрывается через 3с) ────────────────

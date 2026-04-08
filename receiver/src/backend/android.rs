@@ -11,22 +11,24 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::net::ToSocketAddrs;
-
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use jni::{
     objects::{JClass, JObject, JString},
-    sys::{jint},
+    sys::{jint, jstring, jlong},
     EnvUnowned,
     Env
 };
 use once_cell::sync::OnceCell;
 
 use super::{BackendError, FrameOutput, VideoBackend};
-
+use common::FrameTrace;
 // ─────────────────────────────────────────────────────────────────────────────
 // Глобальный синглтон бекенда
 // ─────────────────────────────────────────────────────────────────────────────
 static BACKEND: OnceCell<Arc<Mutex<AndroidMediaCodecBackend>>> = OnceCell::new();
 static NETWORK_RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
+static LATEST_LATENCY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 fn get_or_create_backend() -> Arc<Mutex<AndroidMediaCodecBackend>> {
     BACKEND
@@ -62,13 +64,47 @@ impl Drop for CodecState {
 pub struct AndroidMediaCodecBackend {
     state:        Option<CodecState>,
     frame_pts_us: u64,
+    traces:       VecDeque<FrameTrace>,
 }
 
 impl AndroidMediaCodecBackend {
+    const MAX_PENDING_TRACES: usize = 64;
     pub fn new() -> Self {
         Self {
             state:        None,
             frame_pts_us: 0,
+            traces:       VecDeque::new(),
+        }
+    }
+
+    pub fn on_vsync(&mut self, _frame_time_ns: u64) {
+        if let Some(trace) = self.traces.pop_front() {
+            let offset = crate::network::CLOCK_OFFSET.load(Ordering::Relaxed);
+            
+            // В локальное время телефона (i64, так как offset может быть отрицательным)
+            let local_capture_us = (trace.capture_us as i64).saturating_sub(offset);
+            let present_us = FrameTrace::now_us();
+            
+            let diff_us = present_us.saturating_sub(local_capture_us as u64);
+
+            // Статический счетчик для логов, чтобы не захламлять консоль
+            static mut LOG_THROTTLE: u64 = 0;
+            unsafe {
+                LOG_THROTTLE += 1;
+                if LOG_THROTTLE % 60 == 0 {
+                    log::info!(
+                        "[LatencyDebug] Present: {} | LocalCap: {} | Offset: {} | Diff: {}us",
+                        present_us, local_capture_us, offset, diff_us
+                    );
+                }
+            }
+
+            let total_ms = diff_us as f64 / 1000.0;
+
+            if let Ok(mut lat) = LATEST_LATENCY.lock() {
+                // Если видишь 0.0, значит diff_us после saturating_sub стал нулем
+                *lat = format!("{:.1} ms", total_ms);
+            }
         }
     }
 
@@ -150,39 +186,27 @@ impl AndroidMediaCodecBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl VideoBackend for AndroidMediaCodecBackend {
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, _trace: FrameTrace) -> Result<(), BackendError> {
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<(), BackendError> {
         let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
 
         unsafe {
-            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 5_000);
-
-            if idx == ndk_sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
-                return Err(BackendError::BufferFull);
-            }
-            if idx < 0 {
-                return Err(BackendError::DecodeError(format!("dequeue error: {idx}")));
-            }
-            let idx = idx as usize;
+            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2_000);
+            if idx < 0 { return Ok(()); } 
 
             let mut buf_size: usize = 0;
-            let buf_ptr = ndk_sys::AMediaCodec_getInputBuffer(state.codec, idx, &mut buf_size);
-            if buf_ptr.is_null() {
-                return Err(BackendError::DecodeError("getInputBuffer returned null".into()));
-            }
-
+            let buf_ptr = ndk_sys::AMediaCodec_getInputBuffer(state.codec, idx as usize, &mut buf_size);
             let copy_len = payload.len().min(buf_size);
             ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr, copy_len);
 
-            self.frame_pts_us = frame_id.saturating_mul(16_667);
-
-            let status = ndk_sys::AMediaCodec_queueInputBuffer(
-                state.codec, idx, 0, copy_len, self.frame_pts_us, 0,
-            );
-            if status != ndk_sys::media_status_t(0) {
-                return Err(BackendError::DecodeError(
-                    format!("queueInputBuffer failed: {status:?}")
-                ));
+            // КЛАДЕМ трейс в очередь ПЕРЕД очередью декодера
+            if let Some(t) = trace {
+                // Если очередь слишком разрослась (например, кадры не выходят), чистим старое
+                if self.traces.len() > 64 { self.traces.pop_front(); }
+                self.traces.push_back(t);
             }
+
+            self.frame_pts_us = frame_id.saturating_mul(16_667);
+            ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, self.frame_pts_us, 0);
         }
         Ok(())
     }
@@ -191,26 +215,27 @@ impl VideoBackend for AndroidMediaCodecBackend {
         let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
 
         unsafe {
-            let mut info = ndk_sys::AMediaCodecBufferInfo {
-                offset: 0, size: 0, presentationTimeUs: 0, flags: 0,
-            };
-
+            let mut info = ndk_sys::AMediaCodecBufferInfo { offset: 0, size: 0, presentationTimeUs: 0, flags: 0 };
+            // Используем таймаут 0, чтобы не блокировать сетевой поток
             let idx = ndk_sys::AMediaCodec_dequeueOutputBuffer(state.codec, &mut info, 0);
 
-            match idx {
-                i if i == ndk_sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize => Ok(FrameOutput::Pending),
-                i if i == ndk_sys::AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize => Ok(FrameOutput::Pending),
-                idx if idx >= 0 => {
-                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
-                    Ok(FrameOutput::DirectToSurface)
-                }
-                _ => Ok(FrameOutput::Pending),
+            if idx >= 0 {
+                // КРИТИЧЕСКИЙ МОМЕНТ: Выводим кадр на экран. 
+                // true означает "отрендерить на Surface немедленно"
+                ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
+                
+                // Мы НЕ удаляем из очереди traces здесь! 
+                // Мы удалим его в on_vsync, когда сработает событие обновления экрана.
+                Ok(FrameOutput::DirectToSurface)
+            } else {
+                Ok(FrameOutput::Pending)
             }
         }
     }
 
     fn shutdown(&mut self) {
         self.state = None;
+        self.traces.clear();
     }
 }
 
@@ -338,5 +363,39 @@ pub extern "C" fn Java_com_example_streamreceiver_NativeLib_shutdownBackend(
 fn stop_networking_inner() {
     if let Some(rt) = NETWORK_RT.lock().unwrap().take() {
         rt.shutdown_background(); // не блокирует вызывающий поток
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_streamreceiver_NativeLib_getLatencyStats<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass,
+) -> jstring {
+    let latency = LATEST_LATENCY.lock().unwrap().clone();
+
+    unowned_env
+        .with_env(|env: &mut Env| {
+            env.new_string(latency)
+                .or_else(|_| env.new_string(""))
+                .map(|s| s.into_raw())
+                
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_streamreceiver_NativeLib_onVsync(
+    _env: *mut jni::sys::JNIEnv,
+    _class: JClass,
+    frame_time_ns: jlong,
+) {
+    if frame_time_ns <= 0 {
+        return;
+    }
+
+    if let Some(backend) = BACKEND.get() {
+        if let Ok(mut guard) = backend.lock() {
+            guard.on_vsync(frame_time_ns as u64);
+        }
     }
 }

@@ -33,7 +33,7 @@ use bytes::Bytes;
 use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::{broadcast, mpsc};
-use common::{DatagramChunk, VideoPacket, FrameTrace};
+use common::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +107,32 @@ impl QuicServer {
                     match connecting.await {
                         Ok(conn) => {
                             log::info!("[QUIC] Client connected: {}", conn.remote_address());
+                            
+                            // Создаем отдельную задачу, которая слушает пинги от этого клиента
+                            let ctrl_conn = conn.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match ctrl_conn.read_datagram().await {
+                                        Ok(data) => {
+                                            if let Ok(ControlPacket::Ping { client_time_us }) = postcard::from_bytes(&data) {
+                                                let server_now = FrameTrace::now_us();
+                                                let delta_ms = (server_now as i64 - client_time_us as i64) as f64 / 1000.0;
+                                                
+                                                log::info!("[Sync] Client: {}, Raw Delta: {:.10} ms", ctrl_conn.remote_address(), delta_ms);
+
+                                                let pong = ControlPacket::Pong {
+                                                    client_time_us,
+                                                    server_time_us: server_now,
+                                                };
+                                                if let Ok(bytes) = postcard::to_stdvec(&pong) {
+                                                    let _ = ctrl_conn.send_datagram(bytes.into());
+                                                }
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
                             send_datagrams_to_client(conn, client_rx).await;
                         }
                         Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),

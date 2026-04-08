@@ -112,3 +112,9 @@ impl DatagramChunk {
         Some(Self { frame_id, chunk_idx, total_chunks, is_key, data })
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ControlPacket {
+    Ping { client_time_us: u64 },
+    Pong { client_time_us: u64, server_time_us: u64 },
+}

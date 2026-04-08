@@ -54,4 +54,14 @@ object NativeLib {
      * Внутри также вызывает stopNetworking.
      */
     external fun shutdownBackend()
+
+    /**
+     * Получить текущую задержку (строку) от Rust-бекенда.
+     */
+    external fun getLatencyStats(): String
+
+    /**
+     * Колбек от отрисовки кадра для показа задержки 
+     */
+    external fun onVsync(frameTimeNanos: Long)
 }

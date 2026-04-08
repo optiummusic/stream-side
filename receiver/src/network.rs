@@ -31,20 +31,44 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use tokio::sync::mpsc;
 use bytes::Bytes;
-use common::{DatagramChunk, VideoPacket, FrameTrace};
+use common::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket};
 use quinn::Endpoint;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
 
-use crate::backend::{FrameOutput, VideoBackend};
-
+use crate::{backend::{FrameOutput, VideoBackend}, types::DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Datagram reassembly buffer
 // ─────────────────────────────────────────────────────────────────────────────
+pub static CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
+// Коэффициент сглаживания: 0.1 значит, что новый замер влияет на 10%, 
+// а старое значение сохраняется на 90%.
+const OFFSET_ALPHA: f64 = 0.2;
+
+async fn start_ping_loop(connection: quinn::Connection) {
+    let mut count = 0;
+    loop {
+        let t1 = FrameTrace::now_us();
+        let ping = ControlPacket::Ping { client_time_us: t1 };
+        if let Ok(bytes) = postcard::to_stdvec(&ping) {
+            let _ = connection.send_datagram(bytes.into());
+        }
+        
+        count += 1;
+        let delay = if count < 10 {
+            Duration::from_millis(200) // Быстрая калибровка при старте
+        } else {
+            Duration::from_secs(3)      // Редкое обновление для поддержки
+        };
+        
+        tokio::time::sleep(delay).await;
+    }
+}
 
 struct ReassemblyBuf {
     /// Slot per chunk index; `None` until the chunk arrives.
@@ -112,7 +136,7 @@ impl ReassemblyBuf {
 pub async fn run_quic_receiver<B: VideoBackend>(
     backend:     Arc<Mutex<B>>,
     sender_addr: SocketAddr,
-    frame_tx:    Option<mpsc::Sender<crate::backend::YuvFrame>>,
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
@@ -140,7 +164,10 @@ pub async fn run_quic_receiver<B: VideoBackend>(
         };
 
         log::info!("[QUIC] Connected to {}", conn.remote_address());
-        
+
+        let ping_conn = conn.clone();
+        tokio::spawn(start_ping_loop(ping_conn));
+
         receive_datagrams(conn, backend.clone(), frame_tx.clone()).await;
         log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -155,7 +182,7 @@ pub async fn run_quic_receiver<B: VideoBackend>(
 async fn receive_datagrams<B: VideoBackend>(
     conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
-    frame_tx: Option<mpsc::Sender<crate::backend::YuvFrame>>,
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>
 ) {
     let mut waiting_for_key = false;
     let mut expected_frame_id: Option<u64> = None;
@@ -171,7 +198,37 @@ async fn receive_datagrams<B: VideoBackend>(
                 break;
             }
         };
-
+        if raw.len() < 100 {
+            if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&raw) {
+                if let ControlPacket::Pong { client_time_us, server_time_us } = ctrl {
+                    let t2 = FrameTrace::now_us();
+                    let rtt = t2.saturating_sub(client_time_us);
+                    
+                    // 1. Считаем мгновенное значение (как и раньше)
+                    let new_raw_offset = (server_time_us as i64) - (client_time_us + rtt / 2) as i64;
+                    
+                    // 2. Берем текущее сглаженное значение
+                    let current_offset = CLOCK_OFFSET.load(Ordering::Relaxed);
+                    
+                    let filtered_offset = if current_offset == 0 {
+                        // Если это самый первый замер — сохраняем как есть
+                        new_raw_offset
+                    } else {
+                        // Формула EMA: filtered = current + alpha * (new - current)
+                        let filtered = current_offset as f64 + OFFSET_ALPHA * (new_raw_offset - current_offset) as f64;
+                        filtered as i64
+                    };
+                    
+                    CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
+                    
+                    log::debug!(
+                        "[Sync] RTT: {}ms, Raw: {}us, Filtered: {}us", 
+                        rtt as f64 / 1000.0, new_raw_offset, filtered_offset
+                    );
+                    continue;
+                }
+            }
+        }
         let chunk = match DatagramChunk::decode(raw) {
             Some(c) => c,
             None    => continue,
@@ -258,7 +315,14 @@ async fn receive_datagrams<B: VideoBackend>(
             match backend_lock.poll_output() {
                 Ok(FrameOutput::Yuv(frame)) => {
                     if let Some(ref tx) = frame_tx {
-                        let _ = tx.try_send(frame);
+                        let _ = tx.try_send(DecodedFrame::Yuv(frame));
+                    }
+                }
+                Ok(FrameOutput::DmaBuf(frame)) => {
+                    // Zero-copy путь: VASurface уже экспортирован как DMA-BUF fd.
+                    // render-поток импортирует его в Vulkan без CPU-участия.
+                    if let Some(ref tx) = frame_tx {
+                        let _ = tx.try_send(DecodedFrame::DmaBuf(frame));
                     }
                 }
                 Ok(FrameOutput::DirectToSurface) => {}

@@ -260,9 +260,9 @@ fn run_encoder_loop(
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
         (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*raw).bit_rate       = 20_000_000;
-        (*raw).rc_max_rate    = 100_000_000;
-        (*raw).rc_buffer_size = 20_000_000;
+        (*raw).bit_rate       = 5_000_000;
+        (*raw).rc_max_rate    = 5_000_000;
+        (*raw).rc_buffer_size = 2_000_000;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);

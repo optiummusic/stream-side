@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod network;
+pub mod types;
 
 // Android-инициализация логгера выполняется при загрузке библиотеки
 #[cfg(target_os = "android")]
