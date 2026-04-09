@@ -2,6 +2,7 @@
 name = "receiver"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 # На Android собираем только cdylib (JNI library).
 # На десктопе собираем и rlib (для бинаря), и саму библиотеку.
