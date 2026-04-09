@@ -269,6 +269,8 @@ jobs:
       - name: Build signed APK
         working-directory: android-app
         run: |
+          cd ..
+          cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
 
