@@ -270,6 +270,10 @@ jobs:
       - name: Build signed APK
         working-directory: android-app
         run: |
+          echo "store pass length: ${#KEYSTORE_PASSWORD}"
+          keytool -list \
+            -keystore app/my-release-key.jks \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}"
           chmod +x gradlew
           ./gradlew assembleRelease
 
