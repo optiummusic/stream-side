@@ -245,7 +245,7 @@ jobs:
       - name: Decode keystore
         run: |
           mkdir -p android-app/app
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/app/my-release-key.jks
+          printf "%s" "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/app/my-release-key.jks
 
       - name: Write local.properties
         run: |
@@ -269,11 +269,18 @@ jobs:
 
       - name: Build signed APK
         working-directory: android-app
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           echo "store pass length: ${#KEYSTORE_PASSWORD}"
+          ls -l app/my-release-key.jks
+          
           keytool -list \
             -keystore app/my-release-key.jks \
-            -storepass "${{ secrets.KEYSTORE_PASSWORD }}"
+            -storepass "$KEYSTORE_PASSWORD"
+
           chmod +x gradlew
           ./gradlew assembleRelease
 
