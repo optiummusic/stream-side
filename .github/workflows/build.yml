@@ -252,7 +252,7 @@ jobs:
           sdk.dir=$ANDROID_HOME
           ndk.dir=$ANDROID_NDK_HOME
           PROPS
-          echo "release.store.file=../my-release-key.jks" >> android-app/local.properties
+          echo "release.store.file=my-release-key.jks" >> android-app/local.properties
           echo "release.store.password=${{ secrets.KEYSTORE_PASSWORD }}" >> android-app/local.properties
           echo "release.key.password=${{ secrets.KEY_PASSWORD }}" >> android-app/local.properties
           echo "release.key.alias=${{ secrets.KEY_ALIAS }}" >> android-app/local.properties
@@ -269,8 +269,6 @@ jobs:
       - name: Build signed APK
         working-directory: android-app
         run: |
-          cd ..
-          cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
 
