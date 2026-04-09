@@ -13,26 +13,27 @@ jobs:
   # Linux sender
   # ─────────────────────────────────────────────────────────────────────────────
   build-sender-linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
+ 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libva-dev libdrm-dev libpipewire-0.3-dev \
+            libva-dev libdrm-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
             libssl-dev pkg-config \
             nasm yasm cmake ninja-build \
             libx264-dev libx265-dev
-
+ 
       - name: Restore FFmpeg cache
         id: cache-ffmpeg-sender
         uses: actions/cache@v4
         with:
           path: /opt/ffmpeg
-          key: ffmpeg-n8.1-ubuntu22-sender
-
+          key: ffmpeg-n8.1-ubuntu24-sender
+ 
       - name: Build FFmpeg n8.1
         if: steps.cache-ffmpeg-sender.outputs.cache-hit != 'true'
         run: |
@@ -49,22 +50,22 @@ jobs:
             --enable-nonfree
           make -j$(nproc)
           make install
-
+ 
       - name: Set FFmpeg env
         run: |
           echo "FFMPEG_DIR=/opt/ffmpeg" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib" >> $GITHUB_ENV
-
+ 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
+ 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-
+ 
       - name: Build sender
         run: cargo build -p sender --release
-
+ 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

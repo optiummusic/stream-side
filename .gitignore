@@ -5,7 +5,6 @@ output.mp4
 /android-app/.gradle
 .gitignore
 android-app/local.properties
-android-app/gradle/wrapper/gradle-wrapper.jar
 android-app/app/my-release-key.jks
 *.zip
 *.svg
