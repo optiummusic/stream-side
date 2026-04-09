@@ -55,7 +55,10 @@ use std::os::unix::io::FromRawFd;
 use std::ptr;
 
 use common::FrameTrace;
+
+#[cfg(unix)]
 use crate::types::DmaBufFrame;
+
 use ffmpeg_next::{
     codec,
     format::Pixel,
