@@ -249,7 +249,7 @@ jobs:
 
       - name: Write local.properties
         run: |
-          cat > android-app/local.properties <<EOF
+          cat > android-app/local.properties <<'EOF'
           sdk.dir=$ANDROID_HOME
           ndk.dir=$ANDROID_NDK_HOME
           release.store.file=my-release-key.jks
@@ -276,6 +276,7 @@ jobs:
         run: |
           echo "store pass length: ${#KEYSTORE_PASSWORD}"
           ls -l app/my-release-key.jks
+          cat -A android-app/local.properties
           
           keytool -list \
             -keystore app/my-release-key.jks \
