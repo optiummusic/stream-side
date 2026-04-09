@@ -244,8 +244,9 @@ jobs:
 
       - name: Decode keystore
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/my-release-key.jks
-
+          mkdir -p android-app/app
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/app/my-release-key.jks
+          
       - name: Write local.properties
         run: |
           cat > android-app/local.properties << 'PROPS'
