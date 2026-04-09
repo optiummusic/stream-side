@@ -55,7 +55,10 @@ use stream_receiver::backend::{
     VideoBackend, YuvFrame,
 };
 use stream_receiver::network::run_quic_receiver;
-use stream_receiver::types::{DmaBufFrame, DecodedFrame};
+
+#[cfg(unix)]
+use stream_receiver::types::{DmaBufFrame};
+use stream_receiver::types::{DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Канальный тип: CPU-кадр или zero-copy DMA-BUF кадр
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +139,8 @@ impl DmaBufAllocator {
     /// # Safety
     /// `fd` должен быть валидным DMA-BUF дескриптором.
     /// `wgpu_device` должен использовать Vulkan бэкенд.
+    /// 
+    #[cfg(unix)]
     unsafe fn import_plane(
         &self,
         wgpu_device: &wgpu::Device,
@@ -363,6 +368,8 @@ impl DmaBufAllocator {
     ///
     /// Возвращает (y_tex, uv_tex) или None при любой ошибке.
     /// При None вызывающий должен откатиться на CPU-путь.
+    
+    #[cfg(unix)]
     pub unsafe fn import_nv12(
         &self,
         wgpu_device: &wgpu::Device,
@@ -712,7 +719,7 @@ impl WgpuState {
     }
 
     // ── Zero-copy путь: импортируем DMA-BUF fd как Vulkan текстуры ───────────
-
+    #[cfg(unix)]
     fn update_textures_dmabuf(&mut self, frame: &DmaBufFrame) -> bool {
         let alloc = match &self.dmabuf {
             Some(a) => a,

@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
 
-
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # Linux sender
@@ -23,9 +22,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libva-dev libdrm-dev libpipewire-0.3-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libavfilter-dev libavdevice-dev \
-            libssl-dev pkg-config
+            libssl-dev pkg-config \
+            nasm yasm cmake ninja-build \
+            libx264-dev libx265-dev
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg-sender
+        uses: actions/cache@v4
+        with:
+          path: /opt/ffmpeg
+          key: ffmpeg-n8.1-ubuntu22-sender
+
+      - name: Build FFmpeg n8.1
+        if: steps.cache-ffmpeg-sender.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src
+          cd /tmp/ffmpeg-src
+          ./configure \
+            --prefix=/opt/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-vaapi \
+            --enable-libdrm \
+            --disable-doc \
+            --disable-programs \
+            --enable-nonfree
+          make -j$(nproc)
+          make install
+
+      - name: Set FFmpeg env
+        run: |
+          echo "FFMPEG_DIR=/opt/ffmpeg" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -55,10 +84,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libva-dev libdrm-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libavfilter-dev libavdevice-dev \
             libssl-dev pkg-config \
-            libvulkan-dev vulkan-tools
+            libvulkan-dev \
+            nasm yasm cmake ninja-build \
+            libx264-dev libx265-dev
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg-receiver
+        uses: actions/cache@v4
+        with:
+          path: /opt/ffmpeg
+          key: ffmpeg-n8.1-ubuntu22-receiver
+
+      - name: Build FFmpeg n8.1
+        if: steps.cache-ffmpeg-receiver.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src
+          cd /tmp/ffmpeg-src
+          ./configure \
+            --prefix=/opt/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-vaapi \
+            --enable-libdrm \
+            --disable-doc \
+            --disable-programs \
+            --enable-nonfree
+          make -j$(nproc)
+          make install
+
+      - name: Set FFmpeg env
+        run: |
+          echo "FFMPEG_DIR=/opt/ffmpeg" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -199,6 +258,7 @@ jobs:
 
       - name: Build Rust JNI lib
         run: |
+          cd receiver
           cargo ndk \
             -t arm64-v8a \
             -P 26 \
@@ -216,6 +276,7 @@ jobs:
         with:
           name: receiver-android
           path: android-app/app/build/outputs/apk/release/app-release.apk
+
 
   release:
     needs:
