@@ -54,6 +54,7 @@ android {
             storePassword props['release.store.password']
             keyAlias props['release.key.alias']
             keyPassword props['release.key.password']
+            storeType "jks"
         }
     }
 

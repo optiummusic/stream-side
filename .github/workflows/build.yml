@@ -246,17 +246,17 @@ jobs:
         run: |
           mkdir -p android-app/app
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/app/my-release-key.jks
-          
+
       - name: Write local.properties
         run: |
-          cat > android-app/local.properties << 'PROPS'
+          cat > android-app/local.properties <<EOF
           sdk.dir=$ANDROID_HOME
           ndk.dir=$ANDROID_NDK_HOME
-          PROPS
-          echo "release.store.file=my-release-key.jks" >> android-app/local.properties
-          echo "release.store.password=${{ secrets.KEYSTORE_PASSWORD }}" >> android-app/local.properties
-          echo "release.key.password=${{ secrets.KEY_PASSWORD }}" >> android-app/local.properties
-          echo "release.key.alias=${{ secrets.KEY_ALIAS }}" >> android-app/local.properties
+          release.store.file=my-release-key.jks
+          release.store.password=${{ secrets.KEYSTORE_PASSWORD }}
+          release.key.password=${{ secrets.KEY_PASSWORD }}
+          release.key.alias=${{ secrets.KEY_ALIAS }}
+          EOF
 
       - name: Build Rust JNI lib
         run: |
