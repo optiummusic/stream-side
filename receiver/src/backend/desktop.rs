@@ -48,7 +48,9 @@
 // ```
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::ptr;
 
