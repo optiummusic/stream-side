@@ -276,7 +276,7 @@ jobs:
         run: |
           echo "store pass length: ${#KEYSTORE_PASSWORD}"
           ls -l app/my-release-key.jks
-          cat -A android-app/local.properties
+          cat -A local.properties
           
           keytool -list \
             -keystore app/my-release-key.jks \
