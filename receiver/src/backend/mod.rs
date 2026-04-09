@@ -17,6 +17,8 @@
 
 use std::fmt;
 use common::FrameTrace;
+
+#[cfg(unix)]
 pub use crate::types::DmaBufFrame;
 
 // ─────────────────────────────────────────

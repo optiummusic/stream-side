@@ -869,6 +869,8 @@ impl ApplicationHandler for App {
                 // 1. Вытаскиваем данные кадра заранее, пока decoded еще доступен
                 let (frame_id, frame_trace) = match &decoded {
                     DecodedFrame::Yuv(f)    => (f.frame_id, f.trace),
+
+                    #[cfg(unix)]
                     DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                 };
 
@@ -877,6 +879,8 @@ impl ApplicationHandler for App {
                     DecodedFrame::Yuv(frame) => {
                         state.update_textures_cpu(&frame);
                     }
+
+                    #[cfg(unix)]
                     DecodedFrame::DmaBuf(frame) => {
                         if !state.update_textures_dmabuf(&frame) {
                             log::warn!("[Render] DMA-BUF import failed for frame #{}", frame_id);

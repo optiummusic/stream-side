@@ -7,6 +7,8 @@ use crate::backend::{YuvFrame};
 
 pub enum DecodedFrame {
     Yuv(YuvFrame),
+    
+    #[cfg(unix)]
     DmaBuf(DmaBufFrame),
 }
 
