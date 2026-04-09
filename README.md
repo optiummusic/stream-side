@@ -4,6 +4,7 @@ In the streamcapture folder:
 Run sender (only linux pipewire as of now) = 
 1) cargo run --release (accepts all connections to port 4433)
 2) cargo run --release <listen_addr> (accepts connections to listen addr to port 4433)
+
 Run receiver = cargo run --release -p receiver --features="desktop" (IP or DDNS to whihch you wanna connect with port 4433. e.g.) 127.0.0.1:4433
 
 In the receiver folder:
