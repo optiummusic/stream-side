@@ -50,10 +50,11 @@ android {
 
     signingConfigs {
         release {
-            storeFile file("my-release-key.jks")
+            storeFile file(props['release.store.file'] ?: "my-release-key.jks")
             storePassword props['release.store.password']
             keyAlias props['release.key.alias']
             keyPassword props['release.key.password']
+            storeType "jks"
         }
     }
 

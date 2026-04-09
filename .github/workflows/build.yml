@@ -1,79 +1,322 @@
-name: Build Windows Receiver
+name: Release
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Linux sender
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-sender-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libva-dev libdrm-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libssl-dev pkg-config \
+            nasm yasm cmake ninja-build \
+            libx264-dev libx265-dev
+ 
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg-sender
+        uses: actions/cache@v4
+        with:
+          path: /opt/ffmpeg
+          key: ffmpeg-n8.1-ubuntu24-sender
+ 
+      - name: Build FFmpeg n8.1
+        if: steps.cache-ffmpeg-sender.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src
+          cd /tmp/ffmpeg-src
+          ./configure \
+            --prefix=/opt/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-vaapi \
+            --enable-libdrm \
+            --disable-doc \
+            --disable-programs \
+            --enable-nonfree
+          make -j$(nproc)
+          make install
+ 
+      - name: Set FFmpeg env
+        run: |
+          echo "FFMPEG_DIR=/opt/ffmpeg" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib" >> $GITHUB_ENV
+ 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+ 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+ 
+      - name: Build sender
+        run: cargo build -p sender --release
+ 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sender-linux
+          path: target/release/sender
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Linux receiver
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-receiver-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libva-dev libdrm-dev \
+            libssl-dev pkg-config \
+            libvulkan-dev \
+            nasm yasm cmake ninja-build \
+            libx264-dev libx265-dev
+
+      - name: Restore FFmpeg cache
+        id: cache-ffmpeg-receiver
+        uses: actions/cache@v4
+        with:
+          path: /opt/ffmpeg
+          key: ffmpeg-n8.1-ubuntu22-receiver
+
+      - name: Build FFmpeg n8.1
+        if: steps.cache-ffmpeg-receiver.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src
+          cd /tmp/ffmpeg-src
+          ./configure \
+            --prefix=/opt/ffmpeg \
+            --enable-shared \
+            --disable-static \
+            --enable-vaapi \
+            --enable-libdrm \
+            --disable-doc \
+            --disable-programs \
+            --enable-nonfree
+          make -j$(nproc)
+          make install
+
+      - name: Set FFmpeg env
+        run: |
+          echo "FFMPEG_DIR=/opt/ffmpeg" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib" >> $GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build receiver
+        run: cargo build -p receiver --release --features="desktop"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: receiver-linux
+          path: target/release/receiver
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Windows receiver
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-receiver-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # 1. Кэшируем только установленные библиотеки FFmpeg
-      - name: Restore vcpkg artifacts cache
+      - name: Restore vcpkg cache
         id: cache-vcpkg
         uses: actions/cache/restore@v4
         with:
           path: C:/vcpkg/installed
-          # Кэш привязан к ОС и твоему Cargo.toml (если там меняются версии)
           key: ${{ runner.os }}-vcpkg-ffmpeg-${{ hashFiles('Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-ffmpeg-
 
-      # 2. Устанавливаем FFmpeg через системный vcpkg, если нет в кэше
       - name: Install FFmpeg via vcpkg
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: vcpkg install ffmpeg:x64-windows
 
-      # 3. Сохраняем кэш собранного FFmpeg сразу (чтобы не пересобирать при ошибках Rust)
-      - name: Save vcpkg artifacts cache
+      - name: Save vcpkg cache
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: C:/vcpkg/installed
           key: ${{ runner.os }}-vcpkg-ffmpeg-${{ hashFiles('Cargo.toml') }}
 
-      # 4. Прописываем пути к FFmpeg для компилятора Rust (ffmpeg-next)
-      - name: Set FFmpeg Environment Variables
+      - name: Set FFmpeg env
         shell: bash
         run: |
-          # В GitHub Actions vcpkg ставит всё в C:/vcpkg/installed
           VCPKG_INSTALLED="C:/vcpkg/installed/x64-windows"
           echo "FFMPEG_DIR=$VCPKG_INSTALLED" >> $GITHUB_ENV
           echo "$VCPKG_INSTALLED/bin" >> $GITHUB_PATH
 
-      # 5. Кэшируем зависимости самого Rust
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      # 6. Собираем только ресивер
-      - name: Build and Prepare Artifact
+      - name: Build receiver
         shell: bash
         run: |
-          # Собираем
           cargo build -p receiver --release --features="desktop"
-          
-          # Копируем DLL из vcpkg прямо к экзешнику
-          # Это нужно и для артефакта, и чтобы экзешник вообще запустился у пользователя
           cp C:/vcpkg/installed/x64-windows/bin/*.dll target/release/
-          
-          # Проверим, что всё на месте (для логов)
-          ls -lh target/release/receiver.exe
-          ls -lh target/release/*.dll
 
-      # 7. Выгружаем всю папку release (или только нужные файлы из неё)
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: receiver-windows
-          # Теперь путь один, и он внутри воркспейса
           path: |
             target/release/receiver.exe
             target/release/*.dll
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Android receiver
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-receiver-android:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Restore NDK cache
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          key: android-ndk-29.0.14206865
+
+      - name: Install NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: sdkmanager "ndk;29.0.14206865"
+
+      - name: Set ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> $GITHUB_ENV
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android-app/**/*.gradle*', 'android-app/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Decode keystore
+        run: |
+          mkdir -p android-app/app
+          printf "%s" "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android-app/app/my-release-key.jks
+
+      - name: Write local.properties
+        run: |
+          cat > android-app/local.properties <<'EOF'
+          sdk.dir=$ANDROID_HOME
+          ndk.dir=$ANDROID_NDK_HOME
+          release.store.file=my-release-key.jks
+          release.store.password=${{ secrets.KEYSTORE_PASSWORD }}
+          release.key.password=${{ secrets.KEY_PASSWORD }}
+          release.key.alias=${{ secrets.KEY_ALIAS }}
+          EOF
+
+      - name: Build Rust JNI lib
+        run: |
+          cd receiver
+          cargo ndk \
+            -t arm64-v8a \
+            -P 26 \
+            -o android-app/app/src/main/jniLibs \
+            build --release
+
+      - name: Build signed APK
+        working-directory: android-app
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: receiver-android
+          path: android-app/app/build/outputs/apk/release/app-release.apk
+
+
+  release:
+    needs:
+      - build-sender-linux
+      - build-receiver-linux
+      - build-receiver-windows
+      - build-receiver-android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          chmod +x artifacts/sender-linux/sender
+          chmod +x artifacts/receiver-linux/receiver
+
+          zip -j sender-linux-x86_64.zip       artifacts/sender-linux/sender
+          zip -j receiver-linux-x86_64.zip     artifacts/receiver-linux/receiver
+          zip -j receiver-windows-x86_64.zip   artifacts/receiver-windows/receiver.exe \
+                                                artifacts/receiver-windows/*.dll
+          cp artifacts/receiver-android/app-release.apk receiver-android.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            sender-linux-x86_64.zip
+            receiver-linux-x86_64.zip
+            receiver-windows-x86_64.zip
+            receiver-android.apk

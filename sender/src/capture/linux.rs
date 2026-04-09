@@ -144,7 +144,7 @@ async fn run_portal() -> ashpd::Result<(u32, i32, Option<(i32, i32)>)> {
         &session,
         SelectSourcesOptions::default()
             .set_cursor_mode(CursorMode::Embedded)
-            .set_sources(SourceType::Monitor | SourceType::Window)
+            .set_sources(SourceType::Monitor | SourceType::Window | SourceType::Virtual)
             .set_multiple(false)
             .set_persist_mode(PersistMode::DoNot),
     )

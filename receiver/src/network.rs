@@ -543,6 +543,8 @@ async fn handle_video_chunk<B: VideoBackend>(
         for frame in decoded_frames {
             let _ = match frame {
                 FrameOutput::Yuv(f) => tx.try_send(DecodedFrame::Yuv(f)),
+                
+                #[cfg(unix)]
                 FrameOutput::DmaBuf(f) => tx.try_send(DecodedFrame::DmaBuf(f)),
                 _ => Ok(()),
             };
