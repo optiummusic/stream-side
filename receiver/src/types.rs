@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 
 use common::FrameTrace;
@@ -15,6 +16,9 @@ pub enum DecodedFrame {
 /// память. CPU пиксельные данные не касается вообще.
 ///
 /// `fd` закрывается автоматически при Drop.
+/// 
+#[cfg(unix)]
+#[derive(Debug)]
 pub struct DmaBufFrame {
     pub frame_id:   u64,
     pub trace:      FrameTrace,

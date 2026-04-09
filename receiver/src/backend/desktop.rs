@@ -276,6 +276,7 @@ impl VideoBackend for DesktopFfmpegBackend {
         //   там:  DRM_PRIME(fd) → av_hwframe_map → VAAPI  (import)
         //   здесь: VAAPI → av_hwframe_map → DRM_PRIME(fd)  (export)
 
+        #[cfg(unix)]
         if fmt == Pixel::VAAPI && self.dmabuf_enabled {
             match unsafe { try_map_vaapi_to_drm(self.map_frame, raw.as_ptr(), frame_id, trace, w, h) } {
                 Ok(frame) => return Ok(FrameOutput::DmaBuf(frame)),
@@ -397,6 +398,7 @@ impl VideoBackend for DesktopFfmpegBackend {
 /// # Safety
 /// `map_frame` должен быть валидным предвыделенным AVFrame (переиспользуется).
 /// `src` — валидный AVFrame формата AV_PIX_FMT_VAAPI.
+#[cfg(unix)]
 unsafe fn try_map_vaapi_to_drm(
     map_frame: *mut AVFrame,
     src:       *const AVFrame,
