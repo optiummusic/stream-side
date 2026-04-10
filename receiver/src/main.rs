@@ -299,13 +299,13 @@ impl DmaBufAllocator {
         // Для Y-плоскости обычно 0, для UV — stride * height (или с выравниванием).
         // Требование: bind_offset должен быть кратен mem_reqs.alignment.
 
-        let mem_reqs = self.device.get_image_memory_requirements(vk_image);
+        let mem_reqs = unsafe { self.device.get_image_memory_requirements(vk_image) };
         let aligned_offset = align_up(bind_offset, mem_reqs.alignment);
 
-        if let Err(e) = self.device.bind_image_memory(vk_image, vk_memory, aligned_offset) {
+        if let Err(e) = unsafe { self.device.bind_image_memory(vk_image, vk_memory, aligned_offset) } {
             log::error!("[DMA-BUF] vkBindImageMemory failed: {e}");
-            self.device.destroy_image(vk_image, None);
-            self.device.free_memory(vk_memory, None);
+            unsafe { self.device.destroy_image(vk_image, None) };
+            unsafe { self.device.free_memory(vk_memory, None) };
             return None;
         }
 
@@ -379,7 +379,7 @@ impl DmaBufAllocator {
         let raw_fd = frame.fd.as_raw_fd();
 
         // Y-плоскость: R8Unorm, полный размер
-        let y_tex = self.import_plane(
+        let y_tex = unsafe { self.import_plane(
             wgpu_device,
             raw_fd,
             frame.total_size,
@@ -390,10 +390,10 @@ impl DmaBufAllocator {
             frame.height,
             vk::Format::R8_UNORM,
             wgpu::TextureFormat::R8Unorm,
-        )?;
+        ) }?;
 
         // UV-плоскость: Rg8Unorm, половинный размер
-        let uv_tex = self.import_plane(
+        let uv_tex = unsafe { self.import_plane(
             wgpu_device,
             raw_fd,
             frame.total_size,
@@ -404,7 +404,7 @@ impl DmaBufAllocator {
             frame.height / 2,
             vk::Format::R8G8_UNORM,
             wgpu::TextureFormat::Rg8Unorm,
-        )?;
+        ) }?;
 
         Some((y_tex, uv_tex))
     }
@@ -950,6 +950,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        eprintln!("Usage: {} <ip:port>", args[0]);
+        eprintln!("Example: {} 192.168.1.5:5000", args[0]);
+        std::process::exit(1);
+    }
+
     let addr: SocketAddr = args[1]
         .to_socket_addrs()?
         .next()

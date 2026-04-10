@@ -91,7 +91,12 @@ pub enum FrameOutput {
     Pending,
 
     /// Декодер выплюнул кадр
-    Dropped,
+    Dropped{age: Option<f32>},
+}
+
+pub enum PushStatus {
+    Accepted,
+    Dropped{age: Option<f32>},
 }
 
 // ─────────────────────────────────────────
@@ -127,7 +132,7 @@ pub trait VideoBackend: Send + 'static {
     ///
     /// На десктопе: передаёт пакет в ffmpeg-декодер.
     /// На Android:  копирует данные во входной буфер AMediaCodec.
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>,) -> Result<(), BackendError>;
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>,) -> Result<PushStatus, BackendError>;
 
     /// Получить один декодированный кадр из выходной очереди (если готов).
     ///

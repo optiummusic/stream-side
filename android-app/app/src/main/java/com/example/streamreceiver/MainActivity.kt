@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun StreamReceiverScreen() {
     // ── Состояние ────────────────────────────────────────────────────────────
-    var host        by remember { mutableStateOf("192.168.1.100") }
+    var host        by remember { mutableStateOf("") }
     var port        by remember { mutableStateOf("4433") }
     var isConnected by remember { mutableStateOf(false) }
     var statusText  by remember { mutableStateOf("") }
@@ -135,7 +135,7 @@ fun StreamReceiverScreen() {
                             // После возврата платформа уничтожает Surface — UB если Rust ещё пишет в него.
                             NativeLib.shutdownBackend()
                             isConnected = false
-                            statusText  = "Surface уничтожен"
+                            statusText  = "Surface destroyed"
                         }
                     })
                 }
@@ -159,7 +159,7 @@ fun StreamReceiverScreen() {
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Text(
-                            text  = "Подключение к sender'у",
+                            text  = "Connecting..",
                             style = MaterialTheme.typography.titleMedium,
                         )
 
@@ -167,7 +167,7 @@ fun StreamReceiverScreen() {
                             value         = host,
                             onValueChange = { host = it },
                             label         = { Text("IP адрес") },
-                            placeholder   = { Text("192.168.1.100") },
+                            placeholder   = { Text("") },
                             singleLine    = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                             modifier      = Modifier.fillMaxWidth(),
@@ -176,7 +176,7 @@ fun StreamReceiverScreen() {
                         OutlinedTextField(
                             value         = port,
                             onValueChange = { v -> if (v.all { it.isDigit() } && v.length <= 5) port = v },
-                            label         = { Text("Порт") },
+                            label         = { Text("Port") },
                             singleLine    = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             modifier      = Modifier.fillMaxWidth(),
@@ -187,12 +187,12 @@ fun StreamReceiverScreen() {
                                 val portInt = port.toIntOrNull() ?: 4433
                                 NativeLib.startNetworking(host, portInt)
                                 isConnected = true
-                                statusText  = "Подключение к $host:$portInt..."
+                                statusText  = "Connecting to $host:$portInt..."
                             },
                             modifier = Modifier.fillMaxWidth(),
                             enabled  = host.isNotBlank() && port.isNotBlank(),
                         ) {
-                            Text("Подключиться")
+                            Text("Connect")
                         }
                     }
                 }
@@ -205,7 +205,7 @@ fun StreamReceiverScreen() {
                 onClick  = {
                     NativeLib.stopNetworking()
                     isConnected = false
-                    statusText  = "Отключено"
+                    statusText  = "Disabled"
                 },
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -215,7 +215,7 @@ fun StreamReceiverScreen() {
                     contentColor   = MaterialTheme.colorScheme.onErrorContainer,
                 ),
             ) {
-                Text("Отключить")
+                Text("Disable")
             }
         }
 

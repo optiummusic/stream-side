@@ -22,15 +22,17 @@ use jni::{
 };
 use once_cell::sync::OnceCell;
 
-use super::{BackendError, FrameOutput, VideoBackend};
+use super::{BackendError, FrameOutput, PushStatus, VideoBackend};
 use common::FrameTrace;
 // ─────────────────────────────────────────────────────────────────────────────
 // Глобальный синглтон бекенда
 // ─────────────────────────────────────────────────────────────────────────────
 static BACKEND: OnceCell<Arc<Mutex<AndroidMediaCodecBackend>>> = OnceCell::new();
 static NETWORK_RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
-static LATEST_LATENCY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static LATEST_LATENCY: Mutex<String> = Mutex::new(String::new());
 static TRACE_TX: OnceCell<watch::Sender<Option<(u64, FrameTrace)>>> = OnceCell::new();
+
+static PENDING_VSYNC_INFO: Mutex<Option<(u64, FrameTrace)>> = Mutex::new(None);
 
 fn get_or_create_backend() -> Arc<Mutex<AndroidMediaCodecBackend>> {
     BACKEND
@@ -65,9 +67,7 @@ impl Drop for CodecState {
 // ─────────────────────────────────────────────────────────────────────────────
 pub struct AndroidMediaCodecBackend {
     state:        Option<CodecState>,
-    frame_pts_us: u64,
-    traces:       VecDeque<(u64, FrameTrace)>,
-    last_rendered: Option<(u64, FrameTrace)>,
+    pts_to_frame: HashMap<u64, (u64, FrameTrace)>,
 }
 
 impl AndroidMediaCodecBackend {
@@ -75,28 +75,16 @@ impl AndroidMediaCodecBackend {
     pub fn new() -> Self {
         Self {
             state:        None,
-            frame_pts_us: 0,
-            traces:       VecDeque::new(),
-            last_rendered: None,
+            pts_to_frame: HashMap::new(),
         }
     }
 
-    pub fn on_vsync(&mut self, _frame_time_ns: u64) {
-        let Some((frame_id, mut trace)) = self.last_rendered.take() else { return };
-
-        let offset = common::CLOCK_OFFSET.load(Ordering::Relaxed);
-        let local_capture_us = (trace.capture_us as i64).saturating_sub(offset);
-        let present_us = FrameTrace::now_us();
-
-        let diff_us = present_us as i64 - local_capture_us;
-        if diff_us <= 0 { return; }
-
-        trace.present_us = present_us;
-        if let Some(tx) = TRACE_TX.get() {
-            let _ = tx.send(Some((frame_id, trace)));
-        }
-        if let Ok(mut lat) = LATEST_LATENCY.lock() {
-            *lat = format!("{:.1} ms", diff_us as f64 / 1000.0);
+    fn flush_decoder(&mut self) {
+        if let Some(state) = &self.state {
+            unsafe {
+                ndk_sys::AMediaCodec_flush(state.codec);
+            }
+            self.pts_to_frame.clear();
         }
     }
 
@@ -145,7 +133,11 @@ impl AndroidMediaCodecBackend {
         fmt_i32!("adaptive-playback", 1);
         fmt_i32!("low-latency",       1);
         fmt_i32!("priority",          0);
-        fmt_i32!("operating-rate",    60);
+        fmt_i32!("operating-rate",    120);
+        fmt_i32!("vendor.qti-ext-dec-low-latency.enable", 1);
+        fmt_i32!("latency",           0);
+        fmt_i32!("async-crpto",       0);
+
 
         let status = unsafe { ndk_sys::AMediaCodec_configure(
             codec, format, native_window, ptr::null_mut(), 0,
@@ -176,81 +168,73 @@ impl AndroidMediaCodecBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 // Реализация трейта VideoBackend
 // ─────────────────────────────────────────────────────────────────────────────
+const MAX_AGE_PUSH: f64 = 75.0;
+const MAX_AGE_POLL: f64 = 150.0; // Pre Poll
+const CRITICAL_AGE_FLUSH: f64 = 300.0;
 
 impl VideoBackend for AndroidMediaCodecBackend {
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<(), BackendError> {
-        let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
 
-        let mut trace = trace;
-        if let Some(t) = trace.as_mut() {
-            t.reassembled_us = FrameTrace::now_us();
+        // Drop old chunks
+        if let Some(t) = &trace {
+            let age_ms = FrameTrace::ms(t.receive_us, FrameTrace::now_us());
+
+            if age_ms > CRITICAL_AGE_FLUSH {
+                self.flush_decoder();
+                return Ok(PushStatus::Dropped { age: Some(age_ms as f32) });
+            }
+
+            if age_ms > MAX_AGE_PUSH {
+                return Ok(PushStatus::Dropped{age: Some(age_ms as f32)});
+            }
         }
-
+        let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
+        let pts_us = FrameTrace::now_us(); 
         unsafe {
-            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2_000);
-            if idx < 0 { return Ok(()); } 
+            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2000);
+            if idx < 0 { return Ok(PushStatus::Dropped { age: None }); } 
 
             let mut buf_size: usize = 0;
             let buf_ptr = ndk_sys::AMediaCodec_getInputBuffer(state.codec, idx as usize, &mut buf_size);
             let copy_len = payload.len().min(buf_size);
             ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr, copy_len);
 
-            // КЛАДЕМ трейс в очередь ПЕРЕД очередью декодера
             if let Some(mut t) = trace {
-                // Если очередь слишком разрослась (например, кадры не выходят), чистим старое
-                t.decode_us = FrameTrace::now_us();
-                if self.traces.len() > 64 { self.traces.pop_front(); }
-                self.traces.push_back((frame_id, t));
+                t.decode_us = pts_us;
+                self.pts_to_frame.insert(pts_us, (frame_id, t));
             }
 
-            self.frame_pts_us = frame_id.saturating_mul(16_667);
-            ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, self.frame_pts_us, 0);
+            ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, pts_us, 0);
         }
-        Ok(())
+        Ok(PushStatus::Accepted)
     }
 
     fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {
         let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
-
+        
         unsafe {
             let mut info = ndk_sys::AMediaCodecBufferInfo { offset: 0, size: 0, presentationTimeUs: 0, flags: 0 };
-            // Используем таймаут 0, чтобы не блокировать сетевой поток
             let idx = ndk_sys::AMediaCodec_dequeueOutputBuffer(state.codec, &mut info, 0);
 
             if idx >= 0 {
-                // КРИТИЧЕСКИЙ МОМЕНТ: Выводим кадр на экран. 
-                // true означает "отрендерить на Surface немедленно"
                 let pts = info.presentationTimeUs as u64;
+                if let Some((id, t)) = self.pts_to_frame.remove(&pts) {
+                    let age = FrameTrace::ms(t.decode_us, FrameTrace::now_us());
 
-                let found = self.traces
-                    .iter()
-                    .find(|(id, _)| id.saturating_mul(16_667) == pts)
-                    .map(|(id, t)| (*id, *t));
+                    if age > MAX_AGE_POLL {
+                        ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
+                        return Ok(FrameOutput::Dropped { age: Some(age as f32) });
+                    }
 
-                let mut should_drop = self.traces
-                    .iter()
-                    .find(|(id, _)| id.saturating_mul(16_667) == pts)
-                    .map(|(_, trace)| {
-                        let now_us = FrameTrace::now_us() as i64;
-                        let latency_ms = (now_us - trace.decode_us as i64) as f64 / 1000.0;
-                        latency_ms > 100.0
-                    })
-                    .unwrap_or(false);
-                
+                    if let Ok(mut pending) = PENDING_VSYNC_INFO.lock() {
+                        *pending = Some((id, t));
+                    }
 
-                while self.traces.front()
-                    .map_or(false, |(id, _)| id.saturating_mul(16_667) <= pts)
-                {
-                    self.traces.pop_front();
-                }
-
-                if should_drop {
-                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
-                    Ok(FrameOutput::Dropped)
-                } else {
-                    self.last_rendered = found;
                     ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
                     Ok(FrameOutput::DirectToSurface)
+                } else {
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
+                    Ok(FrameOutput::Dropped { age: None })
                 }
             } else {
                 Ok(FrameOutput::Pending)
@@ -260,7 +244,7 @@ impl VideoBackend for AndroidMediaCodecBackend {
 
     fn shutdown(&mut self) {
         self.state = None;
-        self.traces.clear();
+        self.pts_to_frame.clear();
     }
 }
 
@@ -415,15 +399,29 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_getLatencyStats
 pub extern "system" fn Java_com_example_streamreceiver_NativeLib_onVsync(
     _env: *mut jni::sys::JNIEnv,
     _class: JClass,
-    frame_time_ns: jlong,
+    _frame_time_ns: jlong,
 ) {
-    if frame_time_ns <= 0 {
-        return;
-    }
+    // [п.3] Теперь мы не лочим BACKEND вообще!
+    // VSYNC просто забирает данные, если их подготовил poll_output
+    if let Ok(mut pending_guard) = PENDING_VSYNC_INFO.lock() {
+        if let Some((frame_id, mut trace)) = pending_guard.take() {
+            let offset = common::CLOCK_OFFSET.load(Ordering::Relaxed);
+            let present_us = FrameTrace::now_us();
+            let capture_local_us = (trace.capture_us as i64).saturating_sub(offset);
+            
+            let diff_ms = (present_us as i64 - capture_local_us) as f64 / 1000.0;
+            
+            trace.present_us = present_us;
+            
+            // Отправляем трейс в логгер/сервер
+            if let Some(tx) = TRACE_TX.get() {
+                let _ = tx.send(Some((frame_id, trace)));
+            }
 
-    if let Some(backend) = BACKEND.get() {
-        if let Ok(mut guard) = backend.lock() {
-            guard.on_vsync(frame_time_ns as u64);
+            // Обновляем строку статистики
+            if let Ok(mut lat) = LATEST_LATENCY.lock() {
+                *lat = format!("{:.1} ms", diff_ms);
+            }
         }
     }
 }

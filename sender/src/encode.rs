@@ -48,7 +48,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-
+const BITRATE: i64 = 2_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +84,7 @@ pub struct Encoder {
     _worker:  thread::JoinHandle<()>,
     /// Пул CPU-буферов (только для пути Bgra).
     free_rx:  mpsc::Receiver<Vec<u8>>,
+    idr_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Encoder {
@@ -95,7 +96,7 @@ impl Encoder {
     ///
     /// # Panics
     /// Паникует, если `hevc_vaapi` недоступен или VAAPI/DRM недоступны.
-    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>) -> Self {
+    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (free_tx, free_rx)   = mpsc::channel::<Vec<u8>>();
@@ -106,17 +107,17 @@ impl Encoder {
         free_tx.send(vec![0u8; buf_size]).unwrap();
 
         ffmpeg::init().unwrap();
-
+        let idr_rx_clone = idr_rx.clone();
         let worker = thread::Builder::new()
             .name("vaapi-encoder".into())
             .spawn(move || {
-                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink);
+                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone);
             })
             .expect("failed to spawn encoder thread");
 
         ready_rx.recv().expect("encoder init signal");
 
-        Self { tx, _worker: worker, free_rx }
+        Self { tx, _worker: worker, free_rx, idr_rx }
     }
 
     /// Отправить BGRA-кадр (CPU-путь) на кодирование.
@@ -246,6 +247,7 @@ fn run_encoder_loop(
     free_tx:  mpsc::Sender<Vec<u8>>,
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
+    mut idr_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
 
@@ -260,9 +262,9 @@ fn run_encoder_loop(
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
         (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*raw).bit_rate       = 5_000_000;
-        (*raw).rc_max_rate    = 5_000_000;
-        (*raw).rc_buffer_size = 2_000_000;
+        (*raw).bit_rate       = BITRATE;
+        (*raw).rc_max_rate    = BITRATE;
+        (*raw).rc_buffer_size = BITRATE as i32 / 2;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
@@ -334,6 +336,7 @@ fn run_encoder_loop(
     let mut started    = false;
     let mut src_frame  = Video::new(Pixel::BGRA, width, height);
     let mut nv12_frame = Video::new(Pixel::NV12, width, height);
+    let mut force_idr = false;
 
     loop {
         let (mut frame_data, mut capture_us) = match rx.recv() {
@@ -349,6 +352,12 @@ fn run_encoder_loop(
             }
             frame_data  = newer.0;
             capture_us  = newer.1;
+        }
+
+        if idr_rx.has_changed().unwrap_or(false) {
+            if *idr_rx.borrow_and_update() == true {
+                force_idr = true;
+            }
         }
 
         // Получаем VAAPI hw_frame в зависимости от типа входа.
@@ -393,6 +402,15 @@ fn run_encoder_loop(
         // Отправляем hw_frame в кодек.
         if let Some(mut hw_frame) = hw_frame_opt {
             unsafe {
+                if force_idr {
+                    log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current hardware frame.");
+                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
+                    (*hw_frame).flags |= AV_FRAME_FLAG_KEY as i32;
+                    force_idr = false;
+                } else {
+                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
+                    (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                }
                 if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame) >= 0 {
                     let mut pkt = ffmpeg::Packet::empty();
                     while encoder.receive_packet(&mut pkt).is_ok() {

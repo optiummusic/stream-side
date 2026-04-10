@@ -32,7 +32,7 @@ use std::{
     time::Duration,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio::sync::mpsc;
 use bytes::Bytes;
 use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
@@ -41,7 +41,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
 
-use crate::{backend::{FrameOutput, VideoBackend}, types::DecodedFrame};
+use crate::{JITTER_TARGET_MS, JitterBuffer, JitterEntry, backend::{FrameOutput, PushStatus, VideoBackend}, types::DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Datagram reassembly buffer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,32 +116,25 @@ impl ReassemblyBuf {
 /// # Errors
 /// Returns only if endpoint construction fails (TLS config error, port bind
 /// failure).  Connection errors and decode errors are logged and retried.
-pub async fn run_quic_receiver<B: VideoBackend>(
-    backend:     Arc<Mutex<B>>,
+
+pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
+    backend: Arc<Mutex<B>>,
     sender_addr: SocketAddr,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>,
     trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
-    // Build the endpoint ONCE.  Reusing it across reconnects preserves the
-    // TLS session cache, which allows 0-RTT on subsequent connections and
-    // avoids re-parsing the certificate on every attempt.
+    // Создаём endpoint один раз и переиспользуем его для реконнектов.
     let endpoint = build_quic_client_endpoint()?;
+
     loop {
         log::info!("[QUIC] Connecting to {sender_addr}...");
 
-        let conn = match endpoint.connect(sender_addr, "localhost") {
-            Ok(c) => match c.await {
-                Ok(c)  => c,
-                Err(e) => {
-                    log::warn!("[QUIC] Connect failed: {e}");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            },
+        let conn = match connect_quic(&endpoint, sender_addr).await {
+            Ok(conn) => conn,
             Err(e) => {
-                log::warn!("[QUIC] endpoint.connect error: {e}");
+                log::warn!("[QUIC] connect failed: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -149,115 +142,262 @@ pub async fn run_quic_receiver<B: VideoBackend>(
 
         log::info!("[QUIC] Connected to {}", conn.remote_address());
 
-        let (send, mut recv) = match conn.open_bi().await {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("open_bi failed: {e}");
-                continue;
-            }
-        };
-        send_identity(send).await;
-
-        let mut len_buf = [0u8; 4];
-        if let Err(e) = recv.read_exact(&mut len_buf).await {
-            log::error!("failed to read ack len: {e}");
+        if let Err(e) = send_identity_and_wait_ack(&conn).await {
+            log::warn!("[QUIC] handshake failed: {e}");
+            tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
 
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut data = vec![0u8; len];
+        let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
 
-        if let Err(e) = recv.read_exact(&mut data).await {
-            log::error!("failed to read ack body: {e}");
-            continue;
+        let mut task_handles = Vec::<JoinHandle<()>>::new();
+
+        task_handles.push(spawn_decoder_poll_task(
+            backend.clone(),
+            frame_tx.clone(),
+            control_tx.clone(),
+        ));
+
+        task_handles.push(spawn_control_writer_task(
+            conn.clone(),
+            control_rx,
+        ));
+
+        task_handles.push(spawn_trace_feedback_task(
+            trace_rx.clone(),
+            control_tx.clone(),
+        ));
+
+        task_handles.push(spawn_ping_task(conn.clone()));
+
+        // Основной цикл приёма датаграмм.
+        // Когда он завершается — считаем соединение потерянным.
+        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
+        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx).await;
+
+        // Останавливаем все фоновые задачи этого соединения.
+        for handle in task_handles {
+            handle.abort();
         }
 
-        match postcard::from_bytes::<ControlPacket>(&data) {
-            Ok(ControlPacket::StartStreaming) => {
-                log::info!("[QUIC] Server ACK → start streaming");
-            }
-            Ok(other) => {
-                log::warn!("unexpected packet: {:?}", other);
-                continue;
-            }
-            Err(e) => {
-                log::error!("decode error: {e}");
-                continue;
-            }
+        log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn connect_quic(
+    endpoint: &quinn::Endpoint,
+    sender_addr: SocketAddr,
+) -> Result<quinn::Connection, Box<dyn Error>> {
+    let connecting = endpoint.connect(sender_addr, "localhost")?;
+    let conn = connecting.await?;
+    Ok(conn)
+}
+
+async fn send_identity_and_wait_ack(conn: &quinn::Connection) -> Result<(), Box<dyn Error>> {
+    let (send, mut recv) = conn.open_bi().await?;
+    send_identity(send).await;
+
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut data = vec![0u8; len];
+    recv.read_exact(&mut data).await?;
+
+    match postcard::from_bytes::<ControlPacket>(&data) {
+        Ok(ControlPacket::StartStreaming) => {
+            log::info!("[QUIC] Server ACK → start streaming");
+            Ok(())
         }
-        
+        Ok(other) => {
+            Err(format!("unexpected ACK packet: {:?}", other).into())
+        }
+        Err(e) => {
+            Err(format!("ACK decode error: {e}").into())
+        }
+    }
+}
+
+fn spawn_control_writer_task(
+    conn: quinn::Connection,
+    mut control_rx: mpsc::Receiver<ControlPacket>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let mut uni_send = match conn.open_uni().await {
             Ok(s) => s,
             Err(e) => {
-                log::error!("open_uni failed: {e}");
-                continue;
+                log::error!("[QUIC] open_uni failed: {e}");
+                return;
             }
         };
-        let (control_tx, mut control_rx) = mpsc::channel::<ControlPacket>(100);
 
-        tokio::spawn(async move {
-            while let Some(packet) = control_rx.recv().await {
-                if let Ok(bytes) = postcard::to_stdvec(&packet) {
-                    let len = (bytes.len() as u32).to_le_bytes();
-                    if uni_send.write_all(&len).await.is_err() { break; }
-                    if uni_send.write_all(&bytes).await.is_err() { break; }
+        while let Some(packet) = control_rx.recv().await {
+            let bytes = match postcard::to_stdvec(&packet) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("[QUIC] control serialize error: {e}");
+                    continue;
                 }
+            };
+
+            let len = (bytes.len() as u32).to_le_bytes();
+
+            if uni_send.write_all(&len).await.is_err() {
+                break;
             }
-            log::debug!("[QUIC] Control stream task exited");
-        });
+            if uni_send.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    })
+}
 
-        let trace_rx_clone = trace_rx.clone();
-        let control_tx_for_trace = control_tx.clone();
-        tokio::spawn(async move {
-            // Таймер: раз в 1 секунду (можешь поменять на 2 или 0.5)
-            let mut interval = tokio::time::interval(Duration::from_millis(1500));
-            let mut last_sent_id = 0;
+fn spawn_trace_feedback_task(
+    trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
+    control_tx: mpsc::Sender<ControlPacket>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        let mut last_sent_id = 0u64;
 
-            loop {
-                interval.tick().await; // Ждем тик таймера
+        loop {
+            interval.tick().await;
 
-                // Берем самый свежий трейс из канала
-                let latest = *trace_rx_clone.borrow(); 
-                
-                if let Some((frame_id, trace)) = latest {
-                    // Чтобы не слать один и тот же кадр, если видео зависло
-                    if frame_id != last_sent_id { 
-                        last_sent_id = frame_id;
+            let latest = trace_rx.borrow().clone();
 
-                        let packet = ControlPacket::FrameFeedback { frame_id, trace };
-                        if control_tx_for_trace.send(packet).await.is_err() {
-                            break;
-                        }
+            if let Some((frame_id, trace)) = latest {
+                if frame_id != last_sent_id {
+                    last_sent_id = frame_id;
+
+                    let packet = ControlPacket::FrameFeedback { frame_id, trace };
+                    if control_tx.send(packet).await.is_err() {
+                        continue;
                     }
                 }
             }
-            log::debug!("[QUIC] Feedback stream loop exited");
-        });
+        }
+    })
+}
 
+fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut count = 0u64;
 
-        let ping_conn = conn.clone();
-        tokio::spawn(async move {
-            let mut count = 0;
-            loop {
-                let ping = ControlPacket::Ping { client_time_us: FrameTrace::now_us() };
-                if let Ok(bytes) = postcard::to_stdvec(&ping) {
-                    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bytes);
-                    let _ = ping_conn.send_datagram(dgram);
-                }
-                count += 1;
-                let delay = if count < 10 {
-                    Duration::from_millis(200)
-                } else {
-                    Duration::from_secs(3)
-                };
-                tokio::time::sleep(delay).await;
+        loop {
+            let ping = ControlPacket::Ping {
+                client_time_us: FrameTrace::now_us(),
+            };
+
+            if let Ok(bytes) = postcard::to_stdvec(&ping) {
+                let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bytes);
+                let _ = conn.send_datagram(dgram);
             }
-        });
-        receive_datagrams(conn, backend.clone(), frame_tx.clone(), control_tx.clone()).await;
-        log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
-    }
+            count += 1;
+            let delay = if count < 10 {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(3)
+            };
+
+            tokio::time::sleep(delay).await;
+        }
+    })
+}
+
+fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
+    backend: Arc<Mutex<B>>,
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
+    control_tx: mpsc::Sender<ControlPacket>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(3));
+        const MAX_DRAIN_PER_TICK: usize = 32;
+
+        loop {
+            interval.tick().await;
+
+            let backend = backend.clone();
+            let poll_result = tokio::task::spawn_blocking(move || {
+                let mut frames_to_send = Vec::new();
+                let mut dropped_ages = Vec::new();
+
+                let mut guard = match backend.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        return Err("backend mutex poisoned".to_string());
+                    }
+                };
+
+                let mut drained = 0usize;
+
+                loop {
+                    if drained >= MAX_DRAIN_PER_TICK {
+                        break;
+                    }
+
+                    match guard.poll_output() {
+                        Ok(FrameOutput::Pending) => break,
+
+                        Ok(FrameOutput::Dropped { age }) => {
+                            dropped_ages.push(age);
+                        }
+
+                        Ok(frame) => {
+                            frames_to_send.push(frame);
+                            drained += 1;
+                        }
+
+                        Err(e) => {
+                            return Err(format!("poll_output error: {e:?}"));
+                        }
+                    }
+                }
+
+                Ok::<_, String>((frames_to_send, dropped_ages))
+            })
+            .await;
+
+            let (frames_to_send, dropped_ages) = match poll_result {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    log::error!("[Decoder] poll task error: {e}");
+                    break;
+                }
+                Err(e) => {
+                    log::error!("[Decoder] poll task join error: {e}");
+                    break;
+                }
+            };
+
+            for age in dropped_ages {
+                let _ = control_tx.try_send(ControlPacket::Communication {
+                    message: format!(
+                        "DROPPED ON POLL, age: {:.1}ms",
+                        age.unwrap_or(0.0)
+                    ),
+                });
+            }
+
+            if let Some(tx) = &frame_tx {
+                for frame in frames_to_send {
+                    let res = match frame {
+                        FrameOutput::Yuv(f) => tx.try_send(DecodedFrame::Yuv(f)),
+
+                        #[cfg(unix)]
+                        FrameOutput::DmaBuf(f) => tx.try_send(DecodedFrame::DmaBuf(f)),
+
+                        _ => Ok(()),
+                    };
+
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 async fn send_identity(mut send: SendStream) {
@@ -293,54 +433,328 @@ pub async fn send_offset_update(conn: &quinn::Connection, rtt_us: u64) -> Result
 async fn receive_datagrams<B: VideoBackend>(
     conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
-    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
     control_tx: mpsc::Sender<ControlPacket>,
+    idr_needed_tx: watch::Sender<bool>,
 ) {
+    let idr_needed_rx = idr_needed_tx.subscribe();
     let mut video_state = VideoState {
         reassembly: HashMap::new(),
         waiting_for_key: true,
         expected_frame_id: None,
     };
-
+    let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
     loop {
-        let raw = match conn.read_datagram().await {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!("QUIC READ ERROR: {:?}", e);
-                break;
-            }
-        };
-        log::trace!("Got packet: {} bytes", raw.len()); // Видим, что данные вообще идут?
-        
-        let chunk = match DatagramChunk::decode(raw) {
-            Some(c) => c,
-            None => {
-                log::warn!("Failed to decode chunk header");
-                continue;
-            }
+        // ── Sleep duration until the next buffered frame is due ───────────────
+        // If the buffer is empty we park the timer for 1 hour; it will be
+        // cancelled the moment the datagram arm fires.
+        let drain_sleep = match jitter_buf.time_to_next() {
+            Some(d) => d,
+            None    => Duration::from_secs(3600),
         };
 
-        match chunk.packet_type {
-            TYPE_VIDEO => {
-                handle_video_chunk(chunk, &mut video_state, &backend, &frame_tx, &control_tx).await;
+        tokio::select! {
+            // ── 1. Incoming datagram ─────────────────────────────────────────
+            raw = conn.read_datagram() => {
+                let raw = match raw {
+                    Ok(b)  => b,
+                    Err(e) => { log::error!("QUIC READ ERROR: {:?}", e); break; }
+                };
+ 
+                log::trace!("Got packet: {} bytes", raw.len());
+ 
+                let chunk = match DatagramChunk::decode(raw) {
+                    Some(c) => c,
+                    None    => { log::warn!("Failed to decode chunk header"); continue; }
+                };
+ 
+                match chunk.packet_type {
+                    TYPE_VIDEO => {
+                        // Reassemble; if a frame completed, enqueue it in the
+                        // jitter buffer instead of pushing to the backend directly.
+                        if let Some(packet) = reassemble_chunk(chunk, &mut video_state) {
+                            jitter_buf.push(packet);
+                        }
+                    }
+                    TYPE_AUDIO => {
+                        // Audio bypasses the jitter buffer (separate sync path).
+                        // handle_audio_frame(chunk.data);
+                    }
+                    TYPE_CONTROL => {
+                        if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
+                            if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
+                                let conn_clone = conn.clone();
+                                tokio::spawn(async move {
+                                    let _ = send_offset_update(&conn_clone, rtt_us).await;
+                                });
+                            }
+                        }
+                    }
+                    _ => log::warn!("Unknown packet type"),
+                }
             }
-            TYPE_AUDIO => {
-                // Аудио не ждет сборки видео! Пролетает сразу.
-                // handle_audio_frame(chunk.data); 
+ 
+            // ── 2. Jitter-buffer drain timer ─────────────────────────────────
+            // Fires when the earliest buffered frame has waited long enough.
+            // All frames whose deadline has now passed are released at once.
+            _ = tokio::time::sleep(drain_sleep) => {
+                let ready = jitter_buf.drain_ready();
+                if ready.is_empty() { continue; }
+ 
+                log::trace!("[JitterBuf] releasing {} frame(s)", ready.len());
+ 
+                for packet in ready {
+                    push_frame_to_backend(
+                        packet,
+                        &mut video_state,
+                        &backend,
+                        &control_tx,
+                        &idr_needed_tx,
+                        &idr_needed_rx,
+                    ).await;
+                }
             }
-            TYPE_CONTROL => {
-                if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
-                    if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
-                        // Сразу после вычисления нового offset — слать на сервер
-                        let conn_clone = conn.clone();
-                        tokio::spawn(async move {
-                            let _ = send_offset_update(&conn_clone, rtt_us).await;
-                        });
+        }
+        
+    }
+}
+
+fn reassemble_chunk(
+    chunk: DatagramChunk,
+    state: &mut VideoState,
+) -> Option<VideoPacket> {
+    let frame_id = chunk.frame_id;
+    let is_key   = chunk.flags & 1 != 0;
+    const MAX_BUFFERED_FRAMES: usize = 8;
+ 
+    if chunk.chunk_idx >= chunk.total_chunks {
+        log::warn!(
+            "[Video] Drop corrupted chunk: idx {} >= total {}",
+            chunk.chunk_idx, chunk.total_chunks
+        );
+        return None;
+    }
+ 
+    if is_key && chunk.chunk_idx == 0 {
+        if !state.reassembly.contains_key(&frame_id) {
+            state.reassembly.clear();
+        }
+    }
+ 
+    state.reassembly
+        .retain(|&id, _| id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64));
+ 
+    let buf = state.reassembly
+        .entry(frame_id)
+        .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, is_key));
+ 
+    if !buf.insert(chunk.chunk_idx, chunk.data) {
+        return None; // frame not yet complete
+    }
+ 
+    // All chunks arrived — assemble and deserialise.
+    let buf      = state.reassembly.remove(&frame_id).unwrap();
+    let first_us = buf.first_us;
+ 
+    let mut packet: VideoPacket = match postcard::from_bytes(&buf.assemble()) {
+        Ok(p)  => p,
+        Err(e) => { log::error!("[Video] Postcard decode error: {e}"); return None; }
+    };
+ 
+    packet.trace.as_mut().map(|t| {
+        t.receive_us     = first_us;
+        t.reassembled_us = FrameTrace::now_us();
+    });
+ 
+    Some(packet)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend push — called from the jitter-buffer drain path
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+/// Submit one decoded packet to the backend decoder.
+///
+/// The in-order / IDR-wait checks that were previously inside
+/// `handle_video_chunk` are now applied here, *after* the jitter buffer has
+/// had a chance to reorder out-of-order arrivals.
+async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
+    mut packet: VideoPacket,
+    state:      &mut VideoState,
+    backend:    &Arc<Mutex<B>>,
+    control_tx: &mpsc::Sender<ControlPacket>,
+    idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
+    idr_needed_rx: &watch::Receiver<bool>,
+) {
+    // ── In-order / IDR gate ───────────────────────────────────────────────
+    if packet.is_key {
+        state.waiting_for_key   = false;
+        state.expected_frame_id = Some(packet.frame_id);
+        let _ = idr_needed_tx.send(false);
+    } else if state.waiting_for_key || Some(packet.frame_id) != state.expected_frame_id {
+        if state.waiting_for_key {
+            return; 
+        }
+        state.waiting_for_key = true;
+        let _ = idr_needed_tx.send(true);
+        log::warn!("Frame lost! Expected {:?}, got {}. Spawning IDR solicitor.", state.expected_frame_id, packet.frame_id);
+
+        let tx = control_tx.clone();
+        let mut rx = idr_needed_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(300));
+            // Loop as long as the watch value is 'true'
+            while *rx.borrow() {
+                if tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    // Wake up immediately if the value changes to false
+                    _ = rx.changed() => {
+                        if !*rx.borrow() { break; }
                     }
                 }
             }
-            _ => log::warn!("Unknown packet type"),
+            log::info!("[Video] IDR solicitor task satisfied and exiting.");
+        });
+        return;
+    }
+ 
+    state.expected_frame_id = Some(packet.frame_id + 1);
+ 
+    let frame_id    = packet.frame_id;
+    let payload     = packet.payload;
+    let trace       = packet.trace.take();
+    let backend_arc = backend.clone();
+    let ctrl        = control_tx.clone();
+ 
+    let push_result = tokio::task::spawn_blocking(move || {
+        let mut backend_lock = backend_arc.lock().unwrap();
+        backend_lock.push_encoded(&payload, frame_id, trace)
+    })
+    .await;
+ 
+    match push_result {
+        Ok(Ok(PushStatus::Dropped { age })) => {
+            let _ = ctrl.try_send(ControlPacket::Communication {
+                message: format!(
+                    "DROPPED ON PUSH#{}, age: {:.1}ms",
+                    frame_id,
+                    age.unwrap_or(0.0)
+                ),
+            });
         }
+        Ok(Ok(PushStatus::Accepted)) => {}
+        Ok(Err(e)) => {
+            let _ = ctrl.try_send(ControlPacket::Communication {
+                message: format!("ERROR ON BACKEND: {e}"),
+            });
+        }
+        Err(e) => log::error!("[Video] push task join error: {e}"),
+    }
+}
+
+fn process_control_feedback(ctrl: ControlPacket) -> Option<(i64, u64)> {
+    if let ControlPacket::Pong { client_time_us, server_time_us } = ctrl {
+        let t2 = FrameTrace::now_us();
+        let rtt = t2.saturating_sub(client_time_us);
+
+        let new_raw_offset = (server_time_us as i64) - (client_time_us + rtt / 2) as i64;
+        let current_offset = CLOCK_OFFSET.load(Ordering::Relaxed);
+
+        let filtered_offset = if current_offset == 0 {
+            new_raw_offset
+        } else {
+            (current_offset as f64 + OFFSET_ALPHA * (new_raw_offset - current_offset) as f64) as i64
+        };
+
+        CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
+        log::debug!("[Sync] RTT: {}ms, Offset: {}us", rtt as f64 / 1000.0, filtered_offset);
+        Some((filtered_offset, rtt))
+    } else {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client endpoint construction
+// ─────────────────────────────────────────────────────────────────────────────
+fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
+    let mut crypto = rustls::ClientConfig::builder_with_provider(
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+    .with_no_client_auth();
+
+    crypto.alpn_protocols = vec![b"video-stream".to_vec()];
+
+    let quic_crypto = QuicClientConfig::try_from(crypto)?;
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+
+    // ── Transport — mirror the server settings for symmetrical behaviour ──────
+    let mut t = quinn::TransportConfig::default();
+
+    t.datagram_receive_buffer_size(Some(1 * 1024 * 1024));
+
+    // Match the server's initial MTU probe so the first handshake uses the
+    // optimal path MTU immediately rather than starting at 1200.
+    t.initial_mtu(1400);
+
+    // Keep-alive: same period as server so both sides detect dead connections
+    // within a consistent window.
+    t.keep_alive_interval(Some(Duration::from_millis(500)));
+
+    t.max_idle_timeout(Some(
+        Duration::from_secs(8)
+            .try_into()
+            .expect("idle timeout"),
+    ));
+
+    client_cfg.transport_config(Arc::new(t));
+
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS skip-verify (LAN / self-signed, NOT for production over untrusted networks)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity:    &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name:   &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now:           rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -430,205 +844,4 @@ fn unknown_identity() -> (String, String) {
     let model = std::env::var("CLIENT_MODEL").unwrap_or_else(|_| "Unknown device".to_string());
     let name = std::env::var("CLIENT_NAME").unwrap_or_else(|_| "Unknown".to_string());
     (model, name)
-}
-
-fn process_control_feedback(ctrl: ControlPacket) -> Option<(i64, u64)> {
-    if let ControlPacket::Pong { client_time_us, server_time_us } = ctrl {
-        let t2 = FrameTrace::now_us();
-        let rtt = t2.saturating_sub(client_time_us);
-
-        let new_raw_offset = (server_time_us as i64) - (client_time_us + rtt / 2) as i64;
-        let current_offset = CLOCK_OFFSET.load(Ordering::Relaxed);
-
-        let filtered_offset = if current_offset == 0 {
-            new_raw_offset
-        } else {
-            (current_offset as f64 + OFFSET_ALPHA * (new_raw_offset - current_offset) as f64) as i64
-        };
-
-        CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
-        log::debug!("[Sync] RTT: {}ms, Offset: {}us", rtt as f64 / 1000.0, filtered_offset);
-        Some((filtered_offset, rtt))
-    } else {
-        None
-    }
-}
-
-async fn handle_video_chunk<B: VideoBackend>(
-    chunk: DatagramChunk,
-    state: &mut VideoState,
-    backend: &Arc<Mutex<B>>,
-    frame_tx: &Option<mpsc::Sender<DecodedFrame>>,
-    control_tx: &mpsc::Sender<ControlPacket>,
-) {
-    let frame_id = chunk.frame_id;
-    let is_key = chunk.flags & 1 != 0;
-    const MAX_BUFFERED_FRAMES: usize = 8;
-
-    // 1. ЗАЩИТА ОТ ПАНИКИ: проверяем индексы
-    if chunk.chunk_idx >= chunk.total_chunks {
-        log::warn!("[Video] Drop corrupted chunk: idx {} >= total {}", chunk.chunk_idx, chunk.total_chunks);
-        return;
-    }
-
-    // 2. Логика сброса при IDR
-    if is_key && chunk.chunk_idx == 0 {
-        if !state.reassembly.contains_key(&frame_id) {
-            state.reassembly.clear(); 
-        }
-    }
-
-    // 3. Эвикция старых кадров
-    state.reassembly.retain(|&id, _| id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64));
-
-    // 4. Вставка чанка
-    let buf = state.reassembly.entry(frame_id)
-        .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, is_key));
-    
-    if !buf.insert(chunk.chunk_idx, chunk.data) { return; }
-
-    // 5. Кадр собран — десериализация
-    let buf = state.reassembly.remove(&frame_id).unwrap();
-    let first_us = buf.first_us;
-    
-    let mut packet: VideoPacket = match postcard::from_bytes(&buf.assemble()) {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("[Video] Postcard decode error: {}", e);
-            return;
-        }
-    };
-
-    packet.trace.as_mut().map(|t| {
-        t.receive_us = first_us;
-        t.reassembled_us = FrameTrace::now_us();
-    });
-
-    // 6. Декодирование (ИЗОЛИРОВАННЫЙ ЛОК)
-    // Мы собираем кадры в локальный вектор, чтобы отпустить Mutex МГНОВЕННО
-    let mut decoded_frames = Vec::new();
-    
-    { // <-- Начало зоны Mutex
-        let mut backend_lock = backend.lock().unwrap();
-        
-        if packet.is_key {
-            state.waiting_for_key = false;
-            state.expected_frame_id = Some(packet.frame_id);
-        } else if state.waiting_for_key || Some(packet.frame_id) != state.expected_frame_id {
-            state.waiting_for_key = true;
-            return; // Лок освобождается здесь
-        }
-        state.expected_frame_id = Some(packet.frame_id + 1);
-
-        if backend_lock.push_encoded(&packet.payload, packet.frame_id, packet.trace.take()).is_ok() {
-            loop {
-                match backend_lock.poll_output() {
-                    Ok(FrameOutput::Pending) => break, //Decoder not ready
-                    Ok(FrameOutput::Dropped) => {
-                        let msg = ControlPacket::Communication { 
-                            message: format!("DROP#{}", packet.frame_id) 
-                        };
-                        let _ = control_tx.try_send(msg);
-                        continue;
-                    },  //Decoder dropped a frame
-                    Ok(frame) => decoded_frames.push(frame),
-                    Err(_) => break,
-                }
-            }
-        }
-    } // <-- Конец зоны Mutex. Теперь бэкенд свободен для рендер-потока.
-
-    // 7. Отправка в канал ВНЕ лока
-    if let Some(tx) = frame_tx {
-        for frame in decoded_frames {
-            let _ = match frame {
-                FrameOutput::Yuv(f) => tx.try_send(DecodedFrame::Yuv(f)),
-                
-                #[cfg(unix)]
-                FrameOutput::DmaBuf(f) => tx.try_send(DecodedFrame::DmaBuf(f)),
-                _ => Ok(()),
-            };
-        }
-    }
-}
-// ─────────────────────────────────────────────────────────────────────────────
-// Client endpoint construction
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
-    let mut crypto = rustls::ClientConfig::builder_with_provider(
-        Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .with_safe_default_protocol_versions()?
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-    .with_no_client_auth();
-
-    crypto.alpn_protocols = vec![b"video-stream".to_vec()];
-
-    let quic_crypto = QuicClientConfig::try_from(crypto)?;
-    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
-
-    // ── Transport — mirror the server settings for symmetrical behaviour ──────
-    let mut t = quinn::TransportConfig::default();
-
-    t.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
-
-    // Match the server's initial MTU probe so the first handshake uses the
-    // optimal path MTU immediately rather than starting at 1200.
-    t.initial_mtu(1400);
-
-    // Keep-alive: same period as server so both sides detect dead connections
-    // within a consistent window.
-    t.keep_alive_interval(Some(Duration::from_millis(500)));
-
-    t.max_idle_timeout(Some(
-        Duration::from_secs(8)
-            .try_into()
-            .expect("idle timeout"),
-    ));
-
-    client_cfg.transport_config(Arc::new(t));
-
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_cfg);
-    Ok(endpoint)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TLS skip-verify (LAN / self-signed, NOT for production over untrusted networks)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity:    &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name:   &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now:           rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }

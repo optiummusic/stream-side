@@ -43,8 +43,8 @@ async fn main() {
     log::info!("Receivers must connect to <your-ip>:{}", listen_addr.port());
 
     // ── Transport ────────────────────────────────────────────────────────────
-
-    let server = Arc::new(QuicServer::new(listen_addr).await);
+    let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
+    let server = Arc::new(QuicServer::new(listen_addr, idr_tx).await);
     let sink   = server.frame_sink();
 
     // ── Capture + encode ─────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ async fn main() {
     // Swap it for `WindowsSender` or `AndroidSender` on other platforms without
     // touching any other code.
 
-    let sender = LinuxPipeWireSender::new(1, 1);
+    let sender = LinuxPipeWireSender::new(1, 1, idr_rx);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

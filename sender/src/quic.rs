@@ -34,8 +34,8 @@ use bytes::Bytes;
 use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
-use crate::{ClientIdentity, ConnectionInfo};
+use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
+use crate::{ClientIdentity, ConnectionInfo, FramePacer};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ use crate::encode::EncodedFrame;
 pub struct QuicServer {
     /// Cloneable handle for pushing encoded frames into the transport pipeline.
     frame_tx: mpsc::Sender<EncodedFrame>,
+    idr_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl QuicServer {
@@ -54,7 +55,7 @@ impl QuicServer {
     /// current Tokio runtime.
     ///
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
-    pub async fn new(listen_addr: SocketAddr) -> Self {
+    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(32);
 
         // broadcast capacity = 64 frames  (~1 second of 60 fps with headroom).
@@ -99,18 +100,20 @@ impl QuicServer {
         });
 
         // ── Accept loop ──────────────────────────────────────────────────────
+        let idr_tx_clone = idr_tx.clone();
         let endpoint = build_server_endpoint(listen_addr);
-
         tokio::spawn(async move {
             while let Some(connecting) = endpoint.accept().await {
                 let client_rx = bcast_tx.subscribe();
-
+                let idr_tx_init = idr_tx_clone.clone();
                 tokio::spawn(async move {
                     match connecting.await {
                         Ok(conn) => {
                             log::info!("[QUIC] Client connected: {}", conn.remote_address());
                             let (identity_tx, identity_rx) = watch::channel(ClientIdentity::default());
                             let identity_tx_for_accept = identity_tx.clone();
+
+                            let idr_tx_conn = idr_tx_init.clone();
 
                             let info = Arc::new(ConnectionInfo {
                                 remote: conn.remote_address().to_string(),
@@ -150,10 +153,11 @@ impl QuicServer {
                                 loop {
                                     match conn_uni.accept_uni().await {
                                         Ok(recv) => {
+                                            let idr_tx_uni = idr_tx_conn.clone();
                                             let info_for_task = info_uni.clone();
                                             let clock_offset_task = clock_offset.clone();
                                             tokio::spawn(async move {
-                                                if let Err(e) = handle_uni_stream(recv, info_for_task, clock_offset_task).await {
+                                                if let Err(e) = handle_uni_stream(recv, info_for_task, clock_offset_task, idr_tx_uni).await {
                                                     log::warn!("bi stream error: {e}");
                                                 }
                                             });
@@ -174,7 +178,7 @@ impl QuicServer {
             }
         });
 
-        Self { frame_tx }
+        Self { frame_tx, idr_tx }
     }
 
     /// Return a cloneable sender for delivering encoded `(nal_bytes, is_key)` frames.
@@ -219,7 +223,7 @@ async fn send_loop_to_client(
     let max_dgram = conn.max_datagram_size().unwrap_or(1200);
     let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
 
-    
+    let mut pacer = FramePacer::new(50.0, 4.0);
     loop {
         tokio::select! {
             // 1. ОТПРАВКА ВИДЕО
@@ -240,12 +244,25 @@ async fn send_loop_to_client(
                         let total_chunks = ((data.len() + max_chunk_data - 1) / max_chunk_data) as u16;
 
                         for (idx, offset) in (0..data.len()).step_by(max_chunk_data).enumerate() {
-                            let end = (offset + max_chunk_data).min(data.len());
+                            let end   = (offset + max_chunk_data).min(data.len());
+                            let slice = data.slice(offset..end);
+ 
+                            // ── Token-bucket pacing ──────────────────────────
+                            // Consume one chunk-worth of tokens.  If the bucket
+                            // is empty, sleep until it refills.  The sleep is
+                            // inside this select arm, so control datagrams
+                            // (Ping, etc.) are delayed by at most one inter-chunk
+                            // interval (≤ ~200 µs at 100 Mbit/s) — acceptable.
+                            let wait = pacer.consume(DatagramChunk::HEADER_LEN + slice.len());
+                            if !wait.is_zero() {
+                                tokio::time::sleep(wait).await;
+                            }
+ 
                             let dgram = DatagramChunk::encode(
-                                frame_id, idx as u16, total_chunks, 
-                                TYPE_VIDEO, flags, &data.slice(offset..end)
+                                frame_id, idx as u16, total_chunks,
+                                TYPE_VIDEO, flags, &slice,
                             );
-                            if let Err(_) = conn.send_datagram(dgram) { break; }
+                            if conn.send_datagram(dgram).is_err() { break; }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -332,7 +349,8 @@ async fn handle_bi_stream(
 async fn handle_uni_stream(
     mut recv: quinn::RecvStream,
     info: Arc<ConnectionInfo>,
-    clock_offset: Arc<AtomicI64>
+    clock_offset: Arc<AtomicI64>,
+    idr_tx: watch::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut len_buf = [0u8; 4];
@@ -382,6 +400,13 @@ async fn handle_uni_stream(
                 let label = info.label().await;
                 log::info!("[QUIC] {label} send a MESSAGE: {message}");
             }
+
+            ControlPacket::RequestKeyFrame => {
+                let label = info.label().await;
+                log::info!("[QUIC] Client {label} requested KeyFrame!");
+                let _ = idr_tx.send(true);
+                let _ = idr_tx.send(false);
+            }
         _ => {}
         }
     }
@@ -417,7 +442,6 @@ async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &Connection
                 log::info!("[{}] RTT: {:.1}ms", info.label().await, rtt_us as f64 / 1000.0);
             }
             _ => ()
-            // Здесь будет ControlPacket::RequestKeyFrame -> отправка в mpsc энкодера
         }
     }
 }
@@ -449,12 +473,12 @@ fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
     // ── Transport tuning ─────────────────────────────────────────────────────
     let mut t = quinn::TransportConfig::default();
 
-    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
     // Datagram buffers — 16 MB handles burst of ~80 uncompressed HEVC frames
     // before the kernel starts dropping.
-    t.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
+    t.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     t.datagram_send_buffer_size(16 * 1024 * 1024);
-
+    t.send_fairness(true);
     // Initial MTU probe value for Ethernet LAN.
     //
     // Path MTU = 1500 (Ethernet) - 20 (IP) - 8 (UDP) - ~20 (QUIC) = ~1452.

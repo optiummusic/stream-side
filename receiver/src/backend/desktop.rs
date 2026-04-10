@@ -56,6 +56,7 @@ use std::ptr;
 
 use common::FrameTrace;
 
+use crate::backend::PushStatus;
 #[cfg(unix)]
 use crate::types::DmaBufFrame;
 
@@ -226,7 +227,7 @@ impl VideoBackend for DesktopFfmpegBackend {
         payload:  &[u8],
         frame_id: u64,
         trace:    Option<FrameTrace>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<PushStatus, BackendError> {
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
         if let Some(dst) = pkt.data_mut() {
             dst.copy_from_slice(payload);
@@ -243,7 +244,7 @@ impl VideoBackend for DesktopFfmpegBackend {
         if frame_id > TRACE_HORIZON {
             self.pending_traces.retain(|&k, _| k >= frame_id - TRACE_HORIZON);
         }
-        Ok(())
+        Ok(PushStatus::Accepted)
     }
 
     fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {

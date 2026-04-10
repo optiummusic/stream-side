@@ -139,6 +139,7 @@ pub enum ControlPacket {
         os: String,  
     },
     StartStreaming,
+    RequestKeyFrame,
     Ping { client_time_us: u64 },
     Pong { client_time_us: u64, server_time_us: u64 },
     OffsetUpdate { offset_us: i64, rtt_us: u64 },
