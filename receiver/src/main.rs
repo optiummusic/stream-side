@@ -933,15 +933,22 @@ impl ApplicationHandler<UserEvent> for App {
                         
                         let (frame_id, frame_trace) = match &decoded {
                             DecodedFrame::Yuv(f) => (f.frame_id, f.trace),
-                            #[cfg(unix)]
+                            #[cfg(target_os = "linux")]
+                            DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                            #[cfg(not(target_os = "linux"))]
                             DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                         };
 
                         match decoded {
                             DecodedFrame::Yuv(frame) => state.update_textures_cpu(&frame),
-                            #[cfg(unix)]
+                            #[cfg(target_os = "linux")]
                             DecodedFrame::DmaBuf(frame) => {
                                 if !state.update_textures_dmabuf(&frame) { return; }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            DecodedFrame::DmaBuf(_frame) => {
+                                log::warn!("[Render] DMA-BUF frame received on non-Linux build");
+                                return;
                             }
                         }
 
