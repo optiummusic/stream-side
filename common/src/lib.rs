@@ -156,3 +156,54 @@ pub enum ControlPacket {
     FrameFeedback { frame_id: u64, trace: FrameTrace },
     Communication {message: String },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuVendor {
+    Amd,
+    Intel,
+    Nvidia,
+    Unknown,
+}
+
+/// Reads `/sys/class/drm/card*/device/vendor` THE FIRST ONE IS CHOSEN
+pub fn detect_gpu_vendor() -> GpuVendor {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs;
+        for i in 0..4 {
+            let path = format!("/sys/class/drm/card{i}/device/vendor");
+            if let Ok(raw) = fs::read_to_string(&path) {
+                match raw.trim().to_lowercase().as_str() {
+                    "0x1002" => return GpuVendor::Amd,
+                    "0x8086" => return GpuVendor::Intel,
+                    "0x10de" => return GpuVendor::Nvidia,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+        
+        if let Ok(class_key) = hklm.open_subkey(path) {
+            for name in class_key.enum_keys().filter_map(|x| x.ok()) {
+                if let Ok(sub_key) = class_key.open_subkey(&name) {
+                    if let Ok(device_id) = sub_key.get_value("MatchingDeviceId") {
+                        let id = device_id.to_uppercase();
+                        if id.contains("VEN_1002") { return GpuVendor::Amd; }
+                        if id.contains("VEN_8086") { return GpuVendor::Intel; }
+                        if id.contains("VEN_10DE") { return GpuVendor::Nvidia; }
+                    }
+                }
+            }
+        }
+    }
+
+    GpuVendor::Unknown
+}

@@ -2,7 +2,7 @@
 
 use std::os::unix::io::RawFd;
 use bytes::Bytes;
-use common::FrameTrace;
+use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 use tokio::sync::{mpsc, watch};
 
 pub mod vaapi;
@@ -33,7 +33,7 @@ pub enum FrameData {
 
 /// Аппаратный HEVC-энкодер. Реализуется отдельно для каждого вендора.
 pub trait HwEncoder: Send + 'static {
-    fn encode_bgra(&self, frame: &[u8], capture_us: u64);
+    fn encode_bgra(&self, frame: &[u8], stride: u32, capture_us: u64);
 
     fn encode_dmabuf(
         &self,
@@ -45,36 +45,10 @@ pub trait HwEncoder: Send + 'static {
     );
 
     #[inline]
-    fn encode(&self, frame: &[u8], capture_us: u64) {
-        self.encode_bgra(frame, capture_us);
+    fn encode(&self, frame: &[u8], stride: u32, capture_us: u64) {
+        self.encode_bgra(frame, stride, capture_us);
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpuVendor {
-    Amd,
-    Intel,
-    Nvidia,
-    Unknown,
-}
-
-/// Reads `/sys/class/drm/card*/device/vendor`THE FIRST ONE
-pub fn detect_gpu_vendor() -> GpuVendor {
-    use std::fs;
-
-    for i in 0..4 {
-        let path = format!("/sys/class/drm/card{i}/device/vendor");
-        let Ok(raw) = fs::read_to_string(&path) else { continue };
-        match raw.trim() {
-            "0x1002" => return GpuVendor::Amd,
-            "0x8086" => return GpuVendor::Intel,
-            "0x10de" => return GpuVendor::Nvidia,
-            _        => {}
-        }
-    }
-    GpuVendor::Unknown
-}
-
 
 pub enum AnyEncoder {
     Vaapi(VaapiEncoder),
@@ -102,10 +76,10 @@ impl AnyEncoder {
 }
 
 impl HwEncoder for AnyEncoder {
-    fn encode_bgra(&self, frame: &[u8], capture_us: u64) {
+    fn encode_bgra(&self, frame: &[u8], stride: u32, capture_us: u64) {
         match self {
-            Self::Vaapi(e) => e.encode_bgra(frame, capture_us),
-            Self::Nvenc(e) => e.encode_bgra(frame, capture_us),
+            Self::Vaapi(e) => e.encode_bgra(frame, stride, capture_us),
+            Self::Nvenc(e) => e.encode_bgra(frame, stride, capture_us),
         }
     }
 

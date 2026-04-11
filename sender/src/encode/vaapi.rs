@@ -62,7 +62,10 @@ pub enum FrameData {
     ///
     /// Буфер взят из пула двойной буферизации и должен быть возвращён
     /// через `free_tx` после использования.
-    Bgra(Vec<u8>),
+    Bgra{
+        data: Vec<u8>,
+        stride: u32,
+    },
 
     /// DMA-BUF кадр — нулевое копирование на CPU.
     ///
@@ -126,11 +129,11 @@ impl VaapiEncoder {
     /// Отправить BGRA-кадр (CPU-путь) на кодирование.
     ///
     /// Если пул буферов пуст (энкодер не успевает) — кадр молча дропается.
-    pub fn encode_bgra(&self, frame: &[u8], capture_us: u64) {
+    pub fn encode_bgra(&self, frame: &[u8], stride: u32, capture_us: u64) {
         if let Ok(mut buf) = self.free_rx.try_recv() {
             let len = frame.len().min(buf.len());
             buf[..len].copy_from_slice(&frame[..len]);
-            let _ = self.tx.try_send((FrameData::Bgra(buf), capture_us));
+            let _ = self.tx.try_send((FrameData::Bgra {data: buf, stride }, capture_us));
         }
     }
 
@@ -145,12 +148,6 @@ impl VaapiEncoder {
             // Канал полон или закрыт — освободить fd.
             unsafe { libc::close(fd); }
         }
-    }
-
-    /// Устаревший метод для обратной совместимости — делегирует в `encode_bgra`.
-    #[inline]
-    pub fn encode(&self, frame: &[u8], capture_us: u64) {
-        self.encode_bgra(frame, capture_us);
     }
 }
 
@@ -282,26 +279,6 @@ fn run_encoder_loop(
     let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) =
         unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) };
 
-    // unsafe {
-    //     dump_transfer_formats(
-    //         "DRM FROM",
-    //         drm_frames_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
-    //     );
-
-    //     dump_transfer_formats(
-    //         "VAAPI TO",
-    //         hw_enc_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
-
-    //     dump_transfer_formats(
-    //         "IMPORTED BGRA",
-    //         hw_import_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
-    // }
-
     if drm_frames_ref.is_null() {
         log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
                     SPA_DATA_DmaBuf frames will be dropped.");
@@ -344,11 +321,10 @@ fn run_encoder_loop(
             Ok(v)  => v,
             Err(_) => break,
         };
-
         // Дренируем канал: берём самый свежий кадр.
         while let Ok(newer) = rx.try_recv() {
             match frame_data {
-                FrameData::Bgra(buf) => { let _ = free_tx.send(buf); }
+                FrameData::Bgra{data: buf, ..} => { let _ = free_tx.send(buf); }
                 FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
             }
             frame_data  = newer.0;
@@ -364,7 +340,7 @@ fn run_encoder_loop(
         // Получаем VAAPI hw_frame в зависимости от типа входа.
         let hw_frame_opt: Option<*mut AVFrame> = unsafe {
             match frame_data {
-                FrameData::Bgra(ref bgra) => {
+                FrameData::Bgra{ data: ref bgra, stride} => {
                     encode_bgra_to_vaapi(
                         bgra, capture_us,
                         width, height,
@@ -396,7 +372,7 @@ fn run_encoder_loop(
         };
 
         // Возвращаем CPU-буфер в пул.
-        if let FrameData::Bgra(buf) = frame_data {
+        if let FrameData::Bgra {data: buf, stride} = frame_data {
             let _ = free_tx.send(buf);
         }
 
@@ -856,14 +832,6 @@ unsafe fn encode_dmabuf_to_vaapi(
             av_frame_free(&mut imported);
             return None;
         }
-
-        // log::info!(
-        //     "[Mapping Success] Format: {:?}, Linesize: [{}, {}, ...]",
-        //     (*imported).format,
-        //     (*imported).linesize[0],
-        //     (*imported).linesize[1]
-        // );
-        // log::info!("[VAAPI Details] Surface ID: {}", (*imported).data[3] as usize);
     }
 
     Some(imported)

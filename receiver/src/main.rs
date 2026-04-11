@@ -895,6 +895,56 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::NewFrame => {
                 if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(decoded) = self.poll_latest_frame() {
+            if let Some(state) = self.state.as_mut() {
+
+                // 1. Вытаскиваем данные кадра заранее, пока decoded еще доступен
+                let (frame_id, frame_trace) = match &decoded {
+                    DecodedFrame::Yuv(f)    => (f.frame_id, f.trace),
+
+                    #[cfg(target_os = "linux")]
+                    DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+
+                    #[cfg(not(target_os = "linux"))]
+                    DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                };
+
+                // 2. Рендерим (поглощаем decoded)
+                match decoded {
+                    DecodedFrame::Yuv(frame) => {
+                        state.update_textures_cpu(&frame);
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    DecodedFrame::DmaBuf(frame) => {
+                        if !state.update_textures_dmabuf(&frame) {
+                            log::warn!("[Render] DMA-BUF import failed for frame #{}", frame_id);
+                            return;
+                        }
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    DecodedFrame::DmaBuf(_frame) => {
+                        log::warn!("[Render] DMA-BUF frame received on non-Linux build");
+                        return;
+                    }
+                }
+
+                // 3. Работаем с телеметрией, используя сохраненные переменные
+                let mut t = frame_trace;
+                if t.capture_us != 0 {
+                    t.present_us = FrameTrace::now_us();
+                    let _ = self.trace_tx.send(Some((frame_id, t)));
+                }
+                
+                if let Some(w) = &self.window {
                     w.request_redraw(); // Просто будим окно
                 }
             }

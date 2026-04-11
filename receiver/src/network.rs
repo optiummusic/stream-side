@@ -202,10 +202,11 @@ fn spawn_trace_feedback_task(
     trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
     control_tx: mpsc::Sender<ControlPacket>,
 ) -> JoinHandle<()> {
+            log::info!("Got some trace");
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
         let mut last_sent_id = 0u64;
-
         loop {
             interval.tick().await;
 

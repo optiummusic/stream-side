@@ -69,12 +69,12 @@ impl QuicServer {
         tokio::spawn(async move {
             let mut frame_id = 0u64;
 
-            while let Some(mut frame) = frame_rx.recv().await {
+            while let Some(mut frame ) = frame_rx.recv().await {
                 frame_id += 1;
                 frame.frame_id = frame_id;
 
                 if let Some(t) = frame.trace.as_mut() {
-                    // t.serialize_us = FrameTrace::now_us(); 
+                    t.serialize_us = FrameTrace::now_us(); 
                 }
                 let shared_frame = Arc::new(frame);
 

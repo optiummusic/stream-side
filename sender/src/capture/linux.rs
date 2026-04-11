@@ -53,6 +53,7 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
     PersistMode,
 };
+use common::GpuVendor;
 use libc::c_int;
 use pipewire::spa::pod::Value;
 use pipewire::spa::utils::Id;
@@ -313,7 +314,7 @@ fn run_pipewire(
                     // ── CPU fallback: MemPtr / MemFd ──────────────────────────
                     spa_sys::SPA_DATA_MemPtr | spa_sys::SPA_DATA_MemFd => {
                         encode::process_frame_from_pw_buffer(raw, |src| {
-                            enc.encode_bgra(src, capture_us);
+                            enc.encode_bgra(src, stride, capture_us);
                         });
                         stream.queue_raw_buffer(raw);
                     }
@@ -373,34 +374,37 @@ fn build_spa_video_params() -> Vec<u8> {
     use pw::spa::pod::serialize::PodSerializer;
     use pw::spa::sys::*;
 
+    let mut properties = vec![
+        pw::spa::pod::Property {
+            key:   SPA_FORMAT_mediaType,
+            flags: PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_MEDIA_TYPE_video)),
+        },
+        pw::spa::pod::Property {
+            key:   SPA_FORMAT_mediaSubtype,
+            flags: PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_MEDIA_SUBTYPE_raw)),
+        },
+        pw::spa::pod::Property {
+            key:   SPA_FORMAT_VIDEO_format,
+            flags: PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_FORMAT_BGRA)),
+        },
+    ];
+
+    // Here we specifically ask for DMA frames. NVIDIA currently doesn't eat those.
+    if matches!(common::detect_gpu_vendor(), common::GpuVendor::Amd) {
+        properties.push(pw::spa::pod::Property {
+            key:   SPA_FORMAT_VIDEO_modifier,
+            flags: PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Long(0), // DRM_FORMAT_MOD_LINEAR
+        });
+    }
+
     let value = pw::spa::pod::Value::Object(pw::spa::pod::Object {
         type_: SPA_TYPE_OBJECT_Format,
         id:    SPA_PARAM_EnumFormat,
-        properties: vec![
-            pw::spa::pod::Property {
-                key:   SPA_FORMAT_mediaType,
-                flags: PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_MEDIA_TYPE_video)),
-            },
-            pw::spa::pod::Property {
-                key:   SPA_FORMAT_mediaSubtype,
-                flags: PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_MEDIA_SUBTYPE_raw)),
-            },
-            pw::spa::pod::Property {
-                key:   SPA_FORMAT_VIDEO_format,
-                flags: PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_FORMAT_BGRA)),
-            },
-            // МАГИЯ ЗДЕСЬ: Сообщаем Hyprland/PipeWire, что мы умеем читать видеопамять (DMA-BUF)
-            // Мы запрашиваем линейный формат памяти (0 = DRM_FORMAT_MOD_LINEAR),
-            // который нужен нашему энкодеру в encode.rs
-            // pw::spa::pod::Property {
-            //     key:   SPA_FORMAT_VIDEO_modifier,
-            //     flags: PropertyFlags::empty(),
-            //     value: pw::spa::pod::Value::Long(0), 
-            // },
-        ],
+        properties,
     });
 
     let mut bytes = Vec::new();

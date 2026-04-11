@@ -54,7 +54,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::FromRawFd;
 use std::ptr;
 
-use common::FrameTrace;
+use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 
 use crate::backend::PushStatus;
 #[cfg(unix)]
@@ -69,11 +69,6 @@ use ffmpeg_next::{
 };
 
 use super::{BackendError, FrameOutput, VideoBackend, YuvFrame};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DMA-BUF frame descriptor — передаётся в render-поток
-// ─────────────────────────────────────────────────────────────────────────────
-
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,9 +139,14 @@ impl DesktopFfmpegBackend {
         // чтобы DMA-BUF экспортированный FFmpeg мог быть импортирован
         // Vulkan без EINVAL.
 
-        let (vaapi_dev, drm_dev, dmabuf_enabled) = unsafe {
-            init_vaapi_from_drm(ctx.as_mut_ptr())
-        };
+        let (vaapi_dev, drm_dev, raw_dmabuf) = unsafe { init_vaapi_from_drm(ctx.as_mut_ptr()) };
+
+        // env variables remained for versatility
+
+        // NVIDIA + Vulkan DMA-BUF import can produce chroma artifacts on some stacks.
+        // Default to CPU fallback there; allow override with RECEIVER_FORCE_DMABUF=1.
+        let gpu = detect_gpu_vendor();
+        let dmabuf_enabled = Self::evaluate_dmabuf_support(raw_dmabuf, gpu);
 
         unsafe {
             if !vaapi_dev.is_null() {
@@ -198,6 +198,19 @@ impl DesktopFfmpegBackend {
             map_frame,
             dmabuf_enabled,
         })
+    }
+    fn evaluate_dmabuf_support(initial: bool, gpu: GpuVendor) -> bool {
+        let force = std::env::var("RECEIVER_FORCE_DMABUF").as_deref() == Ok("1");
+        let disable = std::env::var("RECEIVER_DISABLE_DMABUF").as_deref() == Ok("1");
+
+        if force { return true; }
+        if disable { return false; }
+        if gpu == GpuVendor::Nvidia { 
+            log::info!("Detected NVIDIA GPU, disabling DMA-BUF (for now)");
+            return false; 
+        }
+        
+        initial
     }
 }
 

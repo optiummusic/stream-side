@@ -10,3 +10,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 bytes = "1.11.1"
 reed-solomon-erasure = "6.0.0"
 log      = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.50"
