@@ -4,7 +4,6 @@
 pub mod capture;
 
 /// VAAPI HEVC encoder (Linux only).
-#[cfg(target_os = "linux")]
 pub mod encode;
 
 /// QUIC transport server.

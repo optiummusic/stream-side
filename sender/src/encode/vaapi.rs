@@ -38,6 +38,8 @@ use tokio::sync::mpsc as async_mpsc;
 
 use common::FrameTrace;
 
+use crate::encode::EncodedFrame;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Константы DRM fourcc / modifier
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,7 +82,7 @@ pub enum FrameData {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// VAAPI HEVC энкодер с поддержкой DMA-BUF zero-copy и CPU fallback.
-pub struct Encoder {
+pub struct VaapiEncoder {
     tx:       SyncSender<(FrameData, u64)>,
     _worker:  thread::JoinHandle<()>,
     /// Пул CPU-буферов (только для пути Bgra).
@@ -88,7 +90,7 @@ pub struct Encoder {
     idr_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-impl Encoder {
+impl VaapiEncoder {
     /// Инициализация VAAPI HEVC энкодера.
     ///
     /// Порождает один OS-поток для цикла кодирования.
@@ -150,13 +152,6 @@ impl Encoder {
     pub fn encode(&self, frame: &[u8], capture_us: u64) {
         self.encode_bgra(frame, capture_us);
     }
-}
-
-pub struct EncodedFrame {
-    pub frame_id: u64,
-    pub slices: Vec<Bytes>,
-    pub is_key:  bool,
-    pub trace:   Option<FrameTrace>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1059,64 +1054,4 @@ unsafe fn create_vaapi_frames(
     assert!(ret >= 0, "av_hwframe_ctx_init(VAAPI) failed: {ret}");
     (*codec_ctx).hw_frames_ctx = av_buffer_ref(frames);
     frames
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PipeWire buffer → raw slice (CPU fallback, только MemPtr / MemFd)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Извлекает пиксельный срез из PipeWire-буфера и вызывает `f` с ним.
-///
-/// Обрабатывает `SPA_DATA_MemPtr` и `SPA_DATA_MemFd`.
-/// `SPA_DATA_DmaBuf` **не обрабатывается** — для него используй
-/// [`Encoder::encode_dmabuf`] напрямую.
-///
-/// # Safety
-/// `buffer` должен быть валидным `pw_buffer`, полученным от
-/// `stream.dequeue_raw_buffer()` и ещё не возвращённым.
-pub unsafe fn process_frame_from_pw_buffer<F>(buffer: *mut pw_sys::pw_buffer, mut f: F)
-where
-    F: FnMut(&[u8]),
-{
-    unsafe {
-        if buffer.is_null() || (*buffer).buffer.is_null() { return; }
-        let spa_buf = &*(*buffer).buffer;
-        if spa_buf.n_datas == 0 || spa_buf.datas.is_null() { return; }
-
-        let data  = &*spa_buf.datas;
-        let chunk = data.chunk.as_ref().unwrap();
-        let offset = chunk.offset as usize;
-        let size   = chunk.size   as usize;
-        if size == 0 { return; }
-
-        match data.type_ {
-            spa_sys::SPA_DATA_MemFd => {
-                let map_len = data.maxsize as usize;
-                let mapped  = mmap(
-                    ptr::null_mut(), map_len, PROT_READ,
-                    MAP_SHARED, data.fd as c_int, data.mapoffset as libc::off_t,
-                );
-                if mapped != MAP_FAILED {
-                    if offset + size <= map_len {
-                        let src = slice::from_raw_parts(
-                            (mapped as *const u8).add(offset), size,
-                        );
-                        f(src);
-                    }
-                    munmap(mapped, map_len);
-                }
-            }
-            spa_sys::SPA_DATA_MemPtr => {
-                if !data.data.is_null() {
-                    let src = slice::from_raw_parts(
-                        (data.data as *const u8).add(offset), size,
-                    );
-                    f(src);
-                }
-            }
-            // DmaBuf обрабатывается выше, в process-коллбэке linux.rs.
-            _ => {}
-        }
-    }
 }

@@ -66,10 +66,10 @@ use pipewire::spa::sys as spa_sys;
 use pw::properties::properties;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::encode::EncodedFrame;
+use crate::encode::{self, EncodedFrame};
 
 use super::SenderError;
-use super::super::encode::Encoder;
+use super::super::encode::{AnyEncoder, HwEncoder};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Публичный тип
@@ -202,7 +202,7 @@ fn run_pipewire(
     })
     .map_err(|e| SenderError::CaptureInit(format!("pw stream: {e}")))?;
 
-    let mut encoder: Option<Encoder> = None;
+    let mut encoder: Option<AnyEncoder> = None;
     let mut fps_counter = 0u32;
     let mut fps_tick    = std::time::Instant::now();
 
@@ -286,7 +286,9 @@ fn run_pipewire(
 
                 let enc = encoder.get_or_insert_with(|| {
                     log::info!("[ENCODER] Init with width {:?}, height {:?}", pw_width.get(), pw_height.get(),);
-                    Encoder::new(pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone())
+                    AnyEncoder::detect_and_create(
+                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(),
+                    )
                 });
 
                 match data.type_ {
@@ -310,7 +312,7 @@ fn run_pipewire(
 
                     // ── CPU fallback: MemPtr / MemFd ──────────────────────────
                     spa_sys::SPA_DATA_MemPtr | spa_sys::SPA_DATA_MemFd => {
-                        crate::encode::process_frame_from_pw_buffer(raw, |src| {
+                        encode::process_frame_from_pw_buffer(raw, |src| {
                             enc.encode_bgra(src, capture_us);
                         });
                         stream.queue_raw_buffer(raw);
