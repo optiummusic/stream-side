@@ -19,18 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Create tag if manual run
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
-            echo "Tag already exists"
-          else
-            git tag ${{ github.event.inputs.version }}
-            git push origin ${{ github.event.inputs.version }}
-          fi
- 
+    
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -306,6 +295,11 @@ jobs:
       - build-receiver-android
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -319,13 +313,14 @@ jobs:
           zip -j sender-linux-x86_64.zip       artifacts/sender-linux/sender
           zip -j receiver-linux-x86_64.zip     artifacts/receiver-linux/receiver
           zip -j receiver-windows-x86_64.zip   artifacts/receiver-windows/receiver.exe \
-                                                artifacts/receiver-windows/*.dll
+                                               artifacts/receiver-windows/*.dll
           cp artifacts/receiver-android/app-release.apk receiver-android.apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: ${{ github.event.inputs.version || github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true
