@@ -4,9 +4,12 @@ on:
   push:
     tags:
       - 'v*'
-
-permissions:
-  contents: write
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.1)'
+        required: true
+        default: 'v0.1.0'
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
@@ -16,6 +19,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create tag if manual run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
+            echo "Tag already exists"
+          else
+            git tag ${{ github.event.inputs.version }}
+            git push origin ${{ github.event.inputs.version }}
+          fi
  
       - name: Install system dependencies
         run: |
