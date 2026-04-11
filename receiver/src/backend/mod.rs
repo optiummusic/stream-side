@@ -154,5 +154,8 @@ pub trait VideoBackend: Send + 'static {
 #[cfg(not(target_os = "android"))]
 pub mod desktop;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[cfg(target_os = "android")]
 pub mod android;
