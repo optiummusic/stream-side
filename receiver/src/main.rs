@@ -954,6 +954,9 @@ impl ApplicationHandler<UserEvent> for App {
                             t.present_us = FrameTrace::now_us();
                             let _ = self.trace_tx.send(Some((frame_id, t)));
                         }
+                        else {
+                            // log::info!("Capture is 0");
+                        }
 
                         state.render();
                         if !self.frame_rx.is_empty() { if let Some(w) = &self.window { w.request_redraw() }; }
