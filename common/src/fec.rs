@@ -179,20 +179,24 @@ impl FrameBuilder {
             }
         }
 
-        // Собираем итоговый пакет (распаковка из Postcard, если ты 
-        // шлешь VideoPacket целиком, либо просто отдаем payload)
-        // Если payload - это уже сырые NALU, то:
-        
-        let mut trace = FrameTrace::default();
-        trace.receive_us = self.first_us;
-        trace.reassembled_us = FrameTrace::now_us();
+        // 1. full_payload — это байты, созданные postcard на сервере! 
+        // Десериализуем их обратно в структуру VideoPacket.
+        let mut packet: VideoPacket = match postcard::from_bytes(&full_payload) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to deserialize VideoPacket from FEC payload: {}", e);
+                return None;
+            }
+        };
 
-        Some(VideoPacket {
-            frame_id,
-            payload: full_payload,
-            is_key: self.is_key,
-            trace: Some(trace),
-        })
+        // 2. Восстанавливаем метрики приемника (так как packet.trace УЖЕ содержит данные сервера)
+        if let Some(ref mut trace) = packet.trace {
+            trace.receive_us = self.first_us;
+            trace.reassembled_us = FrameTrace::now_us();
+        }
+
+        // 3. Отдаем готовый пакет
+        Some(packet)
     }
 }
 

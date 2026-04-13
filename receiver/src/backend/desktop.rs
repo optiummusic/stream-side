@@ -288,7 +288,6 @@ impl VideoBackend for DesktopFfmpegBackend {
  
         let mut trace = raw_trace.unwrap_or_default();
         trace.decode_us = FrameTrace::now_us();
-
         // ── 3. Zero-copy путь: VAAPI → av_hwframe_map → DRM_PRIME ────────────
         //
         // Если VAAPI и DRM-устройство были подняты совместно (dmabuf_enabled),

@@ -948,14 +948,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 return;
                             }
                         }
-
                         let mut t = frame_trace;
+                        
                         if t.capture_us != 0 {
                             t.present_us = FrameTrace::now_us();
+                            log_trace(0, &t);
                             let _ = self.trace_tx.send(Some((frame_id, t)));
-                        }
-                        else {
-                            // log::info!("Capture is 0");
                         }
 
                         state.render();

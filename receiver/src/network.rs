@@ -202,8 +202,6 @@ fn spawn_trace_feedback_task(
     trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
     control_tx: mpsc::Sender<ControlPacket>,
 ) -> JoinHandle<()> {
-            log::info!("Got some trace");
-
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1500));
         let mut last_sent_id = 0u64;
@@ -541,6 +539,7 @@ async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
     let trace       = packet.trace.take();
     let backend_arc = backend.clone();
     let ctrl        = control_tx.clone();
+    
  
     let push_result = tokio::task::spawn_blocking(move || {
         let mut backend_lock = backend_arc.lock().unwrap();

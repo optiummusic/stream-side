@@ -9,8 +9,9 @@ pub mod encode;
 /// QUIC transport server.
 pub mod quic;
 
-use std::{sync::atomic::AtomicBool, time::Duration};
+use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
 
+use bytes::Bytes;
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -20,12 +21,20 @@ struct ClientIdentity {
     ready: bool,
 }
 
+#[derive(Clone)]
+struct SerializedFrame {
+    pub frame_id: u64,
+    pub is_key: bool,
+    pub chunks: Arc<Vec<Bytes>>,
+}
+
 #[derive(Default)]
 struct ConnectionInfo {
     remote: String,
     label: RwLock<String>,
     ready: AtomicBool,
 }
+
 
 impl ConnectionInfo {
     async fn label(&self) -> String {
