@@ -4,6 +4,8 @@ use std::os::unix::io::RawFd;
 use bytes::Bytes;
 use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 use tokio::sync::{mpsc, watch};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod vaapi;
 pub mod nvenc;
@@ -61,15 +63,16 @@ impl AnyEncoder {
         height: u32,
         sink:   mpsc::Sender<EncodedFrame>,
         idr_rx: watch::Receiver<bool>,
+        bitrate: Arc<AtomicU64>,
     ) -> Self {
         match detect_gpu_vendor() {
             GpuVendor::Nvidia => {
                 log::info!("[Encoder] NVIDIA GPU detected → hevc_nvenc");
-                Self::Nvenc(NvencEncoder::new(width, height, sink, idr_rx))
+                Self::Nvenc(NvencEncoder::new(width, height, sink, idr_rx, bitrate))
             }
             v => {
                 log::info!("[Encoder] Vendor {v:?} → hevc_vaapi (VAAPI)");
-                Self::Vaapi(VaapiEncoder::new(width, height, sink, idr_rx))
+                Self::Vaapi(VaapiEncoder::new(width, height, sink, idr_rx, bitrate))
             }
         }
     }

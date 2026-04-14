@@ -8,6 +8,7 @@ pub mod encode;
 
 /// QUIC transport server.
 pub mod quic;
+pub mod ui;
 
 use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
 

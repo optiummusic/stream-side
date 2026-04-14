@@ -5,6 +5,7 @@
 // DMA-BUF:   fd → av_hwframe_map(CUDA←DRM_PRIME) → nvenc  (TODO: требует nvdec/cuda iop)
 
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{ffi::CString, path::Path, ptr, slice, sync::Arc};
 
 use bytes::Bytes;
@@ -33,7 +34,6 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 5_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,6 +73,7 @@ pub struct NvencEncoder {
     /// Пул CPU-буферов (только для пути Bgra).
     free_rx:  mpsc::Receiver<Vec<u8>>,
     idr_rx: tokio::sync::watch::Receiver<bool>,
+    bitrate: Arc<AtomicU64>
 }
 
 impl NvencEncoder {
@@ -84,11 +85,11 @@ impl NvencEncoder {
     ///
     /// # Panics
     /// Паникует, если `hevc_vaapi` недоступен или VAAPI/DRM недоступны.
-    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate: Arc<AtomicU64>) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (free_tx, free_rx)   = mpsc::channel::<Vec<u8>>();
-
+        let bitrate_clone = bitrate.clone();
         // Два BGRA буфера для CPU-пути.
         let buf_size = (width * height * 4) as usize;
         free_tx.send(vec![0u8; buf_size]).unwrap();
@@ -99,13 +100,13 @@ impl NvencEncoder {
         let worker = thread::Builder::new()
             .name("vaapi-encoder".into())
             .spawn(move || {
-                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone);
+                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone, bitrate_clone);
             })
             .expect("failed to spawn encoder thread");
 
         ready_rx.recv().expect("encoder init signal");
 
-        Self { tx, _worker: worker, free_rx, idr_rx }
+        Self { tx, _worker: worker, free_rx, idr_rx, bitrate }
     }
 
     /// Отправить BGRA-кадр (CPU-путь) на кодирование.
@@ -176,6 +177,7 @@ fn run_encoder_loop(
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
     mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    bitrate: Arc<AtomicU64>,
 ) {
     // ── Codec init ─────────────────────────────────────────────────
 
@@ -183,16 +185,16 @@ fn run_encoder_loop(
         .expect("hevc_nvenc encoder not found");
 
     let mut enc_ctx = codec::context::Context::new_with_codec(codec);
-
+    let initial_bitrate = bitrate.load(Ordering::Relaxed) as i64;
     unsafe {
         let raw = enc_ctx.as_mut_ptr();
         (*raw).width          = width  as i32;
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
         (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_NV12;
-        (*raw).bit_rate       = BITRATE;
-        (*raw).rc_max_rate    = BITRATE;
-        (*raw).rc_buffer_size = BITRATE as i32 / 2;
+        (*raw).bit_rate       = initial_bitrate;
+        (*raw).rc_max_rate    = initial_bitrate;
+        (*raw).rc_buffer_size = initial_bitrate as i32 / 2;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
@@ -255,6 +257,38 @@ fn run_encoder_loop(
             }
             frame_data  = newer.0;
             capture_us  = newer.1;
+        }
+
+        // Check whether we changed the bitrate
+        let current_bitrate = bitrate.load(Ordering::Relaxed) as i64;
+        unsafe {
+            let raw = encoder.as_mut_ptr();
+            if (*raw).bit_rate != current_bitrate {
+                log::info!("[Encoder] Reconfiguring bitrate to {} bps", current_bitrate);
+                
+                // 1. Обновляем основные поля контекста
+                (*raw).bit_rate = current_bitrate;
+                (*raw).rc_max_rate = current_bitrate;
+                (*raw).rc_buffer_size = (current_bitrate / 2) as i32;
+
+                // 2. Явно пробрасываем через опции (nvenc это понимает на лету)
+                let bitrate_str = CString::new(current_bitrate.to_string()).unwrap();
+                
+                // Попытка обновить параметры через av_opt
+                // "b" — это алиас для битрейта в ffmpeg
+                av_opt_set((*raw).priv_data, 
+                    CString::new("b").unwrap().as_ptr(), 
+                    bitrate_str.as_ptr(), 
+                    0
+                );
+
+                // Для NVENC важно также обновить таргет битрейт в его внутренних настройках
+                av_opt_set((*raw).priv_data, 
+                    CString::new("target_bitrate").unwrap().as_ptr(), 
+                    bitrate_str.as_ptr(), 
+                    0
+                );
+            }
         }
 
         if idr_rx.has_changed().unwrap_or(false) {

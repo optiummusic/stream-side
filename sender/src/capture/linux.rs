@@ -80,13 +80,14 @@ use super::super::encode::{AnyEncoder, HwEncoder};
 pub struct LinuxPipeWireSender {
     width:  u32,
     height: u32,
-    idr_rx: tokio::sync::watch::Receiver<bool>
+    idr_rx: tokio::sync::watch::Receiver<bool>,
+    bitrate: Arc<AtomicU64>
 }
 
 impl LinuxPipeWireSender {
     /// Создать sender для захвата и кодирования в разрешении `width × height`.
-    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        Self { width, height, idr_rx }
+    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate: Arc<AtomicU64>) -> Self {
+        Self { width, height, idr_rx, bitrate }
     }
 }
 
@@ -121,7 +122,7 @@ impl super::VideoSender for LinuxPipeWireSender {
             .name("pipewire-capture".into())
             .spawn(move || {
                 let _guard = rt_handle.enter();
-                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.idr_rx) {
+                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.idr_rx, self.bitrate.clone()) {
                     let _ = err_tx.send(e);
                 }
             })
@@ -172,6 +173,7 @@ fn run_pipewire(
     height:  u32,
     sink:    mpsc::Sender<EncodedFrame>,
     idr_rx: tokio::sync::watch::Receiver<bool>,
+    bitrate: Arc<AtomicU64>,
 ) -> Result<(), SenderError> {
     pw::init();
 
@@ -195,6 +197,7 @@ fn run_pipewire(
     let w_clone = pw_width.clone();
     let h_clone = pw_height.clone();
 
+    let bitrate_for_encoder = bitrate.clone();
     
     let stream = pw::stream::StreamBox::new(&core, "capture", properties! {
         *pw::keys::MEDIA_TYPE     => "Video",
@@ -288,7 +291,7 @@ fn run_pipewire(
                 let enc = encoder.get_or_insert_with(|| {
                     log::info!("[ENCODER] Init with width {:?}, height {:?}", pw_width.get(), pw_height.get(),);
                     AnyEncoder::detect_and_create(
-                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(),
+                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(), bitrate_for_encoder.clone()
                     )
                 });
 

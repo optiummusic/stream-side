@@ -417,7 +417,7 @@ async fn receive_datagrams<B: VideoBackend>(
         
         tokio::select! {
             // ── 1. Incoming datagram ─────────────────────────────────────────
-                        // ── 2. Jitter-buffer drain timer ─────────────────────────────────
+            // ── 2. Jitter-buffer drain timer ─────────────────────────────────
             // Fires when the earliest buffered frame has waited long enough.
             // All frames whose deadline has now passed are released at once.
             _ = &mut sleep => {

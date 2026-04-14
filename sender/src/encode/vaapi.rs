@@ -23,6 +23,7 @@
 //! | vaapi-encoder  | приём `FrameData`, кодирование, отправка NAL в sink  |
 
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{ffi::CString, ptr, slice, sync::Arc};
 
 use bytes::Bytes;
@@ -51,7 +52,6 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 5_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +91,7 @@ pub struct VaapiEncoder {
     /// Пул CPU-буферов (только для пути Bgra).
     free_rx:  mpsc::Receiver<Vec<u8>>,
     idr_rx: tokio::sync::watch::Receiver<bool>,
+    pub bitrate: Arc<AtomicU64>,
 }
 
 impl VaapiEncoder {
@@ -102,10 +103,11 @@ impl VaapiEncoder {
     ///
     /// # Panics
     /// Паникует, если `hevc_vaapi` недоступен или VAAPI/DRM недоступны.
-    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate: Arc<AtomicU64>) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (free_tx, free_rx)   = mpsc::channel::<Vec<u8>>();
+        let bitrate_clone = bitrate.clone();
 
         // Два BGRA буфера для CPU-пути.
         let buf_size = (width * height * 4) as usize;
@@ -117,13 +119,13 @@ impl VaapiEncoder {
         let worker = thread::Builder::new()
             .name("vaapi-encoder".into())
             .spawn(move || {
-                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone);
+                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone, bitrate_clone);
             })
             .expect("failed to spawn encoder thread");
 
         ready_rx.recv().expect("encoder init signal");
 
-        Self { tx, _worker: worker, free_rx, idr_rx }
+        Self { tx, _worker: worker, free_rx, idr_rx, bitrate }
     }
 
     /// Отправить BGRA-кадр (CPU-путь) на кодирование.
@@ -242,6 +244,7 @@ fn run_encoder_loop(
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
     mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    bitrate: Arc<AtomicU64>,
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
 
@@ -250,15 +253,16 @@ fn run_encoder_loop(
 
     let mut enc_ctx = codec::context::Context::new_with_codec(codec);
 
+    let initial_bitrate = bitrate.load(Ordering::Relaxed) as i64;
     unsafe {
         let raw = enc_ctx.as_mut_ptr();
         (*raw).width          = width  as i32;
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
         (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*raw).bit_rate       = BITRATE;
-        (*raw).rc_max_rate    = BITRATE;
-        (*raw).rc_buffer_size = BITRATE as i32 / 2;
+        (*raw).bit_rate       = initial_bitrate;
+        (*raw).rc_max_rate    = initial_bitrate;
+        (*raw).rc_buffer_size = initial_bitrate as i32 / 10;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
@@ -272,6 +276,7 @@ fn run_encoder_loop(
     opts.set("intra_refresh_type", "both");
     opts.set("mbtree", "0"); 
     opts.set("tune", "zerolatency");
+    opts.set("rc_mode", "CBR");
     // VAAPI + DRM: создаём оба контекста через единый DRM-девайс.
     // ВАЖНО: VAAPI должен быть ПРОИЗВОДНЫМ от DRM-девайса, чтобы оба контекста
     // разделяли один и тот же fd DRM-устройства. Только тогда av_hwframe_transfer_data
@@ -329,6 +334,19 @@ fn run_encoder_loop(
             }
             frame_data  = newer.0;
             capture_us  = newer.1;
+        }
+
+        // Check whether we changed the bitrate
+        let current_bitrate = bitrate.load(Ordering::Relaxed) as i64;
+        unsafe {
+            let raw = encoder.as_mut_ptr();
+            if (*raw).bit_rate != current_bitrate {
+                log::info!("[Encoder] Changing bitrate to {} bps", current_bitrate);
+                (*raw).bit_rate = current_bitrate;
+                (*raw).rc_max_rate = current_bitrate;
+                (*raw).rc_buffer_size = (current_bitrate / 10) as i32;
+                (*raw).flags |= AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+            }
         }
 
         if idr_rx.has_changed().unwrap_or(false) {

@@ -207,3 +207,41 @@ pub fn detect_gpu_vendor() -> GpuVendor {
 
     GpuVendor::Unknown
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EncoderCfg {
+    pub bitrate_bps:   u64,
+    pub gop_frames:    u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CaptureCfg {
+    pub target_fps:    u32,
+    pub dmabuf_encode: bool,
+    pub dmabuf_decode: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransportCfg {
+    pub pacer_rate_mbps:    f64,
+    pub burst_cap_ms:       f64,
+    pub fec_k:              u8,
+    pub fec_m:              u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct JitterCfg {
+    pub jitter_target_ms:  u64,
+    pub jitter_max_frames: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientCfg {
+    pub receive_datagram_mb: u64, // t * 1024 * 1024    
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServerCfg {
+    pub receive_datagram_mb: u64, // t * 1024 * 1024    
+    pub send_datagram_mb: u64, // t * 1024 * 1024  
+}
