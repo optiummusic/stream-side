@@ -104,11 +104,13 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
         let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
 
         let mut task_handles = Vec::<JoinHandle<()>>::new();
+        let proxy_clone = proxy.clone();
 
         task_handles.push(spawn_decoder_poll_task(
             backend.clone(),
             frame_tx.clone(),
             control_tx.clone(),
+            proxy_clone
         ));
 
         task_handles.push(spawn_control_writer_task(
@@ -125,9 +127,8 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
         // Основной цикл приёма датаграмм.
         // Когда он завершается — считаем соединение потерянным.
-        let proxy_clone = proxy.clone();
         let (idr_needed_tx, _idr_needed_rx) = watch::channel(false);
-        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx, proxy_clone).await;
+        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx).await;
 
         // Останавливаем все фоновые задачи этого соединения.
         for handle in task_handles {
@@ -259,6 +260,7 @@ fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
     backend: Arc<Mutex<B>>,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>,
     control_tx: mpsc::Sender<ControlPacket>,
+    proxy: AppProxy,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(3));
@@ -339,6 +341,12 @@ fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
 
                         _ => Ok(()),
                     };
+                    #[cfg(not(target_os = "android"))]
+                    if res.is_ok() {
+                        if let Some(p) = &proxy {
+                            let _ = p.send_event(crate::UserEvent::NewFrame);
+                        }
+                    }
 
                     if res.is_err() {
                         break;
@@ -384,7 +392,6 @@ async fn receive_datagrams<B: VideoBackend>(
     backend:  Arc<Mutex<B>>,
     control_tx: mpsc::Sender<ControlPacket>,
     idr_needed_tx: watch::Sender<bool>,
-    proxy: AppProxy,
 ) {
     let idr_needed_rx = idr_needed_tx.subscribe();
     let mut video_state = VideoState {
@@ -428,11 +435,6 @@ async fn receive_datagrams<B: VideoBackend>(
                         &idr_needed_tx,
                         &idr_needed_rx,
                     ).await;
-                }
-
-                #[cfg(not(target_os = "android"))]
-                if let Some(p) = &proxy {
-                    let _ = p.send_event(crate::UserEvent::NewFrame);
                 }
             }
 
