@@ -1051,7 +1051,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn log_trace(frame_id: u64, t: &FrameTrace) {
-    log::info!(
+    log::debug!(
         "\n#{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
          serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
          decode→present={:.1}ms  TOTAL={:.1}ms",
