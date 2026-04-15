@@ -103,7 +103,7 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
         }
 
         let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
-
+        let proxy_clone = proxy.clone();
         let mut task_handles = Vec::<JoinHandle<()>>::new();
         let proxy_clone = proxy.clone();
 
@@ -342,6 +342,7 @@ fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
 
                         _ => Ok(()),
                     };
+                    
                     #[cfg(not(target_os = "android"))]
                     if res.is_ok() {
                         if let Some(p) = &proxy {

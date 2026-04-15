@@ -167,39 +167,45 @@ impl FrameBuilder {
 
     fn assemble(&mut self, frame_id: u64) -> Option<VideoPacket> {
         let mut full_payload = Vec::new();
+        let mut final_trace: Option<FrameTrace> = None;
 
-        // Слайсы должны идти строго по порядку 0..total_slices
+        // Slices must be processed in order 0..total_slices
         for i in 0..self.total_slices {
-            if let Some(slice_builder) = self.slices.get_mut(&i) {
-                if let Some(mut recovered_data) = slice_builder.reconstruct() {
-                    full_payload.append(&mut recovered_data);
-                } else {
-                    log::error!("Failed to reconstruct slice {} for frame {}", i, frame_id);
-                    return None;
+            let slice_builder = self.slices.get_mut(&i)?;
+            let recovered_bytes = slice_builder.reconstruct()?;
+
+            // --- THE KEY STEP: DESERIALIZE THE WRAPPER ---
+            // We use take_from_bytes because Reed-Solomon might leave padding zeros 
+            // at the end of the buffer, which Postcard's strict mode would reject.
+            let (video_slice, _remainder): (crate::VideoSlice, _) = 
+                match postcard::take_from_bytes(&recovered_bytes) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        log::error!("Postcard failure on slice {} frame {}: {}", i, frame_id, e);
+                        return None;
+                    }
+                };
+
+            // If this is the first slice, it contains our timing trace
+            if i == 0 {
+                final_trace = video_slice.trace;
+                // Update the trace with receiver-side timing
+                if let Some(ref mut t) = final_trace {
+                    t.receive_us = self.first_us;
+                    t.reassembled_us = FrameTrace::now_us();
                 }
-            } else {
-                return None; // Какого-то слайса вообще нет
             }
+
+            // Append only the ACTUAL video payload to the final buffer
+            full_payload.extend_from_slice(&video_slice.payload);
         }
 
-        // 1. full_payload — это байты, созданные postcard на сервере! 
-        // Десериализуем их обратно в структуру VideoPacket.
-        let mut packet: VideoPacket = match postcard::from_bytes(&full_payload) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Failed to deserialize VideoPacket from FEC payload: {}", e);
-                return None;
-            }
-        };
-
-        // 2. Восстанавливаем метрики приемника (так как packet.trace УЖЕ содержит данные сервера)
-        if let Some(ref mut trace) = packet.trace {
-            trace.receive_us = self.first_us;
-            trace.reassembled_us = FrameTrace::now_us();
-        }
-
-        // 3. Отдаем готовый пакет
-        Some(packet)
+        Some(VideoPacket {
+            frame_id,
+            payload: full_payload,
+            is_key: self.is_key,
+            trace: final_trace,
+        })
     }
 }
 

@@ -47,6 +47,14 @@ impl ConnectionInfo {
     }
 }
 
+#[derive(Clone)]
+pub struct SerializedFrame {
+    pub frame_id: u64,
+    pub is_key: bool,
+    /// Pre-serialized, FEC-encoded, ready-to-send QUIC datagrams.
+    pub datagrams: Vec<Bytes>,
+}
+
 /// Token-bucket pacer — spreads the datagram chunks of a frame evenly over
 /// time instead of blasting them all in a single tight loop.
 ///

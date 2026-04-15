@@ -36,7 +36,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket, VideoSlice};
-use crate::{ClientIdentity, ConnectionInfo, FramePacer};
+use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,84 +61,37 @@ impl QuicServer {
 
         // broadcast capacity = 64 frames  (~1 second of 60 fps with headroom).
         // watch is not used here because we need `is_key` alongside the data.
-        let (bcast_tx, _) = broadcast::channel::<SerializedFrame>(64);
+        let (bcast_tx, _) = broadcast::channel::<Arc<SerializedFrame>>(64);
         let server_bcast  = bcast_tx.clone();
 
         // ── Serialiser task ──────────────────────────────────────────────────
         // Converts raw NAL slices into `VideoPacket`, serialises with postcard
         // once, and broadcasts the resulting `Arc<Bytes>` to all client tasks.
+
         tokio::spawn(async move {
-            let mut frame_id = 0u64;
+            run_serialiser_task(frame_rx, server_bcast).await;
+            // let mut frame_id = 0u64;
 
-            // A safe size between MTU and byte header size
-            let max_chunk_data = 1150;
+            // while let Some(mut frame ) = frame_rx.recv().await {
+            //     frame_id += 1;
+            //     frame.frame_id = frame_id;
 
-            while let Some(mut frame) = frame_rx.recv().await {
-                frame_id += 1;
-                let is_key = frame.is_key;
+            //     if let Some(t) = frame.trace.as_mut() {
+            //         t.serialize_us = FrameTrace::now_us(); 
+            //     }
+            //     let shared_frame = Arc::new(frame);
 
-                if let Some(t) = frame.trace.as_mut() {
-                    t.serialize_us = FrameTrace::now_us(); 
-                }
-                
-                // 1. Склеиваем все слайсы (NALU)
-                let mut flat_payload = Vec::new();
-                for slice in frame.slices {
-                    flat_payload.extend_from_slice(&slice);
-                }
+            //     // log::info!(
+            //     //     "[SEND RAW] id={} size={} key={}",
+            //     //     packet.frame_id,
+            //     //     packet.payload.len(),
+            //     //     packet.is_key
+            //     // );
 
-                let packet = VideoPacket {
-                    frame_id,
-                    payload: flat_payload,
-                    is_key,
-                    trace: frame.trace,
-                };
-
-                // 2. Сериализуем ВЕСЬ пакет целиком
-                let serialized_bytes = postcard::to_allocvec(&packet).unwrap_or_default();
-                let flags = if is_key { 1 } else { 0 };
-
-                // 3. ЗАЩИТА ОТ TooManyShards
-                // Ограничим количество data shards (k) на один слайс до 200.
-                // При k=200, m=40, k+m = 240 (безопасно помещается в лимит 255).
-                let max_k = 200;
-                let max_slice_bytes = max_k * max_chunk_data; // 200 * 1150 = 230_000 байт
-
-                let total_slices = ((serialized_bytes.len() + max_slice_bytes - 1) / max_slice_bytes).max(1);
-
-                if total_slices > 255 {
-                    log::error!("[FEC] Frame {} is too massive! Total slices needed: {}", frame_id, total_slices);
-                    continue; // Пропускаем аномально гигантский кадр (больше 58 МБ)
-                }
-
-                let mut chunk_bytes = Vec::new();
-
-                // 4. Итерируемся по безопасным кускам массива и кодируем каждый отдельно
-                for (slice_idx, slice_data) in serialized_bytes.chunks(max_slice_bytes).enumerate() {
-                    let chunks = common::fec::FecEncoder::encode_slice(
-                        frame_id,
-                        slice_idx as u8,
-                        total_slices as u8,
-                        slice_data,
-                        max_chunk_data,
-                        flags
-                    );
-                    
-                    for c in chunks {
-                        chunk_bytes.push(c.to_bytes().into());
-                    }
-                }
-
-                let msg = SerializedFrame {
-                    frame_id,
-                    is_key,
-                    chunks: Arc::new(chunk_bytes),
-                };
-
-                if let Err(_) = server_bcast.send(msg) {
-                    // Нет активных подписчиков
-                }
-            }
+            //     if let Err(_) = server_bcast.send(shared_frame) {
+            //         // Если нет активных подписчиков, broadcast вернет ошибку, это нормально
+            //     }
+            // }
         });
 
         // ── Accept loop ──────────────────────────────────────────────────────
@@ -250,10 +203,82 @@ impl QuicServer {
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-client send loop
 // ─────────────────────────────────────────────────────────────────────────────
+async fn run_serialiser_task(
+    mut frame_rx: mpsc::Receiver<EncodedFrame>,
+    broadcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
+) {
+    let mut frame_id = 0u64;
+    
+    // Calculate a safe max chunk size for the broadcast.
+    // Quinn's initial_mtu is 1200, so we use that as our baseline constraint.
+    let max_dgram = 1200;
+    let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 8;
+
+    while let Some(mut frame) = frame_rx.recv().await {
+        frame_id += 1;
+        frame.frame_id = frame_id;
+
+        if let Some(t) = frame.trace.as_mut() {
+            t.serialize_us = FrameTrace::now_us(); 
+        }
+
+        let total_slices = frame.slices.len() as u8;
+        if total_slices == 0 {
+            continue;
+        }
+
+        let mut datagrams = Vec::new();
+
+        for (s_idx, (slice_data, is_critical)) in frame.slices.iter().enumerate() {
+            // 1. Calculate flags
+            let mut flags = if frame.is_key { 1 } else { 0 };
+            if *is_critical { flags |= 2; }
+
+            // 2. Wrap payload
+            let slice = VideoSlice {
+                frame_id: frame.frame_id,
+                slice_idx: s_idx as u8,
+                total_slices,
+                is_key: frame.is_key,
+                payload: slice_data.to_vec(),
+                trace: if s_idx == 0 { frame.trace.clone() } else { None },
+            };
+
+            // 3. Serialize using postcard
+            let serialized = postcard::to_allocvec(&slice).unwrap_or_default();
+
+            // 4. FEC Encoding
+            let chunks = common::fec::FecEncoder::encode_slice(
+                frame.frame_id,
+                s_idx as u8,
+                total_slices,
+                &serialized, 
+                max_chunk_data,
+                flags
+            );
+
+            // 5. Convert to Bytes instantly
+            for chunk in chunks {
+                datagrams.push(chunk.to_bytes());
+            }
+        }
+
+        // 6. Broadcast the pre-computed datagrams
+        let shared_frame = Arc::new(SerializedFrame {
+            frame_id: frame.frame_id,
+            is_key: frame.is_key,
+            datagrams,
+        });
+
+        if let Err(_) = broadcast_tx.send(shared_frame) {
+            // No active subscribers, safely ignore.
+        }
+    }
+}
 
 async fn send_loop_to_client(
     conn: quinn::Connection,
-    mut video_rx: broadcast::Receiver<SerializedFrame>,
+    mut video_rx: broadcast::Receiver<Arc<SerializedFrame>>,
     info: Arc<ConnectionInfo>,
     clock_offset: &AtomicI64,
     idr_tx: watch::Sender<bool>,
@@ -272,11 +297,13 @@ async fn send_loop_to_client(
             // 1. ОТПРАВКА ВИДЕО
             video_result = video_rx.recv() => {
                 match video_result {
-                    Ok(sf) => {
-                        if !info.ready.load(Ordering::Acquire) { continue; }
+                    Ok(serialized_frame) => { 
+                        if !info.ready.load(Ordering::Acquire) {
+                            continue;
+                        }
 
                         if !started {
-                            if !sf.is_key {
+                            if !serialized_frame.is_key {
                                 if !requested_initial_idr {
                                     let _ = idr_tx.send(true);
                                     let _ = idr_tx.send(false);
@@ -288,50 +315,18 @@ async fn send_loop_to_client(
                             started = true;
                             requested_initial_idr = false;
                         }
-                        let total_slices = frame.slices.len() as u8;
-                        if total_slices == 0 {
-                            continue;
-                        }
-                        // Теперь итерируемся по реальным слайсам из энкодера
-                        for (s_idx, (slice_data, is_critical)) in frame.slices.iter().enumerate() {
-                            // 1. Calculate flags including the new critical bit
-                            let mut flags = if frame.is_key { 1 } else { 0 };
-                            if *is_critical { flags |= 2; }
 
-                            // 2. Wrap the payload in the new VideoSlice struct
-                            let slice = VideoSlice {
-                                frame_id: frame.frame_id,
-                                slice_idx: s_idx as u8,
-                                total_slices,
-                                is_key: frame.is_key,
-                                payload: slice_data.to_vec(),
-                                trace: if s_idx == 0 { frame.trace.clone() } else { None },
-                            };
+                        // Just pace and send the pre-computed bytes. Zero-copy.
+                        for dgram in &serialized_frame.datagrams {
+                            let wait = pacer.consume(DatagramChunk::HEADER_LEN + dgram.len());
+                            if !wait.is_zero() {
+                                tokio::time::sleep(wait).await;
+                            }
 
-                            // 3. Serialize using postcard
-                            let serialized = postcard::to_allocvec(&slice).unwrap_or_default();
-
-                            // 4. Pass the SERIALIZED data to the FEC encoder, not the raw slice
-                            let chunks = common::fec::FecEncoder::encode_slice(
-                                frame.frame_id,
-                                s_idx as u8,
-                                total_slices,
-                                &serialized, 
-                                max_chunk_data,
-                                flags
-                            );
-
-                            for chunk in chunks {
-                                let wait = pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len());
-                                if !wait.is_zero() {
-                                    tokio::time::sleep(wait).await;
-                                }
-
-                                let dgram = chunk.to_bytes();
-                                if conn.send_datagram(dgram.into()).is_err() {
-                                    log::error!("[QUIC] Failed to send datagram to {}", remote);
-                                    return; 
-                                }
+                            // .clone() on Bytes is extremely cheap (atomic ref-count bump)
+                            if conn.send_datagram(dgram.clone()).is_err() {
+                                log::error!("[QUIC] Failed to send datagram to {}", remote);
+                                return; 
                             }
                         }
                     }
