@@ -53,7 +53,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 20_000_000;
+const BITRATE: i64 = 5_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,7 +296,7 @@ fn run_encoder_loop(
         .expect("avcodec_open2 failed");
 
     unsafe {
-        (*encoder.as_mut_ptr()).gop_size = 120;
+        (*encoder.as_mut_ptr()).gop_size = 300;
     }
 
     // ── SwsScale для CPU-пути (BGRA → NV12) ─────────────────────────────────

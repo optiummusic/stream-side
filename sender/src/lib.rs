@@ -9,9 +9,10 @@ pub mod encode;
 /// QUIC transport server.
 pub mod quic;
 
-use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
+use std::{collections::HashMap, sync::atomic::AtomicBool, time::Duration};
 
 use bytes::Bytes;
+use common::DatagramChunk;
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -116,5 +117,78 @@ impl FramePacer {
             self.tokens = 0.0;
             Duration::from_micros((deficit / self.rate_bytes_per_us) as u64)
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shard cache — retransmission buffer
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+/// How many recent frames to keep in the retransmission cache.
+/// At 60 fps this is ~500 ms of history — enough to cover any reasonable RTT
+/// while not consuming much memory (most frames are a few KB after FEC).
+const SHARD_CACHE_FRAMES: usize = 30;
+ 
+/// Ring-buffer cache of recently sent shards, keyed by frame_id.
+///
+/// Layout: `frame_id → slice_idx → Vec<encoded shard Bytes>` (one entry per
+/// shard, already wire-formatted and ready to `send_datagram`).
+///
+/// When the cache is full (> SHARD_CACHE_FRAMES distinct frame IDs) the oldest
+/// entry is evicted, which is correct because those frames have already been
+/// decoded or skipped on the receiver.
+pub struct ShardCache {
+    // Внутреннее состояние теперь защищено
+    inner: std::sync::RwLock<CacheInner>,
+}
+
+struct CacheInner {
+    order: std::collections::VecDeque<u64>,
+    data: HashMap<u64, HashMap<u8, Vec<Bytes>>>,
+}
+
+impl ShardCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(CacheInner {
+                order: std::collections::VecDeque::with_capacity(SHARD_CACHE_FRAMES + 1),
+                data: HashMap::new(),
+            }),
+        }
+    }
+
+    pub fn insert(&self, frame_id: u64, datagrams: &[Bytes]) {
+        let mut inner = self.inner.write().unwrap(); // Эксклюзивный доступ для записи
+        
+        if inner.order.len() >= SHARD_CACHE_FRAMES {
+            if let Some(old_id) = inner.order.pop_front() {
+                inner.data.remove(&old_id);
+            }
+        }
+
+        let slice_map = inner.data.entry(frame_id).or_default();
+        for dgram in datagrams {
+            if let Some(chunk) = DatagramChunk::decode(dgram.clone()) {
+                slice_map.entry(chunk.slice_idx).or_default().push(dgram.clone());
+            }
+        }
+        inner.order.push_back(frame_id);
+    }
+
+    pub fn retransmit(&self, frame_id: u64, slice_idx: u8, received_mask: u64) -> Vec<Bytes> {
+        let inner = self.inner.read().unwrap(); // Параллельный доступ для чтения
+        let mut out = Vec::new();
+        
+        let Some(slices) = inner.data.get(&frame_id) else { return out; };
+        let Some(shards) = slices.get(&slice_idx) else { return out; };
+
+        for dgram in shards {
+            if dgram.len() < DatagramChunk::HEADER_LEN { continue; }
+            let shard_idx = dgram[10]; 
+            if (received_mask >> shard_idx) & 1 == 0 {
+                out.push(dgram.clone());
+            }
+        }
+        out
     }
 }

@@ -219,7 +219,7 @@ fn run_encoder_loop(
         .expect("avcodec_open2 failed");
 
     unsafe {
-        (*encoder.as_mut_ptr()).gop_size = 120;
+        (*encoder.as_mut_ptr()).gop_size = 300;
     }
 
     // ── SwsScale для CPU-пути (BGRA → NV12) ─────────────────────────────────

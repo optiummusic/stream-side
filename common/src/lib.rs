@@ -164,6 +164,13 @@ pub enum ControlPacket {
     OffsetUpdate { offset_us: i64, rtt_us: u64 },
     FrameFeedback { frame_id: u64, trace: FrameTrace },
     Communication {message: String },
+    Nack {
+        frame_id:      u64,
+        slice_idx:     u8,
+        /// Bitmask: bit `i` is set when shard `i` has been received.
+        /// The sender retransmits shards whose bits are *clear*.
+        received_mask: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

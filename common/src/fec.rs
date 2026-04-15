@@ -1,17 +1,19 @@
 /// /common/src/fec.rs
 /// SOLOMON DATA SHARD ENCODING FOR MITIGATING PACKET LOSS
 
-
 use std::collections::HashMap;
+use std::cell::RefCell;
 use reed_solomon_erasure::galois_8::ReedSolomon;
-// Предполагаю, что DatagramChunk и VideoPacket живут в common
-use crate::{DatagramChunk, FrameTrace, TYPE_VIDEO, VideoPacket};
+
+use crate::{ControlPacket, DatagramChunk, FrameTrace, TYPE_VIDEO, VideoPacket};
 
 const MAX_BUFFERED_FRAMES: u64 = 8;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs (100 ms).
 const STALE_FRAME_US: u64 = 100_000;
 
-use std::cell::RefCell;
+/// A NACK will not be re-sent for the same (frame_id, slice_idx) more often
+/// than this interval (in µs). Set to ~one typical RTT on a LAN.
+const NACK_SUPPRESS_US: u64 = 10_000; // 10 ms
 
 thread_local! {
     static RS_CACHE: RefCell<HashMap<(u8, u8), ReedSolomon>> = RefCell::new(HashMap::new());
@@ -30,17 +32,23 @@ impl FecEncoder {
         max_chunk_data: usize,
         flags: u8,
     ) -> Vec<DatagramChunk> {
-
+        if data.is_empty() || max_chunk_data == 0 {
+            return Vec::new(); 
+        }
         let is_critical = (flags & 2) != 0;
         let is_first_slice = slice_idx == 0;
         
         let k = ((data.len() + max_chunk_data - 1) / max_chunk_data).max(1) as u8;
 
         // Adaptive parity shards
-        let m_raw = if is_critical || is_first_slice { k as usize } else { k as usize / 2 + 1 };
+        let mut m_raw = if is_critical || is_first_slice { k as usize } else { k as usize / 2 + 1 };
+        if (k as usize + m_raw) > 255 {
+            m_raw = 255 - k as usize;
+        }
         let m = m_raw.min(4) as u8;
 
         let shard_size = (data.len() + (k as usize) - 1) / (k as usize);
+        let shard_size = shard_size.max(1);
         
         // Padding
         let mut shards: Vec<Vec<u8>> = data
@@ -56,6 +64,7 @@ impl FecEncoder {
         for _ in 0..m {
             shards.push(vec![0u8; shard_size]);
         }
+        
         RS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             let rs = cache
@@ -95,36 +104,133 @@ impl FecEncoder {
 
 pub struct FrameAssembler {
     frames: HashMap<u64, FrameBuilder>,
+    /// Tracks the last time a NACK was emitted for a (frame_id, slice_idx)
+    /// pair so we don't flood the sender. Entries are pruned alongside frames.
+    nack_sent_at: HashMap<(u64, u8), u64>,
+    /// Tracks the highest frame ID that was evicted to prevent NACKing old frames
+    last_evicted_id: Option<u64>,
 }
 
 impl FrameAssembler {
     pub fn new() -> Self {
         Self {
             frames: HashMap::new(),
+            nack_sent_at: HashMap::new(),
+            last_evicted_id: None,
         }
     }
 
-    /// Добавляет чанк. Если кадр полностью собран, возвращает VideoPacket.
-    pub fn insert(&mut self, chunk: &DatagramChunk) -> Option<VideoPacket> {
+    /// Insert a chunk and attempt reassembly.
+    ///
+    /// Returns a tuple of:
+    /// - `Option<VideoPacket>` — a fully assembled frame, if one just completed.
+    /// - `Option<ControlPacket>` — a NACK request, if the assembler detects a
+    ///   slice that is stalled and not yet recoverable via FEC.
+    pub fn insert(&mut self, chunk: &DatagramChunk) -> (Option<VideoPacket>, Option<ControlPacket>) {
         let frame_id = chunk.frame_id;
         let now_us   = FrameTrace::now_us();
  
-        // ── Evict stale / old frames on every insert ──────────────────────────
-        // Two eviction criteria:
-        //   1. Frame ID too far behind the current one (sliding window).
-        //   2. Frame has been sitting unfinished for > STALE_FRAME_US.
-        // Running on every insert keeps memory bounded without relying on a
-        // modulo trick that can miss cleanup if frame IDs are non-contiguous.
+        // ── Evict stale / old frames and their NACK timestamps ────────────────
         let min_frame_id = frame_id.saturating_sub(MAX_BUFFERED_FRAMES);
+        let mut max_evicted = self.last_evicted_id;
+        
         self.frames.retain(|&id, builder| {
-            id >= min_frame_id && now_us.saturating_sub(builder.first_us) < STALE_FRAME_US
+            let keep = id >= min_frame_id && now_us.saturating_sub(builder.first_us) < STALE_FRAME_US;
+            if !keep {
+                max_evicted = Some(max_evicted.map_or(id, |m| m.max(id)));
+            }
+            keep
         });
- 
+        
+        self.last_evicted_id = max_evicted;
+        
+        if let Some(evicted_cutoff) = max_evicted {
+            self.nack_sent_at.retain(|key, _| key.0 > evicted_cutoff);
+        }
+
+        // ── Check preceding frames for NACKable slices ────────────────────────
+        let nack = self.maybe_generate_nack(frame_id, now_us);
+
+        // ── Normal insertion ──────────────────────────────────────────────────
         let builder = self.frames.entry(frame_id).or_insert_with(|| {
             FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0)
         });
  
-        builder.insert_chunk(chunk)
+        let assembled = builder.insert_chunk(chunk);
+        (assembled, nack)
+    }
+
+    /// Look at frames behind the current one and return a NACK for the first
+    /// slice that is stalled (has shards but cannot yet be recovered).
+    fn maybe_generate_nack(&mut self, current_frame_id: u64, now_us: u64) -> Option<ControlPacket> {
+        let min_allowed = match self.last_evicted_id {
+            Some(id) => id + 1,
+            None => 0,
+        };
+        
+        // Scan all frames in the active window prior to the current arrival
+        let min_id = current_frame_id.saturating_sub(MAX_BUFFERED_FRAMES).max(min_allowed);
+        
+        for target_frame_id in min_id..current_frame_id {
+            let builder = match self.frames.get(&target_frame_id) {
+                Some(b) => b,
+                None => {
+                    // FIX 3: Frame is completely missing. NACK slice 0 to bootstrap.
+                    let key = (target_frame_id, 0);
+                    let last_sent = self.nack_sent_at.get(&key).copied().unwrap_or(0);
+                    if now_us.saturating_sub(last_sent) >= NACK_SUPPRESS_US {
+                        self.nack_sent_at.insert(key, now_us);
+                        return Some(ControlPacket::Nack {
+                            frame_id: target_frame_id,
+                            slice_idx: 0,
+                            received_mask: 0,
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            if builder.is_complete() {
+                continue;
+            }
+
+            // FIX 1: Iterate over total expected slices, not just existing map keys
+            for slice_idx in 0..builder.total_slices {
+                let (needs_nack, mask) = match builder.slices.get(&slice_idx) {
+                    Some(slice_builder) => {
+                        if slice_builder.is_ready() {
+                            (false, 0)
+                        } else {
+                            // Partially received slice needing repair
+                            (true, slice_builder.received_mask())
+                        }
+                    }
+                    None => {
+                        // FIX 1/3: Slice is completely missing
+                        (true, 0)
+                    }
+                };
+
+                if needs_nack {
+                    let key = (target_frame_id, slice_idx);
+                    let last_sent = self.nack_sent_at.get(&key).copied().unwrap_or(0);
+                    if now_us.saturating_sub(last_sent) >= NACK_SUPPRESS_US {
+                        self.nack_sent_at.insert(key, now_us);
+                        log::debug!(
+                            "[NACK] frame={} slice={} received_mask={:#066b}",
+                            target_frame_id, slice_idx, mask
+                        );
+                        return Some(ControlPacket::Nack {
+                            frame_id: target_frame_id,
+                            slice_idx,
+                            received_mask: mask,
+                        });
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -147,6 +253,11 @@ impl FrameBuilder {
         }
     }
 
+    fn is_complete(&self) -> bool {
+        self.slices.len() as u8 == self.total_slices
+            && self.slices.values().all(|s| s.is_ready())
+    }
+
     fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Option<VideoPacket> {
         let slice_idx = chunk.slice_idx;
         
@@ -157,8 +268,7 @@ impl FrameBuilder {
         slice_builder.insert(chunk);
 
         // Проверяем, готовы ли ВСЕ слайсы этого кадра
-        if self.slices.len() as u8 == self.total_slices && 
-           self.slices.values().all(|s| s.is_ready()) {
+        if self.is_complete() {
             self.assemble(chunk.frame_id)
         } else {
             None
@@ -175,8 +285,6 @@ impl FrameBuilder {
             let recovered_bytes = slice_builder.reconstruct()?;
 
             // --- THE KEY STEP: DESERIALIZE THE WRAPPER ---
-            // We use take_from_bytes because Reed-Solomon might leave padding zeros 
-            // at the end of the buffer, which Postcard's strict mode would reject.
             let (video_slice, _remainder): (crate::VideoSlice, _) = 
                 match postcard::take_from_bytes(&recovered_bytes) {
                     Ok(res) => res,
@@ -189,7 +297,6 @@ impl FrameBuilder {
             // If this is the first slice, it contains our timing trace
             if i == 0 {
                 final_trace = video_slice.trace;
-                // Update the trace with receiver-side timing
                 if let Some(ref mut t) = final_trace {
                     t.receive_us = self.first_us;
                     t.reassembled_us = FrameTrace::now_us();
@@ -246,10 +353,18 @@ impl SliceBuilder {
         }
     }
 
-    /// Returns `true` once we have received ≥ k shards (data or parity) so
-    /// that Reed-Solomon can reconstruct any missing data shards.
     fn is_ready(&self) -> bool {
         self.received >= self.k
+    }
+
+    fn received_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for (i, shard) in self.shards.iter().enumerate() {
+            if shard.is_some() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
     }
 
     fn reconstruct(&mut self) -> Option<Vec<u8>> {
@@ -267,7 +382,6 @@ impl SliceBuilder {
             rs.reconstruct(&mut self.shards).ok()?;
         }
  
-        // FIX: Calculate real size considering restored parity padding
         let mut total_size = 0;
         for i in 0..(self.k as usize) {
             if self.payload_lens[i] > 0 {

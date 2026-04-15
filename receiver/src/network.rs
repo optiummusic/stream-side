@@ -128,7 +128,11 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
         // Основной цикл приёма датаграмм.
         // Когда он завершается — считаем соединение потерянным.
-        let (idr_needed_tx, _idr_needed_rx) = watch::channel(false);
+        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
+        task_handles.push(spawn_idr_solicitor(
+            control_tx.clone(), 
+            idr_needed_rx
+        ));
         receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx).await;
 
         // Останавливаем все фоновые задачи этого соединения.
@@ -180,20 +184,45 @@ fn spawn_control_writer_task(
     mut control_rx: mpsc::Receiver<ControlPacket>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Открываем unidirectional stream для управления
+        // В идеале: открываем один раз или на каждый важный пакет.
+        // Для простоты и надежности при 1% потерь — открываем один поток
+        // и пишем в него последовательно.
+        
+        let mut control_stream: Option<quinn::SendStream> = None;
+
         while let Some(packet) = control_rx.recv().await {
+            let is_nack = matches!(packet, ControlPacket::Nack { .. });
+            
             if let Ok(bytes) = postcard::to_stdvec(&packet) {
-                // Шлем как датаграмму, чтобы не зависеть от Window Updates
-                let dgram = DatagramChunk::encode(
-                    0, 0, 1, 0, 1, 0, 
-                    bytes.len() as u16, 
-                    TYPE_CONTROL, 
-                    0, 
-                    &bytes
-                );
-                
-                if let Err(e) = conn.send_datagram(dgram) {
-                    log::warn!("[QUIC] Failed to send control dgram: {e}");
-                    // Не выходим из цикла! Просто идем дальше.
+                if is_nack {
+                    // --- ОТПРАВКА ЧЕРЕЗ STREAM (Надежно) ---
+                    if control_stream.is_none() {
+                        match conn.open_uni().await {
+                            Ok(s) => control_stream = Some(s),
+                            Err(e) => {
+                                log::error!("[QUIC] Failed to open control stream: {e}");
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut s) = control_stream {
+                        // Пишем длину + данные (postcard не самоописывающийся в потоке)
+                        let len = (bytes.len() as u32).to_le_bytes();
+                        if s.write_all(&len).await.is_err() || s.write_all(&bytes).await.is_err() {
+                            log::warn!("[QUIC] Control stream broken, resetting...");
+                            control_stream = None; 
+                        }
+                    }
+                } else {
+                    // --- ОТПРАВКА ЧЕРЕЗ DATAGRAM (Быстро/Ненадежно: Пинги, фидбек) ---
+                    let dgram = DatagramChunk::encode(
+                         0, 0, 1, 0, 1, 0, 
+                        bytes.len() as u16, 
+                        TYPE_CONTROL, 0, &bytes
+                    );
+                    let _ = conn.send_datagram(dgram);
                 }
             }
         }
@@ -253,6 +282,46 @@ fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
             };
 
             tokio::time::sleep(delay).await;
+        }
+    })
+}
+
+fn spawn_idr_solicitor(
+    control_tx: mpsc::Sender<ControlPacket>,
+    mut idr_needed_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Настраиваем интервал один раз
+        let mut interval = tokio::time::interval(Duration::from_millis(750));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            // Ждем, пока значение станет true
+            if !*idr_needed_rx.borrow_and_update() {
+                if idr_needed_rx.changed().await.is_err() { break; }
+                if !*idr_needed_rx.borrow() { continue; }
+            }
+
+            // Как только стало true — начинаем цикл запросов
+            log::warn!("[Video] Loss detected, starting IDR solicitation loop...");
+            
+            while *idr_needed_rx.borrow() {
+                if control_tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
+                    return; // Канал закрыт, выходим совсем
+                }
+
+                tokio::select! {
+                    _ = interval.tick() => {}, 
+                    // Если за время ожидания тика статус сменился на false — выходим из while
+                    res = idr_needed_rx.changed() => {
+                        if res.is_err() { return; }
+                    }
+                }
+            }
+            
+            log::info!("[Video] IDR satisfied, solicitor going to sleep.");
+            // Сбрасываем интервал, чтобы следующий цикл начался с чистого листа (без мгновенного тика)
+            interval.reset(); 
         }
     })
 }
@@ -342,7 +411,7 @@ fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
 
                         _ => Ok(()),
                     };
-                    
+
                     #[cfg(not(target_os = "android"))]
                     if res.is_ok() {
                         if let Some(p) = &proxy {
@@ -395,7 +464,6 @@ async fn receive_datagrams<B: VideoBackend>(
     control_tx: mpsc::Sender<ControlPacket>,
     idr_needed_tx: watch::Sender<bool>,
 ) {
-    let idr_needed_rx = idr_needed_tx.subscribe();
     let mut video_state = VideoState {
         waiting_for_key: true,
         expected_frame_id: None,
@@ -419,7 +487,7 @@ async fn receive_datagrams<B: VideoBackend>(
         
         tokio::select! {
             // ── 1. Incoming datagram ─────────────────────────────────────────
-                        // ── 2. Jitter-buffer drain timer ─────────────────────────────────
+            // ── 2. Jitter-buffer drain timer ─────────────────────────────────
             // Fires when the earliest buffered frame has waited long enough.
             // All frames whose deadline has now passed are released at once.
             _ = &mut sleep => {
@@ -435,7 +503,6 @@ async fn receive_datagrams<B: VideoBackend>(
                         &backend,
                         &control_tx,
                         &idr_needed_tx,
-                        &idr_needed_rx,
                     ).await;
                 }
             }
@@ -457,7 +524,13 @@ async fn receive_datagrams<B: VideoBackend>(
                     TYPE_VIDEO => {
                         // Reassemble; if a frame completed, enqueue it in the
                         // jitter buffer instead of pushing to the backend directly.
-                        if let Some(packet) = assembler.insert(&chunk) {
+                        let (assembled, nack) = assembler.insert(&chunk);
+                        if let Some(nack_pkt) = nack {
+                            if let Err(e) = control_tx.try_send(nack_pkt) {
+                                log::debug!("[NACK] control_tx full, NACK dropped: {e}");
+                            }
+                        }
+                        if let Some(packet) = assembled {
                             jitter_buf.push(packet);
                         }
                     }
@@ -492,47 +565,28 @@ async fn receive_datagrams<B: VideoBackend>(
 /// The in-order / IDR-wait checks that were previously inside
 /// `handle_video_chunk` are now applied here, *after* the jitter buffer has
 /// had a chance to reorder out-of-order arrivals.
+/// 
 async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
     mut packet: VideoPacket,
     state:      &mut VideoState,
     backend:    &Arc<Mutex<B>>,
     control_tx: &mpsc::Sender<ControlPacket>,
     idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
-    idr_needed_rx: &watch::Receiver<bool>,
 ) {
     // ── In-order / IDR gate ───────────────────────────────────────────────
     if packet.is_key {
-        state.waiting_for_key   = false;
+        state.waiting_for_key = false;
         state.expected_frame_id = Some(packet.frame_id);
         let _ = idr_needed_tx.send(false);
-    } else if state.waiting_for_key || Some(packet.frame_id) != state.expected_frame_id {
-        if state.waiting_for_key {
-            return; 
-        }
+    } 
+
+    // Если мы уже ждем ключ — просто игнорируем любые дельта-кадры
+    if state.waiting_for_key {
+        return;
+    }
+    if Some(packet.frame_id) != state.expected_frame_id {
         state.waiting_for_key = true;
         let _ = idr_needed_tx.send(true);
-        log::warn!("Frame lost! Expected {:?}, got {}. Spawning IDR solicitor.", state.expected_frame_id, packet.frame_id);
-
-        let tx = control_tx.clone();
-        let mut rx = idr_needed_rx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            // Loop as long as the watch value is 'true'
-            while *rx.borrow() {
-                if tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
-                    break;
-                }
-
-                tokio::select! {
-                    _ = interval.tick() => {},
-                    // Wake up immediately if the value changes to false
-                    _ = rx.changed() => {
-                        if !*rx.borrow() { break; }
-                    }
-                }
-            }
-            log::info!("[Video] IDR solicitor task satisfied and exiting.");
-        });
         return;
     }
  

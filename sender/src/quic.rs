@@ -36,7 +36,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket, VideoSlice};
-use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame};
+use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame, ShardCache};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,35 +63,13 @@ impl QuicServer {
         // watch is not used here because we need `is_key` alongside the data.
         let (bcast_tx, _) = broadcast::channel::<Arc<SerializedFrame>>(64);
         let server_bcast  = bcast_tx.clone();
-
+        let shard_cache = Arc::new(ShardCache::new());
         // ── Serialiser task ──────────────────────────────────────────────────
         // Converts raw NAL slices into `VideoPacket`, serialises with postcard
         // once, and broadcasts the resulting `Arc<Bytes>` to all client tasks.
-
+        let sc_task = shard_cache.clone();
         tokio::spawn(async move {
-            run_serialiser_task(frame_rx, server_bcast).await;
-            // let mut frame_id = 0u64;
-
-            // while let Some(mut frame ) = frame_rx.recv().await {
-            //     frame_id += 1;
-            //     frame.frame_id = frame_id;
-
-            //     if let Some(t) = frame.trace.as_mut() {
-            //         t.serialize_us = FrameTrace::now_us(); 
-            //     }
-            //     let shared_frame = Arc::new(frame);
-
-            //     // log::info!(
-            //     //     "[SEND RAW] id={} size={} key={}",
-            //     //     packet.frame_id,
-            //     //     packet.payload.len(),
-            //     //     packet.is_key
-            //     // );
-
-            //     if let Err(_) = server_bcast.send(shared_frame) {
-            //         // Если нет активных подписчиков, broadcast вернет ошибку, это нормально
-            //     }
-            // }
+            run_serialiser_task(frame_rx, server_bcast, sc_task).await;
         });
 
         // ── Accept loop ──────────────────────────────────────────────────────
@@ -101,6 +79,7 @@ impl QuicServer {
             while let Some(connecting) = endpoint.accept().await {
                 let client_rx = bcast_tx.subscribe();
                 let idr_tx_init = idr_tx_clone.clone();
+                let sc_client = shard_cache.clone();
                 tokio::spawn(async move {
                     match connecting.await {
                         Ok(conn) => {
@@ -124,6 +103,7 @@ impl QuicServer {
                             //BI STREAM ACCEPT
                             let conn_bi = conn.clone();
                             let conn_uni = conn.clone();
+                            let conn_arg = conn.clone();
                             tokio::spawn(async move {
                                 loop {
                                     match conn_bi.accept_bi().await {
@@ -151,8 +131,10 @@ impl QuicServer {
                                             let idr_tx_uni = idr_tx_conn.clone();
                                             let info_for_task = info_uni.clone();
                                             let clock_offset_task = clock_offset.clone();
+                                            let shard_cache = sc_client.clone();
+                                            let conn = conn_arg.clone();
                                             tokio::spawn(async move {
-                                                if let Err(e) = handle_uni_stream(recv, info_for_task, clock_offset_task, idr_tx_uni).await {
+                                                if let Err(e) = handle_uni_stream(conn, recv, info_for_task, clock_offset_task, idr_tx_uni, shard_cache).await {
                                                     log::warn!("bi stream error: {e}");
                                                 }
                                             });
@@ -164,7 +146,7 @@ impl QuicServer {
                                     }
                                 }
                             });
-                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main, ird_tx_loop).await;
+                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main, ird_tx_loop, ).await;
                         }
                         Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
                     }
@@ -206,6 +188,7 @@ impl QuicServer {
 async fn run_serialiser_task(
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
     broadcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
+    shard_cache: Arc<ShardCache>,
 ) {
     let mut frame_id = 0u64;
     
@@ -241,6 +224,8 @@ async fn run_serialiser_task(
                 total_slices,
                 is_key: frame.is_key,
                 payload: slice_data.to_vec(),
+
+                // We embed our trace in the first slice
                 trace: if s_idx == 0 { frame.trace.clone() } else { None },
             };
 
@@ -269,7 +254,7 @@ async fn run_serialiser_task(
             is_key: frame.is_key,
             datagrams,
         });
-
+        shard_cache.insert(shared_frame.frame_id, &shared_frame.datagrams);
         if let Err(_) = broadcast_tx.send(shared_frame) {
             // No active subscribers, safely ignore.
         }
@@ -287,11 +272,8 @@ async fn send_loop_to_client(
     let mut requested_initial_idr = false;
     let remote = conn.remote_address();
     
-    // Заранее считаем лимиты
-    let max_dgram = conn.max_datagram_size().unwrap_or(1200);
-    let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
-
     let mut pacer = FramePacer::new(100.0, 4.0);
+    
     loop {
         tokio::select! {
             // 1. ОТПРАВКА ВИДЕО
@@ -318,10 +300,11 @@ async fn send_loop_to_client(
 
                         // Just pace and send the pre-computed bytes. Zero-copy.
                         for dgram in &serialized_frame.datagrams {
-                            let wait = pacer.consume(DatagramChunk::HEADER_LEN + dgram.len());
-                            if !wait.is_zero() {
-                                tokio::time::sleep(wait).await;
-                            }
+                            // As of now commented out because wait inside tokio produces blocking.
+                            // let wait = pacer.consume(DatagramChunk::HEADER_LEN + dgram.len());
+                            // if !wait.is_zero() {
+                            //     tokio::time::sleep(wait).await;
+                            // }
 
                             // .clone() on Bytes is extremely cheap (atomic ref-count bump)
                             if conn.send_datagram(dgram.clone()).is_err() {
@@ -416,10 +399,12 @@ async fn handle_bi_stream(
 }
 
 async fn handle_uni_stream(
+    conn: quinn::Connection,
     mut recv: quinn::RecvStream,
     info: Arc<ConnectionInfo>,
     clock_offset: Arc<AtomicI64>,
     idr_tx: watch::Sender<bool>,
+    shard_cache: Arc<ShardCache>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut len_buf = [0u8; 4];
@@ -475,6 +460,39 @@ async fn handle_uni_stream(
                 log::info!("[QUIC] Client {label} requested KeyFrame!");
                 let _ = idr_tx.send(true);
                 let _ = idr_tx.send(false);
+            }
+            ControlPacket::Nack { frame_id, slice_idx, received_mask } => {
+                let label = info.label().await;
+                log::info!(
+                    "[NACK] {label} requested retransmit frame={frame_id} slice={slice_idx} \
+                    received={received_mask:#066b}"
+                );
+    
+                let retransmit = shard_cache.retransmit(frame_id, slice_idx, received_mask);
+                let count = retransmit.len();
+    
+                for dgram in retransmit {
+                    // Retransmitted shards go out immediately — no pacer —
+                    // because they are already late by definition.
+                    if let Err(e) = conn.send_datagram(dgram) {
+                        log::warn!("[NACK] retransmit send failed for {label}: {e}");
+                        break;
+                    }
+                }
+    
+                if count > 0 {
+                    log::debug!("[NACK] retransmitted {count} shard(s) for frame={frame_id} slice={slice_idx} to {label}");
+                } else {
+                    // Cache miss — the frame is too old or was never in cache.
+                    // Fall back to requesting a keyframe so the receiver can
+                    // resync without stalling indefinitely.
+                    log::warn!(
+                        "[NACK] frame={frame_id} slice={slice_idx} not in cache for {label}; \
+                        requesting IDR"
+                    );
+                    let _ = idr_tx.send(true);
+                    let _ = idr_tx.send(false);
+                }
             }
         _ => {}
         }
