@@ -35,8 +35,8 @@ use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
-use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame};
+use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket, VideoSlice};
+use crate::{ClientIdentity, ConnectionInfo, FramePacer};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,17 +288,50 @@ async fn send_loop_to_client(
                             started = true;
                             requested_initial_idr = false;
                         }
-                        
-                        // Просто выплевываем заранее заготовленные чанки в сокет!
-                        for chunk_data in sf.chunks.iter() {
-                            let wait = pacer.consume(DatagramChunk::HEADER_LEN + chunk_data.len());
-                            if !wait.is_zero() {
-                                tokio::time::sleep(wait).await;
-                            }
+                        let total_slices = frame.slices.len() as u8;
+                        if total_slices == 0 {
+                            continue;
+                        }
+                        // Теперь итерируемся по реальным слайсам из энкодера
+                        for (s_idx, (slice_data, is_critical)) in frame.slices.iter().enumerate() {
+                            // 1. Calculate flags including the new critical bit
+                            let mut flags = if frame.is_key { 1 } else { 0 };
+                            if *is_critical { flags |= 2; }
 
-                            if conn.send_datagram(chunk_data.clone()).is_err() {
-                                log::error!("[QUIC] Failed to send datagram to {remote}");
-                                return; 
+                            // 2. Wrap the payload in the new VideoSlice struct
+                            let slice = VideoSlice {
+                                frame_id: frame.frame_id,
+                                slice_idx: s_idx as u8,
+                                total_slices,
+                                is_key: frame.is_key,
+                                payload: slice_data.to_vec(),
+                                trace: if s_idx == 0 { frame.trace.clone() } else { None },
+                            };
+
+                            // 3. Serialize using postcard
+                            let serialized = postcard::to_allocvec(&slice).unwrap_or_default();
+
+                            // 4. Pass the SERIALIZED data to the FEC encoder, not the raw slice
+                            let chunks = common::fec::FecEncoder::encode_slice(
+                                frame.frame_id,
+                                s_idx as u8,
+                                total_slices,
+                                &serialized, 
+                                max_chunk_data,
+                                flags
+                            );
+
+                            for chunk in chunks {
+                                let wait = pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len());
+                                if !wait.is_zero() {
+                                    tokio::time::sleep(wait).await;
+                                }
+
+                                let dgram = chunk.to_bytes();
+                                if conn.send_datagram(dgram.into()).is_err() {
+                                    log::error!("[QUIC] Failed to send datagram to {}", remote);
+                                    return; 
+                                }
                             }
                         }
                     }

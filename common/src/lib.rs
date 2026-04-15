@@ -46,6 +46,15 @@ pub struct VideoPacket {
     pub trace:     Option<FrameTrace>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VideoSlice {
+    pub frame_id:     u64,
+    pub slice_idx:    u8,
+    pub total_slices: u8,
+    pub is_key:       bool,
+    pub payload:      Vec<u8>,
+    pub trace:        Option<FrameTrace>,
+}
 /// One QUIC-datagram fragment of a serialised `VideoPacket`.
 ///
 /// # Wire format (fixed binary, NOT postcard)

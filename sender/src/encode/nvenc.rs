@@ -384,16 +384,30 @@ fn run_encoder_loop(
                                 &boundaries[..]
                             };
 
-                            let mut slices: Vec<Bytes> = Vec::with_capacity(effective.len().max(1));
+                            let mut slices: Vec<(Bytes, bool)> = Vec::with_capacity(effective.len().max(1));
                             let ends = effective.iter().skip(1).copied().chain(std::iter::once(data.len()));
                             for (&start, end) in effective.iter().zip(ends) {
-                                slices.push(full_data.slice(start..end));
+                                let slice_data = full_data.slice(start..end);
+                                
+                                // Вычисляем длину start code (3 или 4 байта)
+                                let sc_len = if slice_data.len() > 2 && slice_data[2] == 1 { 3 } else { 4 };
+                                
+                                let mut is_critical = false;
+                                if slice_data.len() > sc_len {
+                                    let nal_header = slice_data[sc_len];
+                                    // Формула для HEVC (H.265): сдвигаем на 1 бит вправо и берем 6 бит
+                                    let nal_type = (nal_header >> 1) & 0x3F; 
+                                    
+                                    is_critical = matches!(nal_type, 32..=34 | 16..=21); // VPS, SPS, PPS, IDR, CRA
+                                }
+                                
+                                slices.push((slice_data, is_critical));
                             }
  
                             // Fallback: if no start codes were found, treat the whole packet
                             // as a single NALU (e.g. raw bytestream without Annex-B prefix).
                             if slices.is_empty() && !data.is_empty() {
-                                slices.push(full_data.clone());
+                                slices.push((full_data.clone(), true));
                             }
                             match sink.try_send(EncodedFrame {
                                 frame_id: 0,

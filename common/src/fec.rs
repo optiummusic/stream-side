@@ -31,11 +31,14 @@ impl FecEncoder {
         flags: u8,
     ) -> Vec<DatagramChunk> {
 
-        // Calculale k+m
+        let is_critical = (flags & 2) != 0;
+        let is_first_slice = slice_idx == 0;
+        
         let k = ((data.len() + max_chunk_data - 1) / max_chunk_data).max(1) as u8;
 
         // Adaptive parity shards
-        let m = ((k as usize + 4) / 5).max(1) as u8;
+        let m_raw = if is_critical || is_first_slice { k as usize } else { k as usize / 2 + 1 };
+        let m = m_raw.min(4) as u8;
 
         let shard_size = (data.len() + (k as usize) - 1) / (k as usize);
         
@@ -203,6 +206,7 @@ impl FrameBuilder {
 struct SliceBuilder {
     shards: Vec<Option<Vec<u8>>>,
     payload_lens: Vec<u16>,
+    shard_data_size: usize,
     received: u8,
     k: u8,
     m: u8,
@@ -213,6 +217,7 @@ impl SliceBuilder {
         Self {
             shards: vec![None; (k + m) as usize],
             payload_lens: vec![0; k as usize],
+            shard_data_size: 0,
             received: 0,
             k,
             m,
@@ -222,6 +227,11 @@ impl SliceBuilder {
     fn insert(&mut self, chunk: &DatagramChunk) {
         let idx = chunk.shard_idx as usize;
         if idx < self.shards.len() && self.shards[idx].is_none() {
+            // Save reference shard size
+            if self.shard_data_size == 0 {
+                self.shard_data_size = chunk.data.len();
+            }
+
             self.shards[idx] = Some(chunk.data.to_vec());
             if idx < self.k as usize {
                 self.payload_lens[idx] = chunk.payload_len;
@@ -239,29 +249,40 @@ impl SliceBuilder {
     fn reconstruct(&mut self) -> Option<Vec<u8>> {
         if !self.is_ready() { return None; }
  
-        // Only invoke RS when at least one data shard is absent.
-        let has_missing_data = self.shards
-            .iter()
-            .take(self.k as usize)
-            .any(|s| s.is_none());
+        let has_missing_data = self.shards.iter().take(self.k as usize).any(|s| s.is_none());
  
         if has_missing_data {
             let rs = RS_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
                 cache.entry((self.k, self.m))
                     .or_insert_with(|| ReedSolomon::new(self.k as usize, self.m as usize).unwrap())
-                    .clone() // Arc-backed; cheap clone
+                    .clone()
             });
             rs.reconstruct(&mut self.shards).ok()?;
         }
  
-        let total_size: usize = self.payload_lens.iter().map(|&l| l as usize).sum();
+        // FIX: Calculate real size considering restored parity padding
+        let mut total_size = 0;
+        for i in 0..(self.k as usize) {
+            if self.payload_lens[i] > 0 {
+                total_size += self.payload_lens[i] as usize;
+            } else {
+                total_size += self.shard_data_size;
+            }
+        }
+
         let mut nalu_data = Vec::with_capacity(total_size);
  
         for i in 0..(self.k as usize) {
-            let shard    = self.shards[i].as_ref()?;
-            let real_len = self.payload_lens[i] as usize;
-            nalu_data.extend_from_slice(&shard[..real_len]);
+            let shard = self.shards[i].as_ref()?;
+            let real_len = if self.payload_lens[i] > 0 {
+                self.payload_lens[i] as usize
+            } else {
+                self.shard_data_size
+            };
+            
+            let limit = real_len.min(shard.len());
+            nalu_data.extend_from_slice(&shard[..limit]);
         }
  
         Some(nalu_data)

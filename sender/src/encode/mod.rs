@@ -19,7 +19,7 @@ use pipewire::sys as pw_sys;
 
 pub struct EncodedFrame {
     pub frame_id: u64,
-    pub slices: Vec<Bytes>,
+    pub slices: Vec<(Bytes, bool)>,
     pub is_key:  bool,
     pub trace:   Option<FrameTrace>,
 }
