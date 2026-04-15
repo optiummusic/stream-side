@@ -32,6 +32,7 @@ use std::{
     time::Duration,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{sync::watch, task::JoinHandle, time::{self, Instant}};
 use tokio::sync::mpsc;
 use bytes::Bytes;
@@ -629,7 +630,23 @@ fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
 
     client_cfg.transport_config(Arc::new(t));
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    // FIX KERNEL UDP SOCKET CONGESTION
+    // RUN sudo sysctl -w net.core.rmem_max=16777216 and sudo sysctl -w net.core.rmem_max=16777216
+    let addr: SocketAddr = "0.0.0.0:0".parse()?;
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_recv_buffer_size(16 * 1024 * 1024)?; // rmem
+    socket.set_send_buffer_size(8 * 1024 * 1024)?; // wmem
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        std_socket,
+        Arc::new(quinn::TokioRuntime), // Если используешь tokio
+    )?;
     endpoint.set_default_client_config(client_cfg);
     Ok(endpoint)
 }

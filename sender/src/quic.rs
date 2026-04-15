@@ -33,6 +33,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::Bytes;
 use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
 use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame};
@@ -584,8 +585,24 @@ fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
             .expect("idle timeout"),
     ));
 
+    // FIX SOCKET CONGESTION
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .expect("Failed to create socket");
+    socket.set_send_buffer_size(16 * 1024 * 1024).ok(); 
+    socket.set_recv_buffer_size(2 * 1024 * 1024).ok();
+    
+    socket.set_reuse_address(true).ok();
+    socket.bind(&addr.into()).expect("Failed to bind server socket");
+
+    let std_socket: std::net::UdpSocket = socket.into();
+
     server_cfg.transport_config(Arc::new(t));
 
-    let end = Endpoint::server(server_cfg, addr).expect("QUIC endpoint bind failed");
-    end
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg),
+        std_socket,
+        Arc::new(quinn::TokioRuntime),
+    ).expect("QUIC endpoint bind failed")
 }
