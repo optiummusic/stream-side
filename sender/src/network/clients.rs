@@ -1,3 +1,5 @@
+use common::NaluType;
+
 use super::*;
 
 pub(crate) async fn send_loop_to_client(
@@ -11,7 +13,7 @@ pub(crate) async fn send_loop_to_client(
     let mut requested_initial_idr = false;
     let remote = conn.remote_address();
     
-    let mut pacer = FramePacer::new(100.0, 4.0);
+    let _pacer = FramePacer::new(100.0, 4.0);
     
     loop {
         tokio::select! {
@@ -82,9 +84,91 @@ pub(crate) async fn send_loop_to_client(
             }
         }
         
-            
             // 3. (В БУДУЩЕМ) ОТПРАВКА АУДИО
             // Ok(audio_msg) = audio_rx.recv() => { ... }
         
+    }
+}
+
+pub(crate) async fn run_serialiser_task(
+    mut slice_rx: mpsc::Receiver<EncodedFrame>,
+    broadcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
+    shard_cache: Arc<ShardCache>,
+) {
+    let mut current_frame_id = 0u64;
+    let mut is_new_frame = true;
+    
+    // Calculate a safe max chunk size for the broadcast.
+    // Quinn's initial_mtu is 1200, so we use that as our baseline constraint.
+    let max_dgram = 1200;
+    let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 8;
+
+    while let Some(mut slice) = slice_rx.recv().await {
+        // 1. Управление ID кадра: инкрементим, только когда пришел первый слайс нового кадра
+        if is_new_frame {
+            current_frame_id += 1;
+            is_new_frame = false;
+        }
+        slice.frame_id = current_frame_id;
+
+        if let Some(t) = slice.trace.as_mut() {
+            t.serialize_us = FrameTrace::now_us(); 
+        }
+
+        // 2. Подготовка флагов для FEC
+        // Используем nalu_type для определения критичности
+        let mut flags = if slice.is_key { 1 } else { 0 };
+        let nalu_type = slice.nalu_type;
+        let is_critical = matches!(
+            nalu_type, 
+            NaluType::VideoParamSet | NaluType::SeqParamSet | NaluType::PicParamSet | NaluType::SliceIdr
+        );
+        if is_critical { flags |= 2; }
+        let idx = slice.slice_idx;
+        let total = slice.total_slices;
+        // 3. Оборачиваем один NALU в VideoSlice
+        let video_slice = VideoSlice {
+            frame_id: slice.frame_id,
+            slice_idx: idx,
+            total_slices: total,
+            is_key: slice.is_key,
+            is_last: slice.is_last,
+            payload: slice.data.to_vec(),
+            trace: slice.trace,
+            nal_type: nalu_type,
+        };
+
+        // 4. Сериализация и FEC
+        let serialized = postcard::to_allocvec(&video_slice).unwrap_or_default();
+
+        let chunks = common::fec::encode::FecEncoder::encode(
+            slice.frame_id,
+            idx,
+            total,
+            &serialized, 
+            max_chunk_data,
+            flags
+        );
+        let mut datagrams = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            datagrams.push(chunk.to_bytes());
+        }
+
+        // 5. Broadcast: отправляем СЛАЙС немедленно
+        let shared_part = Arc::new(SerializedFrame {
+            frame_id: slice.frame_id,
+            is_key: slice.is_key,
+            datagrams,
+        });
+
+        // Кэшируем (важно: здесь кэш будет пополняться частями)
+        shard_cache.insert(shared_part.frame_id, &shared_part.datagrams);
+        
+        let _ = broadcast_tx.send(shared_part);
+
+        // 6. Если это был последний слайс в пакете от энкодера — следующий будет новым кадром
+        if slice.is_last {
+            is_new_frame = true;
+        }
     }
 }

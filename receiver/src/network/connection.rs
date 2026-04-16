@@ -1,8 +1,11 @@
+use common::fec::assembler::FrameAssembler;
+
 use super::*;
 
 pub(crate) struct VideoState {
     pub waiting_for_key: bool,
     pub expected_frame_id: Option<u64>,
+    pub expected_slice_idx: u8,
 }
 
 pub(crate) async fn connect_quic(
@@ -23,6 +26,7 @@ pub(crate) async fn receive_datagrams<B: VideoBackend>(
     let mut video_state = VideoState {
         waiting_for_key: true,
         expected_frame_id: None,
+        expected_slice_idx: 0
     };
     let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
     let mut assembler = FrameAssembler::new();
@@ -77,7 +81,7 @@ pub(crate) async fn receive_datagrams<B: VideoBackend>(
                 };
  
                 match chunk.packet_type {
-                    TYPE_VIDEO => {
+                    TYPE_VIDEO => { // WE RECEIVE VIDEOSLICE TYPE HERE
                         // Reassemble; if a frame completed, enqueue it in the
                         // jitter buffer instead of pushing to the backend directly.
                         let (assembled, nack) = assembler.insert(&chunk);
@@ -123,6 +127,7 @@ pub(crate) async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
     if packet.is_key {
         state.waiting_for_key = false;
         state.expected_frame_id = Some(packet.frame_id);
+        state.expected_slice_idx = 0;
         let _ = idr_needed_tx.send(false);
     } 
 
@@ -135,8 +140,18 @@ pub(crate) async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
         let _ = idr_needed_tx.send(true);
         return;
     }
- 
-    state.expected_frame_id = Some(packet.frame_id + 1);
+    if packet.slice_idx != state.expected_slice_idx {
+        // пропустили slice → десинк
+        state.waiting_for_key = true;
+        let _ = idr_needed_tx.send(true);
+        return;
+    }
+    state.expected_slice_idx += 1;
+    
+    if packet.is_last {
+        state.expected_frame_id = Some(packet.frame_id + 1);
+        state.expected_slice_idx = 0;
+    }
  
     let frame_id    = packet.frame_id;
     let payload     = packet.payload;

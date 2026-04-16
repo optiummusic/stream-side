@@ -1,5 +1,4 @@
 mod endpoint;
-mod serializer;
 mod handlers;
 mod clients;
 mod connections;
@@ -16,7 +15,6 @@ pub(crate) use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFra
 pub(crate) use crate::encode::EncodedFrame;
 
 use endpoint::*;
-use serializer::*;
 use handlers::*;
 use clients::*;
 use connections::*;

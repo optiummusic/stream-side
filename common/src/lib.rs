@@ -42,18 +42,22 @@ impl FrameTrace {
 pub struct VideoPacket {
     pub frame_id:  u64,
     pub payload:   Vec<u8>,
+    pub slice_idx:    u8,
     pub is_key:    bool,
+    pub is_last:   bool,
     pub trace:     Option<FrameTrace>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VideoSlice {
     pub frame_id:     u64,
     pub slice_idx:    u8,
     pub total_slices: u8,
     pub is_key:       bool,
+    pub is_last:      bool,
     pub payload:      Vec<u8>,
     pub trace:        Option<FrameTrace>,
+    pub nal_type:     NaluType,
 }
 /// One QUIC-datagram fragment of a serialised `VideoPacket`.
 ///
@@ -222,4 +226,15 @@ pub fn detect_gpu_vendor() -> GpuVendor {
     }
 
     GpuVendor::Unknown
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub enum NaluType {
+    VideoParamSet,    // VPS (32)
+    SeqParamSet,      // SPS (33)
+    PicParamSet,      // PPS (34)
+    Sei,              // Supplemental Info (38-39)
+    SliceIdr,         // Ключевой кадр (19-20)
+    SliceTrailing,    // Обычный P-кадр (1)
+    Other(u8),        // Все остальное
 }

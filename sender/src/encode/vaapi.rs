@@ -36,9 +36,9 @@ use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use tokio::sync::mpsc as async_mpsc;
 
-use common::FrameTrace;
+use common::{FrameTrace, NaluType};
 
-use crate::encode::EncodedFrame;
+use crate::encode::{EncodedFrame};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Константы DRM fourcc / modifier
@@ -394,16 +394,10 @@ fn run_encoder_loop(
                     let mut pkt = ffmpeg::Packet::empty();
                     while encoder.receive_packet(&mut pkt).is_ok() {
                         let original_capture_us = pkt.pts().unwrap_or(0) as u64;
-
-                        let mut trace      = FrameTrace::default();
-                        trace.capture_us   = original_capture_us;
-                        trace.encode_us    = FrameTrace::now_us();
-
                         let is_key = pkt.is_key();
 
                         if !started {
                             if !is_key { 
-                                log::info!("[ENCODER] The frame is not a KeyFrame, continuing!");
                                 continue; 
                             }
                             started = true;
@@ -413,75 +407,78 @@ fn run_encoder_loop(
                         if let Some(data) = pkt.data() {
                             // ── NALU slicing ────────────────────────────────────
                             let full_data = Bytes::copy_from_slice(data);
-
-                            let mut boundaries: Vec<usize> = Vec::new();
-                            let mut pos = 0usize;
+                            
+                            // Поиск границ NALU
+                            let mut boundaries = Vec::new();
+                            let mut pos = 0;
                             while pos + 3 <= data.len() {
-                                if pos + 3 < data.len()
-                                    && data[pos]   == 0
-                                    && data[pos+1] == 0
-                                    && data[pos+2] == 0
-                                    && data[pos+3] == 1
-                                {
-                                    boundaries.push(pos);
-                                    pos += 4;
-                                } else if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 1 {
+                                if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 1 {
                                     boundaries.push(pos);
                                     pos += 3;
+                                } else if pos + 3 < data.len() && data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 0 && data[pos+3] == 1 {
+                                    boundaries.push(pos);
+                                    pos += 4;
                                 } else {
                                     pos += 1;
                                 }
                             }
-                            const MAX_SLICES: usize = u8::MAX as usize;
-                            let effective = if boundaries.len() > MAX_SLICES {
-                                log::warn!(
-                                    "[Encoder] frame has {} NALUs, clamping to {MAX_SLICES}",
-                                    boundaries.len()
-                                );
-                                &boundaries[..MAX_SLICES]
-                            } else {
-                                &boundaries[..]
-                            };
 
-                            let mut slices: Vec<(Bytes, bool)> = Vec::with_capacity(effective.len().max(1));
-                            let ends = effective.iter().skip(1).copied().chain(std::iter::once(data.len()));
-                            for (&start, end) in effective.iter().zip(ends) {
+                            if boundaries.is_empty() && !data.is_empty() {
+                                boundaries.push(0);
+                            }
+
+                            let num_nalus = boundaries.len();
+                            let ends = boundaries.iter().skip(1).copied().chain(std::iter::once(data.len()));
+                            for (idx, (&start, end)) in boundaries.iter().zip(ends).enumerate() {
                                 let slice_data = full_data.slice(start..end);
                                 
-                                // Вычисляем длину start code (3 или 4 байта)
+                                // Определяем тип NALU
                                 let sc_len = if slice_data.len() > 2 && slice_data[2] == 1 { 3 } else { 4 };
-                                
-                                let mut is_critical = false;
-                                if slice_data.len() > sc_len {
+                                let nalu_type = if slice_data.len() > sc_len {
                                     let nal_header = slice_data[sc_len];
-                                    // Формула для HEVC (H.265): сдвигаем на 1 бит вправо и берем 6 бит
-                                    let nal_type = (nal_header >> 1) & 0x3F; 
-                                    
-                                    is_critical = matches!(nal_type, 32..=34 | 16..=21); // VPS, SPS, PPS, IDR, CRA
-                                }
-                                
-                                slices.push((slice_data, is_critical));
-                            }
- 
-                            // Fallback: if no start codes were found, treat the whole packet
-                            // as a single NALU (e.g. raw bytestream without Annex-B prefix).
-                            if slices.is_empty() && !data.is_empty() {
-                                slices.push((full_data.clone(), true));
-                            }
-                            match sink.try_send(EncodedFrame {
-                                frame_id: 0,
-                                slices,
-                                is_key,
-                                trace: Some(trace),
-                            }) {
-                                Ok(_) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    log::debug!("[Encoder] sink full, dropping frame");
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    log::warn!("[Encoder] sink closed, shutting down");
-                                    av_frame_free(&mut hw_frame);
-                                    return;
+                                    let raw_type = (nal_header >> 1) & 0x3F;
+                                    match raw_type {
+                                        32 => NaluType::VideoParamSet,
+                                        33 => NaluType::SeqParamSet,
+                                        34 => NaluType::PicParamSet,
+                                        38 | 39 => NaluType::Sei,
+                                        19 | 20 => NaluType::SliceIdr,
+                                        1 => NaluType::SliceTrailing,
+                                        other => NaluType::Other(other),
+                                    }
+                                } else {
+                                    NaluType::Other(0)
+                                };
+
+                                // Трейс цепляем только к ПЕРВОМУ NALU кадра
+                                let trace = if idx == 0 {
+                                    let mut t = FrameTrace::default();
+                                    t.capture_us = original_capture_us;
+                                    t.encode_us = FrameTrace::now_us();
+                                    Some(t)
+                                } else {
+                                    None
+                                };
+
+                                let encoded = EncodedFrame {
+                                    frame_id: 0, // Назначит сериализатор
+                                    data: slice_data,
+                                    nalu_type,
+                                    is_last: idx == num_nalus - 1,
+                                    slice_idx: idx as u8,          // Вот они
+                                    total_slices: num_nalus as u8,
+                                    is_key,
+                                    trace,
+                                };
+
+                                // Отправляем немедленно
+                                if let Err(e) = sink.try_send(encoded) {
+                                    match e {
+                                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                            log::debug!("[Encoder] sink full, dropping NALU");
+                                        }
+                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => return,
+                                    }
                                 }
                             }
                         }

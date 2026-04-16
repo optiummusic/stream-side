@@ -157,21 +157,31 @@ impl ShardCache {
     }
 
     pub fn insert(&self, frame_id: u64, datagrams: &[Bytes]) {
-        let mut inner = self.inner.write().unwrap(); // Эксклюзивный доступ для записи
+        let mut inner = self.inner.write().unwrap();
         
-        if inner.order.len() >= SHARD_CACHE_FRAMES {
-            if let Some(old_id) = inner.order.pop_front() {
-                inner.data.remove(&old_id);
+        // 1. Проверяем, есть ли уже этот кадр в кэше
+        let is_new_frame = !inner.data.contains_key(&frame_id);
+
+        if is_new_frame {
+            // 2. Очистка старых кадров только если кадр реально новый
+            if inner.order.len() >= SHARD_CACHE_FRAMES {
+                if let Some(old_id) = inner.order.pop_front() {
+                    inner.data.remove(&old_id);
+                }
             }
+            inner.order.push_back(frame_id);
         }
 
+        // 3. Добавляем слайсы (NALU) в существующий или новый кадр
         let slice_map = inner.data.entry(frame_id).or_default();
         for dgram in datagrams {
-            if let Some(chunk) = DatagramChunk::decode(dgram.clone()) {
-                slice_map.entry(chunk.slice_idx).or_default().push(dgram.clone());
+            // Оптимизация: вместо полного decode, нам нужен только slice_idx
+            // В твоем DatagramChunk он на 8-й позиции
+            if dgram.len() >= DatagramChunk::HEADER_LEN {
+                let slice_idx = dgram[8]; 
+                slice_map.entry(slice_idx).or_default().push(dgram.clone());
             }
         }
-        inner.order.push_back(frame_id);
     }
 
     pub fn retransmit(&self, frame_id: u64, slice_idx: u8, received_mask: u64) -> Vec<Bytes> {
