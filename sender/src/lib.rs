@@ -6,9 +6,8 @@ pub mod capture;
 /// VAAPI HEVC encoder (Linux only).
 pub mod encode;
 
-/// QUIC transport server.
-pub mod quic;
 
+pub mod network;
 use std::{collections::HashMap, sync::atomic::AtomicBool, time::Duration};
 
 use bytes::Bytes;
@@ -16,7 +15,7 @@ use common::DatagramChunk;
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
-struct ClientIdentity {
+pub struct ClientIdentity {
     model: Option<String>,
     os: Option<String>,
     ready: bool,
@@ -30,7 +29,7 @@ struct SerializedFrame {
 }
 
 #[derive(Default)]
-struct ConnectionInfo {
+pub struct ConnectionInfo {
     remote: String,
     label: RwLock<String>,
     ready: AtomicBool,
@@ -127,7 +126,7 @@ impl FramePacer {
 /// How many recent frames to keep in the retransmission cache.
 /// At 60 fps this is ~500 ms of history — enough to cover any reasonable RTT
 /// while not consuming much memory (most frames are a few KB after FEC).
-const SHARD_CACHE_FRAMES: usize = 30;
+const SHARD_CACHE_FRAMES: usize = 60;
  
 /// Ring-buffer cache of recently sent shards, keyed by frame_id.
 ///

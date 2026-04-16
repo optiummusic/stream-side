@@ -14,8 +14,7 @@
 
 use std::{env, net::SocketAddr, sync::Arc};
 use sender::{
-    capture::{linux::LinuxPipeWireSender, VideoSender},
-    quic::QuicServer,
+    capture::{VideoSender, linux::LinuxPipeWireSender}, network::QuicServer,
 };
 
 #[tokio::main]
