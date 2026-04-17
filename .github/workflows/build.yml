@@ -287,12 +287,58 @@ jobs:
           path: android-app/app/build/outputs/apk/release/app-release.apk
 
 
+  build-receiver-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Homebrew Cache
+        id: cache-homebrew
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar
+            /opt/homebrew/Library/Taps
+            /opt/homebrew/bin/ffmpeg
+            /opt/homebrew/lib/pkgconfig
+          key: ${{ runner.os }}-homebrew-ffmpeg-v1
+
+      - name: Install system dependencies
+        # Устанавливаем только если кеш не сработал
+        if: steps.cache-homebrew.outputs.cache-hit != 'true'
+        run: |
+          brew update
+          brew install ffmpeg pkg-config
+
+      - name: Ensure ffmpeg is linked
+        # На случай, если кеш восстановился, но пути не прописаны
+        run: brew link ffmpeg
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build receiver
+        run: |
+          # На маке иногда нужно явно указать pkg-config путь для brew-библиотек
+          export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
+          cargo build -p receiver --release --features="desktop"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: receiver-macos
+          path: target/release/receiver
+
   release:
     needs:
       - build-sender-linux
       - build-receiver-linux
       - build-receiver-windows
       - build-receiver-android
+      - build-receiver-macos
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -309,11 +355,13 @@ jobs:
         run: |
           chmod +x artifacts/sender-linux/sender
           chmod +x artifacts/receiver-linux/receiver
+          chmod +x artifacts/receiver-macos/receiver
 
           zip -j sender-linux-x86_64.zip       artifacts/sender-linux/sender
           zip -j receiver-linux-x86_64.zip     artifacts/receiver-linux/receiver
           zip -j receiver-windows-x86_64.zip   artifacts/receiver-windows/receiver.exe \
                                                artifacts/receiver-windows/*.dll
+          zip -j receiver-macos-arm64.zip      artifacts/receiver-macos/receiver
           cp artifacts/receiver-android/app-release.apk receiver-android.apk
 
       - name: Create GitHub Release
@@ -328,4 +376,5 @@ jobs:
             sender-linux-x86_64.zip
             receiver-linux-x86_64.zip
             receiver-windows-x86_64.zip
+            receiver-macos-arm64.zip
             receiver-android.apk
