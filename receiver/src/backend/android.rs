@@ -109,9 +109,9 @@ impl AndroidMediaCodecBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 // Реализация трейта VideoBackend
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_AGE_PUSH: f64 = 75.0;
-const MAX_AGE_POLL: f64 = 150.0; // Pre Poll
-const CRITICAL_AGE_FLUSH: f64 = 300.0;
+const MAX_AGE_PUSH: f64 = 160.0;
+const MAX_AGE_POLL: f64 = 220.0; // Pre Poll
+const CRITICAL_AGE_FLUSH: f64 = 500.0;
 
 impl VideoBackend for AndroidMediaCodecBackend {
     fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {

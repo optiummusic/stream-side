@@ -216,7 +216,8 @@ pub(crate) async fn receive_datagrams(
                                 log::debug!("[NACK] control_tx full, NACK dropped: {e}");
                             }
                         }
-                        if let Some(packet) = assembled {
+                        for packet in assembled {
+                            // Если твой джиттер-буфер принимает по одному пакету:
                             jitter_buf.push(packet);
                         }
                     }

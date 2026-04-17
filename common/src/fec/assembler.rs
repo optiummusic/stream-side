@@ -4,7 +4,7 @@ use super::*;
 
 const MAX_BUFFERED_FRAMES: u64 = 8;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs (100 ms).
-const STALE_FRAME_US: u64 = 50_000;
+const STALE_FRAME_US: u64 = 150_000;
 
 /// A NACK will not be re-sent for the same (frame_id, slice_idx) more often
 /// than this interval (in µs). Set to ~one typical RTT on a LAN.
@@ -34,7 +34,7 @@ impl FrameAssembler {
     /// - `Option<VideoPacket>` — a fully assembled frame, if one just completed.
     /// - `Option<ControlPacket>` — a NACK request, if the assembler detects a
     ///   slice that is stalled and not yet recoverable via FEC.
-    pub fn insert(&mut self, chunk: &DatagramChunk) -> (Option<VideoPacket>, Option<ControlPacket>) {
+    pub fn insert(&mut self, chunk: &DatagramChunk) -> (Vec<VideoPacket>, Option<ControlPacket>) {
         let frame_id = chunk.frame_id;
         let now_us = FrameTrace::now_us();
 
@@ -56,12 +56,12 @@ impl FrameAssembler {
         }
 
         let nack = self.maybe_generate_nack(frame_id, now_us);
-
+        
         let assembled = {
             let builder = self.frames.entry(frame_id).or_insert_with(|| {
                 FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0)
             });
-            builder.insert_chunk(chunk)
+            builder.insert_chunk(chunk).unwrap_or_default()
         };
 
         if self.frames.get(&frame_id).is_some_and(|b| b.is_complete()) {

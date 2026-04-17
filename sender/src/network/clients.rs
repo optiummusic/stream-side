@@ -48,9 +48,28 @@ pub(crate) async fn send_loop_to_client(
                             // }
 
                             // .clone() on Bytes is extremely cheap (atomic ref-count bump)
-                            if conn.send_datagram(dgram.clone()).is_err() {
-                                log::error!("[QUIC] Failed to send datagram to {}", remote);
-                                return; 
+                            if let Err(e) = conn.send_datagram(dgram.clone()) {
+                                log::error!("[QUIC] Failed to send datagram to {}: {:?}", remote, e);
+                                match e {
+                                    quinn::SendDatagramError::TooLarge => {
+                                        // Пропускаем этот чанк, смысла переповторять нет — он никогда не пролезет.
+                                        continue; 
+                                    }
+                                    quinn::SendDatagramError::UnsupportedByPeer => {
+                                        // Сеть перегружена. 
+                                        // Вариант А: Просто пропустить (dropped by sender). 
+                                        // Вариант Б: Немного подождать и попробовать снова (но это может вызвать лаг).
+                                        return; 
+                                    }
+                                    quinn::SendDatagramError::Disabled => {
+                                        return; // Смысла продолжать нет
+                                    }
+                                    quinn::SendDatagramError::ConnectionLost(_) => {
+                                        return; 
+                                    }
+                                }
+                                // Если ошибка "TooManyInFlight", можно попробовать 
+                                // не делать return, а просто пропустить этот чанк.
                             }
                         }
                     }

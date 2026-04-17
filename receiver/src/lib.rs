@@ -17,7 +17,7 @@ pub(crate) enum VideoWorkerMsg {
     Push(VideoPacket),
     PollDecoder,
     Shutdown,
-    
+
     #[cfg(target_os = "android")]
     InitSurface {
         window: *mut ndk_sys::ANativeWindow,
@@ -47,7 +47,7 @@ pub extern "C" fn JNI_OnLoad(
     jni::sys::JNI_VERSION_1_6
 }
 
-pub const JITTER_TARGET_MS: u64 = 0;
+pub const JITTER_TARGET_MS: u64 = 40;
  
 /// Maximum number of frames held simultaneously.  When exceeded the oldest
 /// frame is evicted (dropped) to bound memory use.
@@ -106,6 +106,8 @@ pub struct JitterBuffer {
     packets: HashMap<(u64, u8), VideoPacket>,
     /// Fixed delay added to every frame's arrival time.
     target_us: u64,
+    last_scheduled_us: u64,
+    inter_packet_gap_us: u64,
 }
  
 impl JitterBuffer {
@@ -114,6 +116,8 @@ impl JitterBuffer {
             heap:      BinaryHeap::new(),
             packets:   HashMap::new(),
             target_us: target_ms * 1_000,
+            last_scheduled_us: 0,
+            inter_packet_gap_us: 50,
         }
     }
  
@@ -125,7 +129,11 @@ impl JitterBuffer {
     pub fn push(&mut self, packet: VideoPacket) {
         let frame_id = packet.frame_id;
         let slice_idx = packet.slice_idx;
-        let release_us = FrameTrace::now_us() + self.target_us;
+        let now = FrameTrace::now_us();
+
+        let base_release = now + self.target_us;
+        let release_us = base_release.max(self.last_scheduled_us + self.inter_packet_gap_us);
+        self.last_scheduled_us = release_us;
 
         self.packets.insert((frame_id, slice_idx), packet);
 

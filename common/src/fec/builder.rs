@@ -1,3 +1,5 @@
+// common/src/builder.rs
+
 use std::collections::{BTreeMap};
 
 use bytes::Bytes;
@@ -13,9 +15,7 @@ pub(crate) struct FrameBuilder {
     pub(crate) slices: HashMap<u8, SliceBuilder>,
     decoded_slices: BTreeMap<u8, VideoSlice>,
     pub(crate) total_slices: u8,
-    pub(crate) is_key: bool,
     pub(crate) first_us: u64,
-    keyframe_emitted: bool,
     next_emit_idx: u8,
 }
 
@@ -25,9 +25,7 @@ impl FrameBuilder {
             slices: HashMap::new(),
             decoded_slices: BTreeMap::new(),
             total_slices,
-            is_key,
             first_us: FrameTrace::now_us(),
-            keyframe_emitted: false,
             next_emit_idx: 0,
         }
     }
@@ -38,7 +36,7 @@ impl FrameBuilder {
         self.next_emit_idx == self.total_slices
     }
 
-    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Option<VideoPacket> {
+    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Option<Vec<VideoPacket>> {
         let slice_idx = chunk.slice_idx;
 
         {
@@ -62,7 +60,12 @@ impl FrameBuilder {
             self.decoded_slices.insert(slice_idx, video_slice);
         }
 
-        self.try_emit_ordered(chunk.frame_id)
+        let packets = self.try_emit_ordered();
+        if packets.is_empty() {
+            None
+        } else {
+            Some(packets)
+        }
     }
 
     fn decode_slice(&mut self, slice_idx: u8) -> Option<VideoSlice> {
@@ -74,16 +77,16 @@ impl FrameBuilder {
 
         Some(video_slice)
     }
-    fn try_emit_ordered(&mut self, _frame_id: u64) -> Option<VideoPacket> {
-        // Достаем слайс, который идет следующим по очереди
-        let slice = self.decoded_slices.remove(&self.next_emit_idx)?;
-        
-        // Важно: Мы НЕ пропускаем параметры (VPS/SPS/PPS). 
-        // Мы просто превращаем их в VideoPacket и отдаем декодеру.
-        let packet = Self::slice_to_packet(slice, self.first_us);
+    pub fn try_emit_ordered(&mut self) -> Vec<VideoPacket> {
+        let mut packets = Vec::new();
 
-        self.next_emit_idx += 1;
-        Some(packet)
+        while let Some(slice) = self.decoded_slices.remove(&self.next_emit_idx) {
+            let packet = Self::slice_to_packet(slice, self.first_us);
+            packets.push(packet);
+            self.next_emit_idx += 1;
+        }
+
+        packets
     }
 
     fn slice_to_packet(slice: VideoSlice, first_us: u64) -> VideoPacket {
@@ -102,18 +105,6 @@ impl FrameBuilder {
             is_last: slice.is_last,
             trace,
         }
-    }
-}
-
-fn nalu_priority(t: NaluType) -> u8 {
-    match t {
-        NaluType::VideoParamSet => 0,
-        NaluType::SeqParamSet   => 1,
-        NaluType::PicParamSet   => 2,
-        NaluType::Sei           => 3,
-        NaluType::SliceIdr      => 4,
-        NaluType::SliceTrailing  => 5,
-        NaluType::Other(_)      => 6,
     }
 }
 

@@ -38,7 +38,7 @@ impl FrameTrace {
 /// Serialised once on the sender with postcard, then chunked into QUIC
 /// datagrams.  On the receiver the chunks are reassembled and deserialised
 /// back into this struct.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct VideoPacket {
     pub frame_id:  u64,
     pub payload:   Vec<u8>,
