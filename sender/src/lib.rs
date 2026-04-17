@@ -21,20 +21,12 @@ pub struct ClientIdentity {
     ready: bool,
 }
 
-#[derive(Clone)]
-struct SerializedFrame {
-    pub frame_id: u64,
-    pub is_key: bool,
-    pub chunks: Arc<Vec<Bytes>>,
-}
-
 #[derive(Default)]
 pub struct ConnectionInfo {
     remote: String,
     label: RwLock<String>,
     ready: AtomicBool,
 }
-
 
 impl ConnectionInfo {
     async fn label(&self) -> String {
