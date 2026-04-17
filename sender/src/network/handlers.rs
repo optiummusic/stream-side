@@ -113,7 +113,7 @@ pub(crate) async fn handle_uni_stream(
             }
             ControlPacket::Nack { frame_id, slice_idx, received_mask } => {
                 let label = info.label().await;
-                log::info!(
+                log::debug!(
                     "[NACK] {label} requested retransmit frame={frame_id} slice={slice_idx} \
                     received={received_mask:#066b}"
                 );

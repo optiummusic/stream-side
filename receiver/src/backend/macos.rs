@@ -4,6 +4,7 @@
 // Produces NV12 (Y + interleaved UV) frames for the existing WGPU path.
 
 use std::collections::HashMap;
+use bytes::BytesMut;
 
 use common::FrameTrace;
 use ffmpeg_next::{
@@ -18,6 +19,8 @@ use super::{BackendError, FrameOutput, PushStatus, VideoBackend, YuvFrame};
 
 pub struct MacosFfmpegBackend {
     decoder:        ffmpeg_next::decoder::Video,
+    current_trace:  Option<FrameTrace>,
+    slice_buffer:   BytesMut,
     scaler:         Option<scaling::Context>,
     last_fmt:       Pixel,
     pending_traces: HashMap<u64, (u64, Option<FrameTrace>)>,
@@ -56,6 +59,8 @@ impl MacosFfmpegBackend {
 
         Ok(Self {
             decoder,
+            current_trace:  None,
+            slice_buffer:   BytesMut::with_capacity(1024 * 512),
             scaler:         None,
             last_fmt:       Pixel::None,
             pending_traces: HashMap::new(),
@@ -67,7 +72,7 @@ impl MacosFfmpegBackend {
 }
 
 impl VideoBackend for MacosFfmpegBackend {
-    fn push_encoded(
+    fn submit_to_decoder(
         &mut self,
         payload:  &[u8],
         frame_id: u64,
@@ -176,7 +181,12 @@ impl VideoBackend for MacosFfmpegBackend {
             uv_stride: uv_stride as u32,
         }))
     }
-
+    fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
+        &mut self.current_trace
+    }
+    fn get_slice_buffer(&mut self) -> &mut BytesMut {
+        &mut self.slice_buffer
+    }
     fn shutdown(&mut self) {
         log::info!("[Decoder] MacosFfmpegBackend: shutdown");
     }

@@ -31,7 +31,7 @@ pub extern "C" fn JNI_OnLoad(
     jni::sys::JNI_VERSION_1_6
 }
 
-pub const JITTER_TARGET_MS: u64 = 40;
+pub const JITTER_TARGET_MS: u64 = 0;
  
 /// Maximum number of frames held simultaneously.  When exceeded the oldest
 /// frame is evicted (dropped) to bound memory use.
@@ -46,21 +46,35 @@ pub const JITTER_MAX_FRAMES: usize = 32;
  
 /// Scheduling entry stored in the min-heap.
 pub struct JitterEntry {
-    /// Absolute µs timestamp at which this frame may be forwarded.
-    release_us: u64,
-    /// Identifies the corresponding entry in `JitterBuffer::packets`.
-    frame_id: u64,
+    pub release_us: u64,
+    pub frame_id: u64,
+    pub slice_idx: u8,
 }
 
 // Manual Ord impl so BinaryHeap becomes a min-heap on `release_us`.
-impl PartialEq  for JitterEntry { fn eq(&self, o: &Self) -> bool { self.release_us == o.release_us && self.frame_id == o.frame_id } }
-impl Eq         for JitterEntry {}
-impl PartialOrd for JitterEntry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-impl Ord        for JitterEntry {
+impl PartialEq for JitterEntry {
+    fn eq(&self, o: &Self) -> bool {
+        self.release_us == o.release_us
+            && self.frame_id == o.frame_id
+            && self.slice_idx == o.slice_idx
+    }
+}
+
+impl Eq for JitterEntry {}
+
+impl PartialOrd for JitterEntry {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for JitterEntry {
     fn cmp(&self, o: &Self) -> Ordering {
-        // Reverse: smaller release_us → higher priority (min-heap).
-        o.release_us.cmp(&self.release_us)
+        // min-heap by release time
+        o.release_us
+            .cmp(&self.release_us)
             .then(o.frame_id.cmp(&self.frame_id))
+            .then(o.slice_idx.cmp(&self.slice_idx))
     }
 }
  
@@ -73,7 +87,7 @@ pub struct JitterBuffer {
     /// Min-heap of scheduled release times.
     heap: BinaryHeap<JitterEntry>,
     /// Actual packet storage; heap entries with no matching key here are stale.
-    packets: HashMap<u64, VideoPacket>,
+    packets: HashMap<(u64, u8), VideoPacket>,
     /// Fixed delay added to every frame's arrival time.
     target_us: u64,
 }
@@ -93,19 +107,30 @@ impl JitterBuffer {
     /// smallest `frame_id` is evicted — it is the most stale and least likely
     /// to contribute to smooth playback.
     pub fn push(&mut self, packet: VideoPacket) {
-        let frame_id   = packet.frame_id;
+        let frame_id = packet.frame_id;
+        let slice_idx = packet.slice_idx;
         let release_us = FrameTrace::now_us() + self.target_us;
- 
-        self.packets.insert(frame_id, packet);
-        self.heap.push(JitterEntry { release_us, frame_id });
- 
-        // Evict oldest if over capacity.
+
+        self.packets.insert((frame_id, slice_idx), packet);
+
+        self.heap.push(JitterEntry {
+            release_us,
+            frame_id,
+            slice_idx,
+        });
+
         while self.packets.len() > JITTER_MAX_FRAMES {
-            if let Some(min_id) = self.packets.keys().copied().min() {
-                self.packets.remove(&min_id);
-                log::warn!("[JitterBuf] evicted frame #{min_id} (buffer full)");
-                // The corresponding heap entry becomes an orphan and will be
-                // silently skipped by drain_ready / time_to_next.
+            if let Some((min_key, _)) = self.packets
+                .iter()
+                .min_by_key(|((fid, _), _)| *fid)
+                .map(|(k, v)| (*k, v.clone()))
+            {
+                self.packets.remove(&min_key);
+                log::warn!(
+                    "[JitterBuf] evicted frame {} slice {}",
+                    min_key.0,
+                    min_key.1
+                );
             } else {
                 break;
             }
@@ -117,24 +142,24 @@ impl JitterBuffer {
     pub fn drain_ready(&mut self) -> Vec<VideoPacket> {
         let now = FrameTrace::now_us();
         let mut ready = Vec::new();
- 
+
         loop {
             match self.heap.peek() {
-                None                                   => break,
-                Some(e) if e.release_us > now          => break,
+                None => break,
+                Some(e) if e.release_us > now => break,
                 Some(e) => {
-                    let fid = e.frame_id;
+                    let key = (e.frame_id, e.slice_idx);
                     self.heap.pop();
-                    if let Some(pkt) = self.packets.remove(&fid) {
+
+                    if let Some(pkt) = self.packets.remove(&key) {
                         ready.push(pkt);
                     }
-                    // else: orphaned entry (evicted earlier) — skip.
+                    // else orphan
                 }
             }
         }
- 
-        // Sort for in-order delivery to the decoder.
-        ready.sort_unstable_by_key(|p| p.frame_id);
+
+        ready.sort_unstable_by_key(|p| (p.frame_id, p.slice_idx));
         ready
     }
  
@@ -146,15 +171,18 @@ impl JitterBuffer {
         loop {
             match self.heap.peek() {
                 None => return None,
-                Some(e) if self.packets.contains_key(&e.frame_id) => {
+                Some(e) if self.packets.contains_key(&(e.frame_id, e.slice_idx)) => {
                     let now = FrameTrace::now_us();
+
                     return Some(if now >= e.release_us {
                         Duration::ZERO
                     } else {
                         Duration::from_micros(e.release_us - now)
                     });
                 }
-                Some(_) => { self.heap.pop(); } // discard orphan, continue
+                Some(_) => {
+                    self.heap.pop(); // orphan
+                }
             }
         }
     }

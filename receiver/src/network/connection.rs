@@ -1,3 +1,4 @@
+use std::sync::mpsc::{SyncSender, sync_channel};
 use common::fec::assembler::FrameAssembler;
 
 use super::*;
@@ -6,6 +7,113 @@ pub(crate) struct VideoState {
     pub waiting_for_key: bool,
     pub expected_frame_id: Option<u64>,
     pub expected_slice_idx: u8,
+}
+
+pub(crate) enum VideoWorkerMsg {
+    Push(VideoPacket),
+    PollDecoder,
+}
+
+pub(crate) fn spawn_video_backend_worker<B: VideoBackend>(
+    mut backend: B,
+    control_tx: mpsc::Sender<ControlPacket>,
+    idr_needed_tx: watch::Sender<bool>,
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
+    proxy: AppProxy,
+) -> SyncSender<VideoWorkerMsg>
+where
+    B: VideoBackend + 'static,
+{
+    let (tx, rx) = sync_channel::<VideoWorkerMsg>(1024);
+
+    std::thread::spawn(move || {
+        let mut state = VideoState {
+            waiting_for_key: true,
+            expected_frame_id: None,
+            expected_slice_idx: 0,
+        };
+
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                VideoWorkerMsg::Push(packet) => {
+                    push_frame_to_backend(
+                        packet,
+                        &mut state,
+                        &mut backend,
+                        &control_tx,
+                        &idr_needed_tx,
+                    );
+                },
+                VideoWorkerMsg::PollDecoder => {
+                    const MAX_DRAIN_PER_TICK: usize = 32;
+
+                    let mut drained = 0usize;
+
+                    loop {
+                        if drained >= MAX_DRAIN_PER_TICK {
+                            break;
+                        }
+
+                        match backend.poll_output() {
+                            Ok(FrameOutput::Pending) => {
+                                break},
+
+                            Ok(FrameOutput::Dropped { age }) => {
+                                let _ = control_tx.try_send(ControlPacket::Communication {
+                                    message: format!(
+                                        "DROPPED ON POLL, age: {:.1}ms",
+                                        age.unwrap_or(0.0)
+                                    ),
+                                });
+                            }
+
+                            Ok(FrameOutput::Yuv(f)) => {
+                                if let Some(tx) = &frame_tx {
+                                    if tx.try_send(DecodedFrame::Yuv(f)).is_err() {
+                                        break;
+                                    }
+                                }
+
+                                #[cfg(not(target_os = "android"))]
+                                if let Some(p) = &proxy {
+                                    let _ = p.send_event(crate::UserEvent::NewFrame);
+                                }
+
+                                drained += 1;
+                            }
+
+                            #[cfg(unix)]
+                            Ok(FrameOutput::DmaBuf(f)) => {
+                                if let Some(tx) = &frame_tx {
+                                    if tx.try_send(DecodedFrame::DmaBuf(f)).is_err() {
+                                        break;
+                                    }
+                                }
+
+                                #[cfg(not(target_os = "android"))]
+                                if let Some(p) = &proxy {
+                                    let _ = p.send_event(crate::UserEvent::NewFrame);
+                                }
+
+                                drained += 1;
+                            }
+
+                            Ok(_) => {}
+
+                            Err(e) => {
+                                let _ = control_tx.try_send(ControlPacket::Communication {
+                                    message: format!("poll_output error: {e:?}"),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    tx
 }
 
 pub(crate) async fn connect_quic(
@@ -17,22 +125,17 @@ pub(crate) async fn connect_quic(
     Ok(conn)
 }
 
-pub(crate) async fn receive_datagrams<B: VideoBackend>(
+pub(crate) async fn receive_datagrams(
     conn:     quinn::Connection,
-    backend:  Arc<Mutex<B>>,
+    worker_tx: SyncSender<VideoWorkerMsg>,
     control_tx: mpsc::Sender<ControlPacket>,
-    idr_needed_tx: watch::Sender<bool>,
 ) {
-    let mut video_state = VideoState {
-        waiting_for_key: true,
-        expected_frame_id: None,
-        expected_slice_idx: 0
-    };
     let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
     let mut assembler = FrameAssembler::new();
     
     let sleep_until = Instant::now() + Duration::from_secs(3600);
     let sleep = time::sleep_until(sleep_until);
+    
     tokio::pin!(sleep);
     loop {
         // ── Sleep duration until the next buffered frame is due ───────────────
@@ -53,17 +156,12 @@ pub(crate) async fn receive_datagrams<B: VideoBackend>(
             _ = &mut sleep => {
                 let ready = jitter_buf.drain_ready();
                 if ready.is_empty() { continue; }
- 
-                log::trace!("[JitterBuf] releasing {} frame(s)", ready.len());
- 
+
                 for packet in ready {
-                    push_frame_to_backend(
-                        packet,
-                        &mut video_state,
-                        &backend,
-                        &control_tx,
-                        &idr_needed_tx,
-                    ).await;
+                    if let Err(e) = worker_tx.send(VideoWorkerMsg::Push(packet)) {
+                        log::error!("Video worker channel closed: {e}");
+                        return;
+                    }
                 }
             }
 
@@ -116,38 +214,55 @@ pub(crate) async fn receive_datagrams<B: VideoBackend>(
     }
 }
 
-pub(crate) async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
+pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     mut packet: VideoPacket,
     state:      &mut VideoState,
-    backend:    &Arc<Mutex<B>>,
+    backend: &mut B,
     control_tx: &mpsc::Sender<ControlPacket>,
     idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
 ) {
     // ── In-order / IDR gate ───────────────────────────────────────────────
-    if packet.is_key {
+    if packet.is_key && state.waiting_for_key {
         state.waiting_for_key = false;
         state.expected_frame_id = Some(packet.frame_id);
-        state.expected_slice_idx = 0;
+        state.expected_slice_idx = 0; 
         let _ = idr_needed_tx.send(false);
+        log::info!("[Video] Keyframe start received, synced to frame #{}", packet.frame_id);
     } 
 
-    // Если мы уже ждем ключ — просто игнорируем любые дельта-кадры
     if state.waiting_for_key {
         return;
     }
     if Some(packet.frame_id) != state.expected_frame_id {
+        if Some(packet.frame_id) < state.expected_frame_id {
+            return;
+        }
+        // Clear slice buffer
+        backend.clear_buffer();
+        
+
         state.waiting_for_key = true;
+        log::info!("Request keyframe: Frame jump detected (got {}, expected {:?})", packet.frame_id, state.expected_frame_id);
         let _ = idr_needed_tx.send(true);
         return;
     }
+
     if packet.slice_idx != state.expected_slice_idx {
-        // пропустили slice → десинк
+        // Clear slice buffer
+        backend.clear_buffer();
+        
         state.waiting_for_key = true;
+        log::info!(
+            "Request keyframe: Slice gap in frame #{} (got {}, expected {})", 
+            packet.frame_id, packet.slice_idx, state.expected_slice_idx
+        );
         let _ = idr_needed_tx.send(true);
         return;
     }
-    state.expected_slice_idx += 1;
     
+
+    state.expected_slice_idx += 1;
+
     if packet.is_last {
         state.expected_frame_id = Some(packet.frame_id + 1);
         state.expected_slice_idx = 0;
@@ -156,17 +271,10 @@ pub(crate) async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
     let frame_id    = packet.frame_id;
     let payload     = packet.payload;
     let trace       = packet.trace.take();
-    let backend_arc = backend.clone();
     let ctrl        = control_tx.clone();
  
-    let push_result = tokio::task::spawn_blocking(move || {
-        let mut backend_lock = backend_arc.lock().unwrap();
-        backend_lock.push_encoded(&payload, frame_id, trace)
-    })
-    .await;
- 
-    match push_result {
-        Ok(Ok(PushStatus::Dropped { age })) => {
+    match backend.push_encoded(&payload, frame_id, trace, packet.is_last) {
+        Ok(PushStatus::Dropped { age }) => {
             let _ = ctrl.try_send(ControlPacket::Communication {
                 message: format!(
                     "DROPPED ON PUSH#{}, age: {:.1}ms",
@@ -175,12 +283,12 @@ pub(crate) async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
                 ),
             });
         }
-        Ok(Ok(PushStatus::Accepted)) => {}
-        Ok(Err(e)) => {
+        Ok(PushStatus::Accepted) => {}
+        Ok(PushStatus::Accumulating) => {}
+        Err(e) => {
             let _ = ctrl.try_send(ControlPacket::Communication {
                 message: format!("ERROR ON BACKEND: {e}"),
             });
         }
-        Err(e) => log::error!("[Video] push task join error: {e}"),
     }
 }

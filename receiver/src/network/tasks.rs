@@ -149,103 +149,18 @@ pub(crate) fn spawn_idr_solicitor(
     })
 }
 
-pub(crate) fn spawn_decoder_poll_task<B: VideoBackend + Send + 'static>(
-    backend: Arc<Mutex<B>>,
-    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
-    control_tx: mpsc::Sender<ControlPacket>,
-    proxy: AppProxy,
+pub(crate) fn spawn_decoder_poll_task(
+    worker_tx: std::sync::mpsc::SyncSender<VideoWorkerMsg>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(3));
-        const MAX_DRAIN_PER_TICK: usize = 32;
 
         loop {
             interval.tick().await;
 
-            let backend = backend.clone();
-            let poll_result = tokio::task::spawn_blocking(move || {
-                let mut frames_to_send = Vec::new();
-                let mut dropped_ages = Vec::new();
-
-                let mut guard = match backend.lock() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        return Err("backend mutex poisoned".to_string());
-                    }
-                };
-
-                let mut drained = 0usize;
-
-                loop {
-                    if drained >= MAX_DRAIN_PER_TICK {
-                        break;
-                    }
-
-                    match guard.poll_output() {
-                        Ok(FrameOutput::Pending) => break,
-
-                        Ok(FrameOutput::Dropped { age }) => {
-                            dropped_ages.push(age);
-                        }
-
-                        Ok(frame) => {
-                            frames_to_send.push(frame);
-                            drained += 1;
-                        }
-
-                        Err(e) => {
-                            return Err(format!("poll_output error: {e:?}"));
-                        }
-                    }
-                }
-
-                Ok::<_, String>((frames_to_send, dropped_ages))
-            })
-            .await;
-
-            let (frames_to_send, dropped_ages) = match poll_result {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    log::error!("[Decoder] poll task error: {e}");
-                    break;
-                }
-                Err(e) => {
-                    log::error!("[Decoder] poll task join error: {e}");
-                    break;
-                }
-            };
-
-            for age in dropped_ages {
-                let _ = control_tx.try_send(ControlPacket::Communication {
-                    message: format!(
-                        "DROPPED ON POLL, age: {:.1}ms",
-                        age.unwrap_or(0.0)
-                    ),
-                });
-            }
-
-            if let Some(tx) = &frame_tx {
-                for frame in frames_to_send {
-                    let res = match frame {
-                        FrameOutput::Yuv(f) => tx.try_send(DecodedFrame::Yuv(f)),
-
-                        #[cfg(unix)]
-                        FrameOutput::DmaBuf(f) => tx.try_send(DecodedFrame::DmaBuf(f)),
-
-                        _ => Ok(()),
-                    };
-
-                    #[cfg(not(target_os = "android"))]
-                    if res.is_ok() {
-                        if let Some(p) = &proxy {
-                            let _ = p.send_event(crate::UserEvent::NewFrame);
-                        }
-                    }
-
-                    if res.is_err() {
-                        break;
-                    }
-                }
+            if worker_tx.send(VideoWorkerMsg::PollDecoder).is_err() {
+                log::error!("[Decoder] worker channel closed");
+                break;
             }
         }
     })

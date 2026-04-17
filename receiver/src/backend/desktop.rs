@@ -54,6 +54,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::FromRawFd;
 use std::ptr;
 
+use bytes::BytesMut;
 use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 
 use crate::backend::PushStatus;
@@ -80,7 +81,8 @@ pub struct DesktopFfmpegBackend {
     scaler:         Option<scaling::Context>,
     last_fmt:       Pixel,
     pending_traces: HashMap<u64, (u64, Option<FrameTrace>)>,
-
+    current_frame_trace: Option<FrameTrace>,
+    slice_buffer:   BytesMut,
     // ── CPU-путь (fallback) ──────────────────────────────────────────────────
 
     /// Переиспользуемый CPU AVFrame для av_hwframe_transfer_data.
@@ -130,6 +132,7 @@ impl DesktopFfmpegBackend {
         unsafe {
             let raw = ctx.as_mut_ptr();
             (*raw).flags |= AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*raw).flags2 |= AV_CODEC_FLAG2_CHUNKS as i32;
             (*raw).thread_count = 1;
         }
 
@@ -190,6 +193,8 @@ impl DesktopFfmpegBackend {
             scaler:         None,
             last_fmt:       Pixel::None,
             pending_traces: HashMap::new(),
+            slice_buffer:   BytesMut::with_capacity(1024 * 512),
+            current_frame_trace: None,
             transfer_frame,
             scaler_out:     None,
             y_pool:         Vec::new(),
@@ -235,15 +240,20 @@ impl Drop for DesktopFfmpegBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl VideoBackend for DesktopFfmpegBackend {
-    fn push_encoded(
-        &mut self,
-        payload:  &[u8],
-        frame_id: u64,
-        trace:    Option<FrameTrace>,
-    ) -> Result<PushStatus, BackendError> {
+    fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
+        &mut self.current_frame_trace
+    }
+    fn get_slice_buffer(&mut self) -> &mut BytesMut {
+        &mut self.slice_buffer
+    }
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+        if payload.len() < 5 {
+            return Ok(PushStatus::Dropped { age: None });
+        }
+
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
         if let Some(dst) = pkt.data_mut() {
-            dst.copy_from_slice(payload);
+            dst.copy_from_slice(payload.as_ref());
         }
         let pts_key = FrameTrace::now_us();
         pkt.set_pts(Some(pts_key as i64));

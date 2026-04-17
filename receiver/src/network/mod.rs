@@ -27,6 +27,11 @@ pub(crate) use identity::*;
 pub(crate) use connection::*;
 pub(crate) use tasks::*;
 
+#[cfg(target_os = "macos")]
+use crate::backend::macos::MacosFfmpegBackend;
+
+#[cfg(not(target_os = "macos"))]
+use crate::backend::desktop::DesktopFfmpegBackend;
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,8 +49,7 @@ pub(crate) use tasks::*;
 /// Returns only if endpoint construction fails (TLS config error, port bind
 /// failure).  Connection errors and decode errors are logged and retried.
 
-pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
-    backend: Arc<Mutex<B>>,
+pub async fn run_quic_receiver(
     sender_addr: SocketAddr,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>,
     trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
@@ -55,8 +59,8 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
     // Создаём endpoint один раз и переиспользуем его для реконнектов.
     let endpoint = build_quic_client_endpoint()?;
-
     loop {
+
         log::info!("[QUIC] Connecting to {sender_addr}...");
 
         let conn = match connect_quic(&endpoint, sender_addr).await {
@@ -70,21 +74,34 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
         log::info!("[QUIC] Connected to {}", conn.remote_address());
 
+        #[cfg(target_os = "macos")]
+        let backend = MacosFfmpegBackend::new()?;
+
+        #[cfg(not(target_os = "macos"))]
+        let backend = DesktopFfmpegBackend::new()?;
+
+
         if let Err(e) = send_identity_and_wait_ack(&conn).await {
             log::warn!("[QUIC] handshake failed: {e}");
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-
+        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
         let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
         let proxy_clone = proxy.clone();
         let mut task_handles = Vec::<JoinHandle<()>>::new();
 
-        task_handles.push(spawn_decoder_poll_task(
-            backend.clone(),
-            frame_tx.clone(),
+        // Backend task
+        let worker_tx = spawn_video_backend_worker(
+            backend,
             control_tx.clone(),
-            proxy_clone
+            idr_needed_tx.clone(),
+            frame_tx.clone(),
+            proxy_clone,
+        );
+
+        task_handles.push(spawn_decoder_poll_task(
+            worker_tx.clone(),
         ));
 
         task_handles.push(spawn_control_writer_task(
@@ -99,14 +116,13 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
         task_handles.push(spawn_ping_task(conn.clone()));
 
-        // Основной цикл приёма датаграмм.
-        // Когда он завершается — считаем соединение потерянным.
-        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
         task_handles.push(spawn_idr_solicitor(
             control_tx.clone(), 
             idr_needed_rx
         ));
-        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx).await;
+        // Основной цикл приёма датаграмм.
+        // Когда он завершается — считаем соединение потерянным.
+        receive_datagrams(conn.clone(), worker_tx, control_tx.clone()).await;
 
         // Останавливаем все фоновые задачи этого соединения.
         for handle in task_handles {

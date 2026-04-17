@@ -4,11 +4,11 @@ use super::*;
 
 const MAX_BUFFERED_FRAMES: u64 = 8;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs (100 ms).
-const STALE_FRAME_US: u64 = 100_000;
+const STALE_FRAME_US: u64 = 50_000;
 
 /// A NACK will not be re-sent for the same (frame_id, slice_idx) more often
 /// than this interval (in µs). Set to ~one typical RTT on a LAN.
-const NACK_SUPPRESS_US: u64 = 10_000; // 10 ms
+const NACK_SUPPRESS_US: u64 = 50_000; // 10 ms
 
 pub struct FrameAssembler {
     frames: HashMap<u64, FrameBuilder>,

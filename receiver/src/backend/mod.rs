@@ -16,6 +16,7 @@
 // Трейт VideoBackend скрывает эту фундаментальную разницу.
 
 use std::fmt;
+use bytes::BytesMut;
 use common::FrameTrace;
 
 #[cfg(unix)]
@@ -96,6 +97,7 @@ pub enum FrameOutput {
 
 pub enum PushStatus {
     Accepted,
+    Accumulating,
     Dropped{age: Option<f32>},
 }
 
@@ -127,13 +129,48 @@ pub enum PushStatus {
 ///
 /// # Thread safety
 /// `Send + 'static` — бекенд перемещается в networking-поток.
+
 pub trait VideoBackend: Send + 'static {
     /// Передать один закодированный HEVC-фрейм (сырые NAL-юниты из VideoPacket.payload).
     ///
     /// На десктопе: передаёт пакет в ffmpeg-декодер.
     /// На Android:  копирует данные во входной буфер AMediaCodec.
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>,) -> Result<PushStatus, BackendError>;
+    /// 
+    /// Default implementation for bufferizing slices
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>, is_last: bool) -> Result<PushStatus, BackendError> {
+        if trace.is_some() {
+            *self.get_current_trace() = trace;
+        }
+        
+        self.get_slice_buffer().extend_from_slice(payload);
+        
+        if !is_last {
+            return Ok(PushStatus::Accumulating);
+        }
+        
+        let full_payload = self.get_slice_buffer().split().freeze();
+        let full_trace = self.get_current_trace().take();
+        
+        self.submit_to_decoder(&full_payload, frame_id, full_trace)
+    }
+    /// Initialize slice buffer in Backend struct as
+    /// slice_buffer:   BytesMut,
+    fn get_slice_buffer(&mut self) -> &mut BytesMut;
 
+    /// This is for capturing trace datapack that we embed in very first slice during serialization on server's side
+    /// Inititalize in the Backend struct as 
+    /// current_frame_trace: Option<FrameTrace>,
+    fn get_current_trace(&mut self) -> &mut Option<FrameTrace>;
+
+    /// This is a function that takes the fully assembled slice, given by the default push_encoded function
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError>;
+
+    /// This is the method we call from network stack in case we detect packet loss/index inconsistency
+    /// So we don't keep irrelevant slices in buffer which would break sequencing
+    fn clear_buffer(&mut self) {
+        self.get_slice_buffer().clear();
+        self.get_current_trace().take();
+    }
     /// Получить один декодированный кадр из выходной очереди (если готов).
     ///
     /// Должен вызываться в цикле после каждого `push_encoded`, пока не вернёт `Pending`.

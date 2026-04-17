@@ -140,7 +140,6 @@ pub(crate) async fn run_serialiser_task(
 
         // 4. Сериализация и FEC
         let serialized = postcard::to_allocvec(&video_slice).unwrap_or_default();
-
         let chunks = common::fec::encode::FecEncoder::encode(
             slice.frame_id,
             idx,
@@ -153,7 +152,7 @@ pub(crate) async fn run_serialiser_task(
         for chunk in chunks {
             datagrams.push(chunk.to_bytes());
         }
-
+        
         // 5. Broadcast: отправляем СЛАЙС немедленно
         let shared_part = Arc::new(SerializedFrame {
             frame_id: slice.frame_id,

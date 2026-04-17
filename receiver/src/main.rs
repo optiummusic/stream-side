@@ -52,12 +52,6 @@ use winit::{
 };
 
 use stream_receiver::backend::YuvFrame;
-
-#[cfg(target_os = "macos")]
-use stream_receiver::backend::macos::MacosFfmpegBackend;
-
-#[cfg(not(target_os = "macos"))]
-use stream_receiver::backend::desktop::DesktopFfmpegBackend;
 use stream_receiver::network::run_quic_receiver;
 
 #[cfg(target_os = "linux")]
@@ -981,7 +975,9 @@ impl ApplicationHandler<UserEvent> for App {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+    .write_style(env_logger::WriteStyle::Always) // Форсировать цвета даже с grep
+    .init();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -1003,14 +999,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Канал несёт DecodedFrame (CPU или DMA-BUF).
     // Capacity=3: при отставании рендера старые кадры выбрасываются → low-latency.
     let (tx, rx) = mpsc::channel::<DecodedFrame>(3);
-
-    #[cfg(target_os = "macos")]
-    let backend = MacosFfmpegBackend::new()?;
-
-    #[cfg(not(target_os = "macos"))]
-    let backend = DesktopFfmpegBackend::new()?;
-    let backend = Arc::new(Mutex::new(backend));
-    let backend_clone = backend.clone();
     let tx_clone      = tx.clone();
 
     let (trace_tx, trace_rx) = watch::channel::<Option<(u64, FrameTrace)>>(None);
@@ -1033,7 +1021,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                run_quic_receiver(backend_clone, addr, Some(tx_clone), trace_rx, proxy).await;
+                run_quic_receiver(addr, Some(tx_clone), trace_rx, proxy).await;
             }));
         })?;
 

@@ -9,7 +9,7 @@ pub mod vaapi;
 pub mod nvenc;
 
 pub use vaapi::VaapiEncoder;
-// pub use nvenc::NvencEncoder;
+pub use nvenc::NvencEncoder;
 
 use std::{ffi::c_int, ptr, slice};
 use libc::{mmap, munmap, MAP_FAILED, MAP_SHARED, PROT_READ};
@@ -56,7 +56,7 @@ pub trait HwEncoder: Send + 'static {
 
 pub enum AnyEncoder {
     Vaapi(VaapiEncoder),
-    // Nvenc(NvencEncoder),
+    Nvenc(NvencEncoder),
 }
 
 impl AnyEncoder {
@@ -67,10 +67,10 @@ impl AnyEncoder {
         idr_rx: watch::Receiver<bool>,
     ) -> Self {
         match detect_gpu_vendor() {
-            // GpuVendor::Nvidia => {
-            //     log::info!("[Encoder] NVIDIA GPU detected → hevc_nvenc");
-            //     // Self::Nvenc(NvencEncoder::new(width, height, sink, idr_rx))
-            // }
+            GpuVendor::Nvidia => {
+                log::info!("[Encoder] NVIDIA GPU detected → hevc_nvenc");
+                Self::Nvenc(NvencEncoder::new(width, height, sink, idr_rx))
+            }
             v => {
                 log::info!("[Encoder] Vendor {v:?} → hevc_vaapi (VAAPI)");
                 Self::Vaapi(VaapiEncoder::new(width, height, sink, idr_rx))
@@ -83,7 +83,7 @@ impl HwEncoder for AnyEncoder {
     fn encode_bgra(&self, frame: &[u8], stride: u32, capture_us: u64) {
         match self {
             Self::Vaapi(e) => e.encode_bgra(frame, stride, capture_us),
-            // Self::Nvenc(e) => e.encode_bgra(frame, stride, capture_us),
+            Self::Nvenc(e) => e.encode_bgra(frame, stride, capture_us),
         }
     }
 
@@ -92,7 +92,7 @@ impl HwEncoder for AnyEncoder {
     ) {
         match self {
             Self::Vaapi(e) => e.encode_dmabuf(fd, stride, offset, modifier, capture_us),
-            // Self::Nvenc(e) => e.encode_dmabuf(fd, stride, offset, modifier, capture_us),
+            Self::Nvenc(e) => e.encode_dmabuf(fd, stride, offset, modifier, capture_us),
         }
     }
 }

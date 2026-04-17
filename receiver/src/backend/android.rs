@@ -21,6 +21,7 @@ use jni::{
     Env
 };
 use once_cell::sync::OnceCell;
+use bytes::BytesMut;
 
 use super::{BackendError, FrameOutput, PushStatus, VideoBackend};
 use common::FrameTrace;
@@ -68,6 +69,8 @@ impl Drop for CodecState {
 pub struct AndroidMediaCodecBackend {
     state:        Option<CodecState>,
     pts_to_frame: HashMap<u64, (u64, FrameTrace)>,
+    current_trace: Option<FrameTrace>,
+    slice_buffer: BytesMut,
 }
 
 impl AndroidMediaCodecBackend {
@@ -76,6 +79,8 @@ impl AndroidMediaCodecBackend {
         Self {
             state:        None,
             pts_to_frame: HashMap::new(),
+            slice_buffer:   BytesMut::with_capacity(1024 * 512),
+            current_trace: None,
         }
     }
 
@@ -173,7 +178,7 @@ const MAX_AGE_POLL: f64 = 150.0; // Pre Poll
 const CRITICAL_AGE_FLUSH: f64 = 300.0;
 
 impl VideoBackend for AndroidMediaCodecBackend {
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
 
         // Drop old chunks
         if let Some(t) = &trace {
@@ -240,6 +245,17 @@ impl VideoBackend for AndroidMediaCodecBackend {
                 Ok(FrameOutput::Pending)
             }
         }
+    }
+    fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
+        &mut self.current_trace
+    }
+    fn get_slice_buffer(&mut self) -> &mut BytesMut {
+        &mut self.slice_buffer
+    }
+
+    fn clear_buffer(&mut self) {
+        self.get_slice_buffer().clear();
+        self.get_current_trace().take();
     }
 
     fn shutdown(&mut self) {

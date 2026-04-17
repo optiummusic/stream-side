@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap};
 
+use bytes::Bytes;
+
 use crate::{
     DatagramChunk, FrameTrace, NaluType, VideoPacket, VideoSlice,
     fec::decode::FecDecoder,
@@ -31,18 +33,12 @@ impl FrameBuilder {
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        if self.is_key {
-            self.keyframe_emitted
-        } else {
-            self.decoded_slices.len() as u8 == self.total_slices
-        }
+        // Теперь условие завершения едино для всех: 
+        // мы выпустили столько слайсов, сколько ожидали.
+        self.next_emit_idx == self.total_slices
     }
 
     pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Option<VideoPacket> {
-        if self.keyframe_emitted {
-            return None;
-        }
-
         let slice_idx = chunk.slice_idx;
 
         {
@@ -62,19 +58,10 @@ impl FrameBuilder {
             return None;
         }
 
-        let video_slice = self.decode_slice(slice_idx)?;
-        self.decoded_slices.insert(slice_idx, video_slice);
-
-        // ── KEYFRAME ─────────────────────────────────────────────
-        if self.is_key {
-            if self.decoded_slices.len() as u8 == self.total_slices {
-                self.keyframe_emitted = true;
-                return self.assemble_keyframe(chunk.frame_id);
-            }
-            return None;
+        if let Some(video_slice) = self.decode_slice(slice_idx) {
+            self.decoded_slices.insert(slice_idx, video_slice);
         }
 
-        // ── NON-KEY: ordered emit ────────────────────────────────
         self.try_emit_ordered(chunk.frame_id)
     }
 
@@ -87,20 +74,15 @@ impl FrameBuilder {
 
         Some(video_slice)
     }
-    fn try_emit_ordered(&mut self, frame_id: u64) -> Option<VideoPacket> {
+    fn try_emit_ordered(&mut self, _frame_id: u64) -> Option<VideoPacket> {
+        // Достаем слайс, который идет следующим по очереди
         let slice = self.decoded_slices.remove(&self.next_emit_idx)?;
-
-        // ⚠️ КРИТИЧНО: только если это действительно slice payload
-        if !matches!(slice.nal_type, NaluType::SliceTrailing) {
-            // пропускаем, но двигаем индекс
-            self.next_emit_idx += 1;
-            return self.try_emit_ordered(frame_id);
-        }
-
+        
+        // Важно: Мы НЕ пропускаем параметры (VPS/SPS/PPS). 
+        // Мы просто превращаем их в VideoPacket и отдаем декодеру.
         let packet = Self::slice_to_packet(slice, self.first_us);
 
         self.next_emit_idx += 1;
-
         Some(packet)
     }
 
@@ -120,35 +102,6 @@ impl FrameBuilder {
             is_last: slice.is_last,
             trace,
         }
-    }
-
-    fn assemble_keyframe(&mut self, frame_id: u64) -> Option<VideoPacket> {
-        let mut ordered: Vec<VideoSlice> = self.decoded_slices.values().cloned().collect();
-        ordered.sort_by_key(|s| (nalu_priority(s.nal_type), s.slice_idx));
-
-        let mut full_payload = Vec::new();
-        let mut final_trace: Option<FrameTrace> = None;
-
-        for slice in ordered {
-            if final_trace.is_none() {
-                final_trace = slice.trace;
-            }
-            full_payload.extend_from_slice(&slice.payload);
-        }
-
-        if let Some(ref mut t) = final_trace {
-            t.receive_us = self.first_us;
-            t.reassembled_us = FrameTrace::now_us();
-        }
-
-        Some(VideoPacket {
-            frame_id,
-            payload: full_payload,
-            slice_idx: 0,
-            is_key: true,
-            is_last: true,
-            trace: final_trace,
-        })
     }
 }
 
