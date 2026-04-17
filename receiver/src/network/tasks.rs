@@ -1,3 +1,5 @@
+use crate::VideoWorkerMsg;
+
 use super::*;
 
 pub(crate) fn spawn_control_writer_task(

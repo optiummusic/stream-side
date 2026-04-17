@@ -30,7 +30,7 @@ pub(crate) use tasks::*;
 #[cfg(target_os = "macos")]
 use crate::backend::macos::MacosFfmpegBackend;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "android"))))]
 use crate::backend::desktop::DesktopFfmpegBackend;
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -74,22 +74,28 @@ pub async fn run_quic_receiver(
 
         log::info!("[QUIC] Connected to {}", conn.remote_address());
 
+        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
+        let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
+        let proxy_clone = proxy.clone();
+        let mut task_handles = Vec::<JoinHandle<()>>::new();
+
         #[cfg(target_os = "macos")]
         let backend = MacosFfmpegBackend::new()?;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "android"))))]
         let backend = DesktopFfmpegBackend::new()?;
 
+        #[cfg(target_os = "android")]
+        let backend = crate::backend::android::AndroidMediaCodecBackend::new();
 
+        let _ = control_tx.send(ControlPacket::RequestKeyFrame).await;
+        
         if let Err(e) = send_identity_and_wait_ack(&conn).await {
             log::warn!("[QUIC] handshake failed: {e}");
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
-        let (control_tx, control_rx) = mpsc::channel::<ControlPacket>(100);
-        let proxy_clone = proxy.clone();
-        let mut task_handles = Vec::<JoinHandle<()>>::new();
+
 
         // Backend task
         let worker_tx = spawn_video_backend_worker(

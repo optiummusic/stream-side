@@ -7,6 +7,7 @@ unsafe extern "C" {}
 #[link(name = "android")]
 unsafe extern "C" {}
 
+use crate::VideoWorkerMsg;
 use tokio::sync::watch;
 use std::ffi::CString;
 use std::ptr;
@@ -20,6 +21,7 @@ use jni::{
     EnvUnowned,
     Env
 };
+use std::sync::mpsc::SyncSender;
 use once_cell::sync::OnceCell;
 use bytes::BytesMut;
 
@@ -28,17 +30,27 @@ use common::FrameTrace;
 // ─────────────────────────────────────────────────────────────────────────────
 // Глобальный синглтон бекенда
 // ─────────────────────────────────────────────────────────────────────────────
-static BACKEND: OnceCell<Arc<Mutex<AndroidMediaCodecBackend>>> = OnceCell::new();
 static NETWORK_RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 static LATEST_LATENCY: Mutex<String> = Mutex::new(String::new());
 static TRACE_TX: OnceCell<watch::Sender<Option<(u64, FrameTrace)>>> = OnceCell::new();
+pub static WORKER_TX: Mutex<Option<SyncSender<VideoWorkerMsg>>> = Mutex::new(None);
+pub static PENDING_SURFACE: Mutex<Option<VideoWorkerMsg>> = Mutex::new(None);
 
 static PENDING_VSYNC_INFO: Mutex<Option<(u64, FrameTrace)>> = Mutex::new(None);
 
-fn get_or_create_backend() -> Arc<Mutex<AndroidMediaCodecBackend>> {
-    BACKEND
-        .get_or_init(|| Arc::new(Mutex::new(AndroidMediaCodecBackend::new())))
-        .clone()
+fn send_to_worker(msg: VideoWorkerMsg) {
+    if let Ok(guard) = WORKER_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(msg);
+            return;
+        }
+    }
+    // Воркер ещё не запущен — сохраняем InitSurface для последующей отправки
+    if matches!(msg, VideoWorkerMsg::InitSurface { .. }) {
+        if let Ok(mut p) = PENDING_SURFACE.lock() {
+            *p = Some(msg);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,8 +104,107 @@ impl AndroidMediaCodecBackend {
             self.pts_to_frame.clear();
         }
     }
+}
 
-    pub unsafe fn init_with_surface(
+// ─────────────────────────────────────────────────────────────────────────────
+// Реализация трейта VideoBackend
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_AGE_PUSH: f64 = 75.0;
+const MAX_AGE_POLL: f64 = 150.0; // Pre Poll
+const CRITICAL_AGE_FLUSH: f64 = 300.0;
+
+impl VideoBackend for AndroidMediaCodecBackend {
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+        let Some(state) = self.state.as_ref() else {
+                return Ok(PushStatus::Accumulating); // Surface ещё не пришёл — тихо ждём
+        };
+        // Drop old chunks
+        if let Some(t) = &trace {
+            let age_ms = FrameTrace::ms(t.receive_us, FrameTrace::now_us());
+
+            if age_ms > CRITICAL_AGE_FLUSH {
+                self.flush_decoder();
+                return Ok(PushStatus::Dropped { age: Some(age_ms as f32) });
+            }
+
+            if age_ms > MAX_AGE_PUSH {
+                return Ok(PushStatus::Dropped{age: Some(age_ms as f32)});
+            }
+        }
+
+        let pts_us = FrameTrace::now_us(); 
+        unsafe {
+            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2000);
+            if idx < 0 { return Ok(PushStatus::Dropped { age: None }); } 
+
+            let mut buf_size: usize = 0;
+            let buf_ptr = ndk_sys::AMediaCodec_getInputBuffer(state.codec, idx as usize, &mut buf_size);
+            let copy_len = payload.len().min(buf_size);
+            ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr, copy_len);
+
+            if let Some(mut t) = trace {
+                t.decode_us = pts_us;
+                self.pts_to_frame.insert(pts_us, (frame_id, t));
+            }
+
+            ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, pts_us, 0);
+        }
+        Ok(PushStatus::Accepted)
+    }
+
+    fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(FrameOutput::Pending); // Surface ещё не пришёл — тихо ждём
+        };
+        
+        unsafe {
+            let mut info = ndk_sys::AMediaCodecBufferInfo { offset: 0, size: 0, presentationTimeUs: 0, flags: 0 };
+            let idx = ndk_sys::AMediaCodec_dequeueOutputBuffer(state.codec, &mut info, 0);
+
+            if idx >= 0 {
+                let pts = info.presentationTimeUs as u64;
+                if let Some((id, t)) = self.pts_to_frame.remove(&pts) {
+                    let age = FrameTrace::ms(t.decode_us, FrameTrace::now_us());
+
+                    if age > MAX_AGE_POLL {
+                        ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
+                        return Ok(FrameOutput::Dropped { age: Some(age as f32) });
+                    }
+
+                    if let Ok(mut pending) = PENDING_VSYNC_INFO.lock() {
+                        *pending = Some((id, t));
+                    }
+
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
+                    Ok(FrameOutput::DirectToSurface)
+                } else {
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
+                    Ok(FrameOutput::Dropped { age: None })
+                }
+            } else {
+                Ok(FrameOutput::Pending)
+            }
+        }
+    }
+    fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
+        &mut self.current_trace
+    }
+    fn get_slice_buffer(&mut self) -> &mut BytesMut {
+        &mut self.slice_buffer
+    }
+
+    fn clear_buffer(&mut self) {
+        self.get_slice_buffer().clear();
+        self.get_current_trace().take();
+    }
+
+    fn shutdown(&mut self) {
+        self.state = None;
+        self.pts_to_frame.clear();
+    }
+
+        
+    unsafe fn init_with_surface(
         &mut self,
         native_window: *mut ndk_sys::ANativeWindow,
         width:         i32,
@@ -171,100 +282,6 @@ impl AndroidMediaCodecBackend {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Реализация трейта VideoBackend
-// ─────────────────────────────────────────────────────────────────────────────
-const MAX_AGE_PUSH: f64 = 75.0;
-const MAX_AGE_POLL: f64 = 150.0; // Pre Poll
-const CRITICAL_AGE_FLUSH: f64 = 300.0;
-
-impl VideoBackend for AndroidMediaCodecBackend {
-    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
-
-        // Drop old chunks
-        if let Some(t) = &trace {
-            let age_ms = FrameTrace::ms(t.receive_us, FrameTrace::now_us());
-
-            if age_ms > CRITICAL_AGE_FLUSH {
-                self.flush_decoder();
-                return Ok(PushStatus::Dropped { age: Some(age_ms as f32) });
-            }
-
-            if age_ms > MAX_AGE_PUSH {
-                return Ok(PushStatus::Dropped{age: Some(age_ms as f32)});
-            }
-        }
-        let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
-        let pts_us = FrameTrace::now_us(); 
-        unsafe {
-            let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2000);
-            if idx < 0 { return Ok(PushStatus::Dropped { age: None }); } 
-
-            let mut buf_size: usize = 0;
-            let buf_ptr = ndk_sys::AMediaCodec_getInputBuffer(state.codec, idx as usize, &mut buf_size);
-            let copy_len = payload.len().min(buf_size);
-            ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr, copy_len);
-
-            if let Some(mut t) = trace {
-                t.decode_us = pts_us;
-                self.pts_to_frame.insert(pts_us, (frame_id, t));
-            }
-
-            ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, pts_us, 0);
-        }
-        Ok(PushStatus::Accepted)
-    }
-
-    fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {
-        let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
-        
-        unsafe {
-            let mut info = ndk_sys::AMediaCodecBufferInfo { offset: 0, size: 0, presentationTimeUs: 0, flags: 0 };
-            let idx = ndk_sys::AMediaCodec_dequeueOutputBuffer(state.codec, &mut info, 0);
-
-            if idx >= 0 {
-                let pts = info.presentationTimeUs as u64;
-                if let Some((id, t)) = self.pts_to_frame.remove(&pts) {
-                    let age = FrameTrace::ms(t.decode_us, FrameTrace::now_us());
-
-                    if age > MAX_AGE_POLL {
-                        ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
-                        return Ok(FrameOutput::Dropped { age: Some(age as f32) });
-                    }
-
-                    if let Ok(mut pending) = PENDING_VSYNC_INFO.lock() {
-                        *pending = Some((id, t));
-                    }
-
-                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
-                    Ok(FrameOutput::DirectToSurface)
-                } else {
-                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
-                    Ok(FrameOutput::Dropped { age: None })
-                }
-            } else {
-                Ok(FrameOutput::Pending)
-            }
-        }
-    }
-    fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
-        &mut self.current_trace
-    }
-    fn get_slice_buffer(&mut self) -> &mut BytesMut {
-        &mut self.slice_buffer
-    }
-
-    fn clear_buffer(&mut self) {
-        self.get_slice_buffer().clear();
-        self.get_current_trace().take();
-    }
-
-    fn shutdown(&mut self) {
-        self.state = None;
-        self.pts_to_frame.clear();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // JNI EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -277,26 +294,19 @@ pub extern "C" fn Java_com_example_streamreceiver_NativeLib_initBackend(
     height:  jint,
 ) {
     let _ = std::panic::catch_unwind(|| {
+        log::info!("[JNI] initBackend called");
         let native_window = unsafe {
-            // Передаем сырой C-указатель напрямую в NDK
-            ndk_sys::ANativeWindow_fromSurface(
-                env as *mut _, 
-                surface.as_raw() as *mut _,
-            )
+            ndk_sys::ANativeWindow_fromSurface(env as *mut _, surface.as_raw() as *mut _)
         };
-
-        if native_window.is_null() {
-            log::error!("[JNI] ANativeWindow_fromSurface returned null!");
-            return;
-        }
-
-        let backend = get_or_create_backend();
-        let mut guard = backend.lock().unwrap();
-
-        match unsafe { guard.init_with_surface(native_window, width, height) } {
-            Ok(())   => log::info!("[JNI] initBackend OK"),
-            Err(e)   => log::error!("[JNI] initBackend failed: {e}"),
-        }
+        log::info!("[JNI] native_window is_null: {}", native_window.is_null());
+        if native_window.is_null() { return; }
+        unsafe { ndk_sys::ANativeWindow_acquire(native_window); }
+        
+        let worker_exists = WORKER_TX.lock().map(|g| g.is_some()).unwrap_or(false);
+        log::info!("[JNI] WORKER_TX exists: {}", worker_exists);
+        
+        send_to_worker(VideoWorkerMsg::InitSurface { window: native_window, width, height });
+        log::info!("[JNI] InitSurface sent");
     });
 }
 
@@ -311,8 +321,6 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
     let host_str = unowned_env
         .with_env(|env: &mut Env| env.get_string(&host).map(String::from))
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
-
-    let backend = get_or_create_backend();
 
     std::thread::spawn(move || {
         // Останавливаем предыдущий runtime если он ещё жив
@@ -349,7 +357,7 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
             handle.block_on(async move {
                 // run_quic_receiver — бесконечный reconnect-loop
                 // frame_tx = None: кадры рендерятся прямо в Surface
-                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None, trace_rx, None).await {
+                if let Err(e) = crate::network::run_quic_receiver(addr, None, trace_rx, None).await {
                     log::error!("[Network] Fatal: {}", e);
                 }
             });
@@ -381,10 +389,8 @@ pub extern "C" fn Java_com_example_streamreceiver_NativeLib_shutdownBackend(
     _class: JClass,
 ) {
     let _ = std::panic::catch_unwind(|| {
-        if let Some(backend) = BACKEND.get() {
-            backend.lock().unwrap().shutdown();
-            log::info!("[JNI] shutdownBackend OK");
-        }
+        send_to_worker(VideoWorkerMsg::Shutdown);
+        log::info!("[JNI] Shutdown command sent to worker");
     });
 }
 

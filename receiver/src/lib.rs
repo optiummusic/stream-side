@@ -12,6 +12,22 @@ pub mod backend;
 pub mod network;
 pub mod types;
 pub mod platform;
+
+pub(crate) enum VideoWorkerMsg {
+    Push(VideoPacket),
+    PollDecoder,
+    Shutdown,
+    
+    #[cfg(target_os = "android")]
+    InitSurface {
+        window: *mut ndk_sys::ANativeWindow,
+        width: i32,
+        height: i32,
+    },
+}
+
+unsafe impl Send for VideoWorkerMsg {}
+
 // Android-инициализация логгера выполняется при загрузке библиотеки
 #[cfg(target_os = "android")]
 #[allow(non_snake_case)]

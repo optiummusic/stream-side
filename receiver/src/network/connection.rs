@@ -1,17 +1,14 @@
 use std::sync::mpsc::{SyncSender, sync_channel};
 use common::fec::assembler::FrameAssembler;
 
+use crate::VideoWorkerMsg;
+
 use super::*;
 
 pub(crate) struct VideoState {
     pub waiting_for_key: bool,
     pub expected_frame_id: Option<u64>,
     pub expected_slice_idx: u8,
-}
-
-pub(crate) enum VideoWorkerMsg {
-    Push(VideoPacket),
-    PollDecoder,
 }
 
 pub(crate) fn spawn_video_backend_worker<B: VideoBackend>(
@@ -26,6 +23,22 @@ where
 {
     let (tx, rx) = sync_channel::<VideoWorkerMsg>(1024);
 
+    #[cfg(target_os = "android")]
+    if let Ok(mut guard) = crate::backend::android::WORKER_TX.lock() {
+        *guard = Some(tx.clone());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        log::info!("[Worker] Checking PENDING_SURFACE on spawn");
+        if let Ok(mut pending) = crate::backend::android::PENDING_SURFACE.lock() {
+            log::info!("[Worker] PENDING_SURFACE is_some: {}", pending.is_some());
+            if let Some(msg) = pending.take() {
+                let _ = tx.send(msg);
+                log::info!("[Worker] Sent pending InitSurface to worker");
+            }
+        }
+    }
     std::thread::spawn(move || {
         let mut state = VideoState {
             waiting_for_key: true,
@@ -106,6 +119,21 @@ where
                                 });
                                 break;
                             }
+                        }
+                    }
+                },
+                VideoWorkerMsg::Shutdown => {
+                    backend.shutdown();
+                    break;
+                }
+
+                #[cfg(target_os = "android")]
+                VideoWorkerMsg::InitSurface { window, width, height } => {
+                    log::info!("[Worker] Got InitSurface {}x{}", width, height);
+                    unsafe {
+                        match backend.init_with_surface(window, width, height) {
+                            Ok(()) => log::info!("[Worker] init_with_surface OK"),
+                            Err(e) => log::error!("[Worker] init_with_surface FAILED: {:?}", e),
                         }
                     }
                 }

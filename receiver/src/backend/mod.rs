@@ -182,6 +182,15 @@ pub trait VideoBackend: Send + 'static {
     /// Освободить все ресурсы (codec, surface, GPU handles).
     /// Безопасно вызывать несколько раз.
     fn shutdown(&mut self);
+
+    #[cfg(target_os = "android")]
+    unsafe fn init_with_surface(
+        &mut self, 
+        _window: *mut ndk_sys::ANativeWindow, 
+        _width: i32, 
+        _height: i32
+    ) -> Result<(), BackendError>;
+    
 }
 
 // ─────────────────────────────────────────
