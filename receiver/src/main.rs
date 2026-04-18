@@ -926,6 +926,8 @@ impl ApplicationHandler<UserEvent> for App {
                             DecodedFrame::Yuv(f) => (f.frame_id, f.trace),
                             #[cfg(target_os = "linux")]
                             DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                            #[cfg(target_os = "macos")]
+                            DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                         };
 
                         match decoded {
@@ -933,6 +935,12 @@ impl ApplicationHandler<UserEvent> for App {
                             #[cfg(target_os = "linux")]
                             DecodedFrame::DmaBuf(frame) => {
                                 if !state.update_textures_dmabuf(&frame) { return; }
+                            }
+                            
+                            #[cfg(target_os = "macos")]
+                            DecodedFrame::DmaBuf(_frame) => {
+                                log::warn!("[Render] DMA-BUF frame received on non-Linux build");
+                                return;
                             }
                         }
 
