@@ -373,6 +373,7 @@ fn run_encoder_loop(
                             }
                         }
                     }
+
                 };
 
                 // Возвращаем CPU-буфер в пул
@@ -437,6 +438,7 @@ fn run_encoder_loop(
                     (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
                 }
                 if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame) >= 0 {
+
                     let mut pkt = ffmpeg::Packet::empty();
                     while encoder.receive_packet(&mut pkt).is_ok() {
                         let original_capture_us = pkt.pts().unwrap_or(0) as u64;
@@ -810,9 +812,13 @@ unsafe fn encode_dmabuf_to_vaapi(
     }
 
     // ── Формируем AVDRMFrameDescriptor ──────────────────────────────────────
+    let safe_fd = unsafe { libc::dup(fd) };
+    if safe_fd < 0 {
+        return None;
+    }
     let mut desc: AVDRMFrameDescriptor = unsafe { std::mem::zeroed() };
     desc.nb_objects = 1;
-    desc.objects[0].fd = fd;
+    desc.objects[0].fd = safe_fd;
     desc.objects[0].size = (stride * height) as usize;
     desc.objects[0].format_modifier = modifier;
     desc.nb_layers = 1;
