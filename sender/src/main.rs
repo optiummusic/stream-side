@@ -10,18 +10,19 @@
 //! cargo run --bin sender -- 0.0.0.0:9999
 //! ```
 //!
-//! Receivers (desktop / Android) connect to `<machine-ip>:<port>`.
+//! На wlroots-композиторах (Sway, Hyprland) автоматически используется
+//! `zwlr_screencopy_manager_v1`. На остальных — XDG Portal + PipeWire.
 
 use std::{env, net::SocketAddr, sync::Arc};
 use sender::{
-    capture::{VideoSender, linux::LinuxPipeWireSender}, network::QuicServer,
+    capture::{VideoSender, LinuxSender},
+    network::QuicServer,
 };
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    // Install the rustls crypto provider exactly once.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
@@ -48,11 +49,11 @@ async fn main() {
 
     // ── Capture + encode ─────────────────────────────────────────────────────
     //
-    // `LinuxPipeWireSender` is the concrete VideoSender implementation for Linux.
-    // Swap it for `WindowsSender` or `AndroidSender` on other platforms without
-    // touching any other code.
+    // LinuxSender автоматически выбирает бэкенд:
+    //   • wlroots-compositor  → WlrootsSender  (zwlr_screencopy, низкая latency)
+    //   • иначе               → LinuxPipeWireSender (XDG Portal + PipeWire)
 
-    let sender = LinuxPipeWireSender::new(1, 1, idr_rx);
+    let sender = LinuxSender::new(1, 1, idr_rx);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
