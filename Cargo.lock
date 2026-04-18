@@ -1715,6 +1715,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memfd"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "memmap2"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3027,6 +3036,7 @@ dependencies = [
  "ffmpeg-next",
  "libc",
  "log",
+ "memfd",
  "pipewire",
  "pollster",
  "postcard",
@@ -3036,6 +3046,8 @@ dependencies = [
  "serde",
  "socket2",
  "tokio",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "wgpu",
  "winit",
 ]
