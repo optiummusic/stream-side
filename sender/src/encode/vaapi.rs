@@ -398,7 +398,6 @@ fn run_encoder_loop(
                 if last_hw_frame.is_null() {
                     continue; // Ещё не было ни одного успешного кадра
                 }
-                log::info!("[Encoder] No new frames for 100ms, sending P-Skip duplicate");
                 // Проверяем запрос IDR даже во время простоя!
                 if idr_rx.has_changed().unwrap_or(false) {
                     if *idr_rx.borrow_and_update() == true {

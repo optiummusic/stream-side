@@ -335,7 +335,6 @@ fn run_encoder_loop(
                 if last_hw_frame.is_null() {
                     continue; // Ещё не было ни одного успешного кадра
                 }
-                log::info!("[Encoder] No new frames for 100ms, sending P-Skip duplicate");
                 // Проверяем запрос IDR даже во время простоя!
                 if idr_rx.has_changed().unwrap_or(false) {
                     if *idr_rx.borrow_and_update() == true {
@@ -378,10 +377,6 @@ fn run_encoder_loop(
                     let mut pkt = ffmpeg::Packet::empty();
                     while encoder.receive_packet(&mut pkt).is_ok() {
                         let original_capture_us = pkt.pts().unwrap_or(0) as u64;
-
-                        let mut trace      = FrameTrace::default();
-                        trace.capture_us   = original_capture_us;
-                        trace.encode_us    = FrameTrace::now_us();
 
                         let is_key = pkt.is_key();
 
