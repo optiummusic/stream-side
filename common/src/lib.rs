@@ -214,7 +214,7 @@ pub fn detect_gpu_vendor() -> GpuVendor {
         if let Ok(class_key) = hklm.open_subkey(path) {
             for name in class_key.enum_keys().filter_map(|x| x.ok()) {
                 if let Ok(sub_key) = class_key.open_subkey(&name) {
-                    if let Ok(device_id) = sub_key.get_value("MatchingDeviceId") {
+                    if let Ok(device_id) = sub_key.get_value::<String, _>("MatchingDeviceId") {
                         let id = device_id.to_uppercase();
                         if id.contains("VEN_1002") { return GpuVendor::Amd; }
                         if id.contains("VEN_8086") { return GpuVendor::Intel; }
