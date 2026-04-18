@@ -241,83 +241,126 @@ fn run_encoder_loop(
     let mut nv12_frame = Video::new(Pixel::NV12, width, height);
     let mut force_idr = false;
 
+    let mut last_hw_frame: *mut AVFrame = std::ptr::null_mut();
+    
     loop {
-        let (mut frame_data, mut capture_us) = match rx.recv() {
-            Ok(v)  => v,
-            Err(_) => break,
-        };
+        let hw_frame_opt: Option<*mut AVFrame> = match rx.recv_timeout(std::time::Duration::from_millis(100)) { // Starvation = give frames at 10 FPS pace
+            Ok((mut frame_data, mut capture_us)) => {
+                // Дренируем канал: берём самый свежий кадр
+                while let Ok(newer) = rx.try_recv() {
+                    match frame_data {
+                        FrameData::Bgra{data: buf, ..} => { let _ = free_tx.send(buf); }
+                        FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
+                    }
+                    frame_data  = newer.0;
+                    capture_us  = newer.1;
+                }
 
-        // Дренируем канал: берём самый свежий кадр.
-        while let Ok(newer) = rx.try_recv() {
-            match frame_data {
-                FrameData::Bgra{ data: buf, ..} => { let _ = free_tx.send(buf); }
-                FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
-            }
-            frame_data  = newer.0;
-            capture_us  = newer.1;
-        }
-
-        if idr_rx.has_changed().unwrap_or(false) {
-            if *idr_rx.borrow_and_update() == true {
-                force_idr = true;
-            }
-        }
-
-        // Получаем VAAPI hw_frame в зависимости от типа входа.
-        let hw_frame_opt: Option<*mut AVFrame> = unsafe {
-            match frame_data {
-                FrameData::Bgra{ data: ref bgra, stride } => {
-                    let src_stride = if stride == 0 { (width * 4) as usize } else { stride as usize };
-                    let dst_stride = src_frame.stride(0);
-                    let row_bytes = (width * 4) as usize;
-                    let rows = height as usize;
-                    let src_plane = bgra;
-                    let dst_plane = src_frame.data_mut(0);
-
-                    if src_stride < row_bytes
-                        || dst_stride < row_bytes
-                        || src_plane.len() < src_stride.saturating_mul(rows)
-                        || dst_plane.len() < dst_stride.saturating_mul(rows)
-                    {
-                        log::warn!(
-                            "[Encoder] Invalid BGRA stride/buffer: src_stride={}, dst_stride={}, row_bytes={}, src_len={}, dst_len={}",
-                            src_stride,
-                            dst_stride,
-                            row_bytes,
-                            src_plane.len(),
-                            dst_plane.len(),
-                        );
-                        None
-                    } else {
-                        for y in 0..rows {
-                            let src_off = y * src_stride;
-                            let dst_off = y * dst_stride;
-                            dst_plane[dst_off..dst_off + row_bytes]
-                                .copy_from_slice(&src_plane[src_off..src_off + row_bytes]);
-                        }
-
-                        if scaler.run(&src_frame, &mut nv12_frame).is_err() {
-                            None
-                        } else {
-                            nv12_frame.set_pts(Some(capture_us as i64));
-                            clone_nv12_frame_owned(nv12_frame.as_ptr(), capture_us)
-                        }
+                if idr_rx.has_changed().unwrap_or(false) {
+                    if *idr_rx.borrow_and_update() == true {
+                        force_idr = true;
                     }
                 }
-                FrameData::DmaBuf { fd, stride, offset, modifier } => {
-                    log::debug!("[Encoder] NVENC path received DMA-BUF; dropping frame (CPU copy path expected)");
-                    libc::close(fd);
-                    None
 
-                    // TODO - implement DmaBuf receival by NVIDIA
+                // Получаем VAAPI hw_frame
+                let frame = unsafe {
+                    match frame_data {
+                        FrameData::Bgra{ data: ref bgra, stride } => {
+                            let src_stride = if stride == 0 { (width * 4) as usize } else { stride as usize };
+                            let dst_stride = src_frame.stride(0);
+                            let row_bytes = (width * 4) as usize;
+                            let rows = height as usize;
+                            let src_plane = bgra;
+                            let dst_plane = src_frame.data_mut(0);
+
+                            if src_stride < row_bytes
+                                || dst_stride < row_bytes
+                                || src_plane.len() < src_stride.saturating_mul(rows)
+                                || dst_plane.len() < dst_stride.saturating_mul(rows)
+                            {
+                                log::warn!(
+                                    "[Encoder] Invalid BGRA stride/buffer: src_stride={}, dst_stride={}, row_bytes={}, src_len={}, dst_len={}",
+                                    src_stride,
+                                    dst_stride,
+                                    row_bytes,
+                                    src_plane.len(),
+                                    dst_plane.len(),
+                                );
+                                None
+                            } else {
+                                for y in 0..rows {
+                                    let src_off = y * src_stride;
+                                    let dst_off = y * dst_stride;
+                                    dst_plane[dst_off..dst_off + row_bytes]
+                                        .copy_from_slice(&src_plane[src_off..src_off + row_bytes]);
+                                }
+
+                                if scaler.run(&src_frame, &mut nv12_frame).is_err() {
+                                    None
+                                } else {
+                                    nv12_frame.set_pts(Some(capture_us as i64));
+                                    clone_nv12_frame_owned(nv12_frame.as_ptr(), capture_us)
+                                }
+                            }
+                        }
+                        FrameData::DmaBuf { fd, stride, offset, modifier } => {
+                            log::debug!("[Encoder] NVENC path received DMA-BUF; dropping frame (CPU copy path expected)");
+                            libc::close(fd);
+                            None
+                            // TODO - implement DmaBuf receival by NVIDIA
+                        }
+                    }
+                };
+
+                // Возвращаем CPU-буфер в пул
+                if let FrameData::Bgra {data: buf, stride: _} = frame_data {
+                    let _ = free_tx.send(buf);
+                }
+
+                // ДОБАВЛЕНО: Сохраняем ссылку на кадр для генерации дубликатов
+                if let Some(f) = frame {
+                    unsafe {
+                        if !last_hw_frame.is_null() {
+                            av_frame_free(&mut last_hw_frame);
+                        }
+                        // Делаем zero-copy клон (просто инкремент refcount для AVBufferRef)
+                        last_hw_frame = av_frame_clone(f);
+                    }
+                }
+
+                frame
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // ДОБАВЛЕНО: WATCHDOG. Прошло 100мс без кадров (статичный экран Wayland)
+                if last_hw_frame.is_null() {
+                    continue; // Ещё не было ни одного успешного кадра
+                }
+                log::info!("[Encoder] No new frames for 100ms, sending P-Skip duplicate");
+                // Проверяем запрос IDR даже во время простоя!
+                if idr_rx.has_changed().unwrap_or(false) {
+                    if *idr_rx.borrow_and_update() == true {
+                        force_idr = true;
+                    }
+                }
+
+                unsafe {
+                    let dup = av_frame_clone(last_hw_frame);
+                    if dup.is_null() { continue; }
+                    
+                    // Обновляем таймстемп
+                    (*dup).pts = FrameTrace::now_us() as i64;
+                    
+                    // Если нет запроса на IDR, гарантируем, что это будет обычный P-Skip
+                    if !force_idr {
+                        (*dup).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
+                        (*dup).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                    }
+                    
+                    Some(dup)
                 }
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-
-        // Возвращаем CPU-буфер в пул.
-        if let FrameData::Bgra { data: buf, .. } = frame_data {
-            let _ = free_tx.send(buf);
-        }
 
         // Отправляем hw_frame в кодек.
         if let Some(mut hw_frame) = hw_frame_opt {
