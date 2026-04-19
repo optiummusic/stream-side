@@ -43,7 +43,8 @@ pub(crate) fn spawn_control_writer_task(
                     let dgram = DatagramChunk::encode(
                          0, 0, 1, 0, 1, 0, 
                         bytes.len() as u16, 
-                        TYPE_CONTROL, 0, &bytes
+                        TYPE_CONTROL, 0, 
+                        0, 0, &bytes
                     );
                     let _ = conn.send_datagram(dgram);
                 }
@@ -94,7 +95,8 @@ pub(crate) fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
                 let dgram = DatagramChunk::encode(
                     0, 0, 1, 0, 1, 0, 
                     bytes.len() as u16, 
-                    TYPE_CONTROL, 0, &bytes
+                    TYPE_CONTROL, 0, 
+                    0, 0, &bytes
                 );
                 let _ = conn.send_datagram(dgram);
             }

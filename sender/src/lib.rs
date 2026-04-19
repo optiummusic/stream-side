@@ -8,7 +8,7 @@ pub mod encode;
 
 
 pub mod network;
-use std::{collections::HashMap, sync::atomic::AtomicBool, time::Duration};
+use std::{collections::{HashMap, VecDeque}, sync::atomic::AtomicBool, time::Duration};
 
 use bytes::Bytes;
 use common::DatagramChunk;
@@ -111,51 +111,52 @@ impl FramePacer {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Shard cache — retransmission buffer
-// ─────────────────────────────────────────────────────────────────────────────
  
-/// How many recent frames to keep in the retransmission cache.
-/// At 60 fps this is ~500 ms of history — enough to cover any reasonable RTT
-/// while not consuming much memory (most frames are a few KB after FEC).
-const SHARD_CACHE_FRAMES: usize = 60;
+pub const HDR_SLICE_IDX:    usize = 8;
+pub const HDR_GROUP_IDX:    usize = 17;
+pub const HDR_SHARD_IDX:    usize = 10;
+pub const HEADER_LEN:       usize = 19;
  
-/// Ring-buffer cache of recently sent shards, keyed by frame_id.
-///
-/// Layout: `frame_id → slice_idx → Vec<encoded shard Bytes>` (one entry per
-/// shard, already wire-formatted and ready to `send_datagram`).
-///
-/// When the cache is full (> SHARD_CACHE_FRAMES distinct frame IDs) the oldest
-/// entry is evicted, which is correct because those frames have already been
-/// decoded or skipped on the receiver.
+// ── Cache parameters ──────────────────────────────────────────────────────────
+ 
+/// How many distinct frame IDs to keep in the retransmit cache.
+const SHARD_CACHE_FRAMES: usize = 32;
+ 
+// ── ShardCache ────────────────────────────────────────────────────────────────
+//
+// Stores raw datagram bytes keyed by (frame_id → (slice_idx, group_idx) → shards)
+// so the sender can retransmit exactly the missing shards of a specific FEC group.
+ 
 pub struct ShardCache {
-    // Внутреннее состояние теперь защищено
     inner: std::sync::RwLock<CacheInner>,
 }
-
+ 
 struct CacheInner {
-    order: std::collections::VecDeque<u64>,
-    data: HashMap<u64, HashMap<u8, Vec<Bytes>>>,
+    /// Insertion-order tracking for LRU eviction.
+    order: VecDeque<u64>,
+    /// frame_id → (slice_idx, group_idx) → raw datagram bytes
+    data: HashMap<u64, HashMap<(u8, u8), Vec<Bytes>>>,
 }
-
+ 
 impl ShardCache {
     pub fn new() -> Self {
         Self {
             inner: std::sync::RwLock::new(CacheInner {
-                order: std::collections::VecDeque::with_capacity(SHARD_CACHE_FRAMES + 1),
+                order: VecDeque::with_capacity(SHARD_CACHE_FRAMES + 1),
                 data: HashMap::new(),
             }),
         }
     }
-
+ 
+    /// Insert a batch of raw datagram bytes for a frame.
+    ///
+    /// Each datagram is parsed for `slice_idx` and `group_idx` using the
+    /// fixed wire-format offsets; no full deserialisation is required.
     pub fn insert(&self, frame_id: u64, datagrams: &[Bytes]) {
         let mut inner = self.inner.write().unwrap();
-        
-        // 1. Проверяем, есть ли уже этот кадр в кэше
+ 
         let is_new_frame = !inner.data.contains_key(&frame_id);
-
         if is_new_frame {
-            // 2. Очистка старых кадров только если кадр реально новый
             if inner.order.len() >= SHARD_CACHE_FRAMES {
                 if let Some(old_id) = inner.order.pop_front() {
                     inner.data.remove(&old_id);
@@ -163,33 +164,55 @@ impl ShardCache {
             }
             inner.order.push_back(frame_id);
         }
-
-        // 3. Добавляем слайсы (NALU) в существующий или новый кадр
-        let slice_map = inner.data.entry(frame_id).or_default();
+ 
+        let frame_map = inner.data.entry(frame_id).or_default();
+ 
         for dgram in datagrams {
-            // Оптимизация: вместо полного decode, нам нужен только slice_idx
-            // В твоем DatagramChunk он на 8-й позиции
-            if dgram.len() >= DatagramChunk::HEADER_LEN {
-                let slice_idx = dgram[8]; 
-                slice_map.entry(slice_idx).or_default().push(dgram.clone());
+            if dgram.len() < HEADER_LEN {
+                continue;
             }
+            let slice_idx = dgram[HDR_SLICE_IDX];
+            let group_idx = dgram[HDR_GROUP_IDX];
+            frame_map
+                .entry((slice_idx, group_idx))
+                .or_default()
+                .push(dgram.clone());
         }
     }
-
-    pub fn retransmit(&self, frame_id: u64, slice_idx: u8, received_mask: u64) -> Vec<Bytes> {
-        let inner = self.inner.read().unwrap(); // Параллельный доступ для чтения
+ 
+    /// Return the subset of shards for `(frame_id, slice_idx, group_idx)` that
+    /// the receiver has **not** yet received, as indicated by `received_mask`
+    /// (bit `i` set → shard `i` already arrived at the receiver).
+    ///
+    /// Returns an empty vec on cache miss (frame too old or never cached).
+    pub fn retransmit(
+        &self,
+        frame_id: u64,
+        slice_idx: u8,
+        group_idx: u8,
+        received_mask: u64,
+    ) -> Vec<Bytes> {
+        let inner = self.inner.read().unwrap();
         let mut out = Vec::new();
-        
-        let Some(slices) = inner.data.get(&frame_id) else { return out; };
-        let Some(shards) = slices.get(&slice_idx) else { return out; };
-
+ 
+        let Some(frame_map) = inner.data.get(&frame_id) else {
+            return out;
+        };
+        let Some(shards) = frame_map.get(&(slice_idx, group_idx)) else {
+            return out;
+        };
+ 
         for dgram in shards {
-            if dgram.len() < DatagramChunk::HEADER_LEN { continue; }
-            let shard_idx = dgram[10]; 
+            if dgram.len() < HEADER_LEN {
+                continue;
+            }
+            let shard_idx = dgram[HDR_SHARD_IDX];
+            // Only retransmit shards the receiver has not acknowledged.
             if (received_mask >> shard_idx) & 1 == 0 {
                 out.push(dgram.clone());
             }
         }
+ 
         out
     }
 }

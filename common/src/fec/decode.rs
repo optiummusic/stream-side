@@ -1,11 +1,13 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
+use bytes::Bytes;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use super::*;
 
 thread_local! {
-    static RS_CACHE: RefCell<HashMap<(u8, u8), ReedSolomon>> = RefCell::new(HashMap::new());
+    static RS_CACHE: RefCell<HashMap<(u8, u8), ReedSolomon>> =
+        RefCell::new(HashMap::new());
 }
 
 pub struct FecDecoder;
@@ -14,37 +16,58 @@ impl FecDecoder {
     pub fn decode(
         k: u8,
         m: u8,
-        mut shards: Vec<Option<Vec<u8>>>,
+        shards: &[Option<Bytes>],
         payload_lens: &[u16],
     ) -> Option<Vec<u8>> {
-        if shards.len() < k as usize { return None; }
+        let k_usize = k as usize;
+        let total = (k + m) as usize;
 
-        let has_missing_data = shards.iter().take(k as usize).any(|s| s.is_none());
-
-        if has_missing_data {
-            let rs = RS_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                cache.entry((k, m))
-                    .or_insert_with(|| ReedSolomon::new(k as usize, m as usize).unwrap())
-                    .clone()
-            });
-            rs.reconstruct(&mut shards).ok()?;
+        if shards.len() < total || payload_lens.len() < k_usize {
+            return None;
         }
 
-        // Определяем общий размер данных, отсекая padding
-        let mut total_size = 0;
-        for i in 0..(k as usize) {
-            total_size += payload_lens[i] as usize;
+        let present = shards.iter().filter(|s| s.is_some()).count();
+        if present < k_usize {
+            return None;
         }
 
-        let mut recovered_data = Vec::with_capacity(total_size);
-        for i in 0..(k as usize) {
-            let shard = shards[i].as_ref()?;
-            let len = payload_lens[i] as usize;
-            let limit = len.min(shard.len());
-            recovered_data.extend_from_slice(&shard[..limit]);
+        // Fast path: all data shards are already present, no RS reconstruct needed.
+        let all_data_present = shards.iter().take(k_usize).all(|s| s.is_some());
+        if all_data_present {
+            let mut out = Vec::with_capacity(payload_lens.iter().map(|&l| l as usize).sum());
+
+            for i in 0..k_usize {
+                let shard = shards[i].as_ref()?;
+                let len = (payload_lens[i] as usize).min(shard.len());
+                out.extend_from_slice(&shard[..len]);
+            }
+
+            return Some(out);
         }
 
-        Some(recovered_data)
+        // Slow path: copy only the available shards into mutable buffers and reconstruct.
+        let mut temp: Vec<Option<Vec<u8>>> = shards
+            .iter()
+            .map(|s| s.as_ref().map(|b| b.to_vec()))
+            .collect();
+
+        RS_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let rs = cache
+                .entry((k, m))
+                .or_insert_with(|| ReedSolomon::new(k as usize, m as usize).unwrap());
+
+            rs.reconstruct(&mut temp).ok()
+        })?;
+
+        let mut out = Vec::with_capacity(payload_lens.iter().map(|&l| l as usize).sum());
+
+        for i in 0..k_usize {
+            let shard = temp[i].as_ref()?;
+            let len = (payload_lens[i] as usize).min(shard.len());
+            out.extend_from_slice(&shard[..len]);
+        }
+
+        Some(out)
     }
 }

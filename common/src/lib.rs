@@ -90,12 +90,14 @@ pub struct DatagramChunk {
     pub payload_len:  u16, // Реальный размер данных (нужно для отрезания нулей из-за паддинга FEC)
     pub packet_type:  u8,
     pub flags:        u8,
+    pub group_idx:    u8,
+    pub total_groups: u8,
     pub data:         Bytes,
 }
 
 impl DatagramChunk {
     /// Fixed header size in bytes.
-    pub const HEADER_LEN: usize = 17; // 8 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
+    pub const HEADER_LEN: usize = 19; // 8 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 1 + 1
 
     // ── Encoding ─────────────────────────────────────────────────────────────
 
@@ -106,7 +108,7 @@ impl DatagramChunk {
     #[inline]
     pub fn encode(
         frame_id: u64, slice_idx: u8, total_slices: u8, shard_idx: u8,
-        k: u8, m: u8, payload_len: u16, p_type: u8, flags: u8, data: &[u8]
+        k: u8, m: u8, payload_len: u16, p_type: u8, flags: u8, group_idx: u8, total_groups: u8, data: &[u8]
     ) -> Bytes {
         let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + data.len());
         buf.put_u64_le(frame_id);
@@ -118,6 +120,8 @@ impl DatagramChunk {
         buf.put_u16_le(payload_len);
         buf.put_u8(p_type);
         buf.put_u8(flags);
+        buf.put_u8(group_idx);
+        buf.put_u8(total_groups);
         buf.put_slice(data);
         buf.freeze()
     }
@@ -142,6 +146,8 @@ impl DatagramChunk {
             payload_len:  u16::from_le_bytes(raw[13..15].try_into().unwrap()),
             packet_type:  raw[15],
             flags:        raw[16],
+            group_idx:    raw[17],
+            total_groups: raw[18],
             data:         raw.slice(Self::HEADER_LEN..),
         })
     }
@@ -150,7 +156,8 @@ impl DatagramChunk {
     pub fn to_bytes(&self) -> Bytes {
         Self::encode(
             self.frame_id, self.slice_idx, self.total_slices, self.shard_idx,
-            self.k, self.m, self.payload_len, self.packet_type, self.flags, &self.data
+            self.k, self.m, self.payload_len, self.packet_type, self.flags, 
+            self.group_idx, self.total_groups, &self.data
         )
     }
 }
@@ -171,6 +178,7 @@ pub enum ControlPacket {
     Nack {
         frame_id:      u64,
         slice_idx:     u8,
+        group_idx: u8,
         /// Bitmask: bit `i` is set when shard `i` has been received.
         /// The sender retransmits shards whose bits are *clear*.
         received_mask: u64,
