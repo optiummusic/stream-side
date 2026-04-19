@@ -134,14 +134,10 @@ pub(crate) async fn handle_uni_stream(
                     log::debug!("[NACK] retransmitted {count} shard(s) for frame={frame_id} slice={slice_idx} to {label}");
                 } else {
                     // Cache miss — the frame is too old or was never in cache.
-                    // Fall back to requesting a keyframe so the receiver can
-                    // resync without stalling indefinitely.
                     log::warn!(
                         "[NACK] frame={frame_id} slice={slice_idx} not in cache for {label}; \
                         requesting IDR"
                     );
-                    let _ = idr_tx.send(true);
-                    let _ = idr_tx.send(false);
                 }
             }
         _ => {}
@@ -222,7 +218,6 @@ pub(crate) async fn handle_control(conn: &Connection, data: Bytes, info: &Connec
                 let label = info.label().await;
                 log::info!("[QUIC] Client {label} requested KeyFrame!");
                 let _ = idr_tx.send(true);
-                let _ = idr_tx.send(false);
             }
             _ => ()
         }

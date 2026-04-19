@@ -27,18 +27,24 @@ impl FecEncoder {
         let is_critical = (flags & 2) != 0;
         let is_first_slice = slice_idx == 0;
         
-        let k = ((data.len() + max_chunk_data - 1) / max_chunk_data).max(1) as u8;
+        let k_full = (data.len() + max_chunk_data - 1) / max_chunk_data;
+        let k = k_full.min(250) as u8;
 
         // Adaptive parity shards
         let mut m_raw = if is_critical || is_first_slice { k as usize } else { k as usize / 2 + 1 };
         if (k as usize + m_raw) > 255 {
             m_raw = 255 - k as usize;
         }
-        let m = m_raw.min(4) as u8;
+        let m = m_raw as u8;
 
-        let shard_size = (data.len() + (k as usize) - 1) / (k as usize);
-        let shard_size = shard_size.max(1);
+        let shard_size = (data.len() + k as usize - 1) / k as usize;
         
+        log::debug!(
+            "[FEC] encode frame#{} slice#{} | len: {}, k: {}, m: {}, shard_size: {}",
+            frame_id, slice_idx, data.len(), k, m, shard_size
+        );
+        
+
         // Padding
         let mut shards: Vec<Vec<u8>> = data
             .chunks(shard_size)

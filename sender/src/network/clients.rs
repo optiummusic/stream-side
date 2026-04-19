@@ -52,8 +52,13 @@ pub(crate) async fn send_loop_to_client(
                                 log::error!("[QUIC] Failed to send datagram to {}: {:?}", remote, e);
                                 match e {
                                     quinn::SendDatagramError::TooLarge => {
-                                        // Пропускаем этот чанк, смысла переповторять нет — он никогда не пролезет.
-                                        continue; 
+                                        let limit = conn.max_datagram_size().unwrap_or(0);
+                                        log::error!(
+                                            "[QUIC] Datagram ({} bytes) is larger than allowed limit ({} bytes)", 
+                                            dgram.len(), 
+                                            limit
+                                        );
+                                        continue;
                                     }
                                     quinn::SendDatagramError::UnsupportedByPeer => {
                                         // Сеть перегружена. 
@@ -119,8 +124,8 @@ pub(crate) async fn run_serialiser_task(
     
     // Calculate a safe max chunk size for the broadcast.
     // Quinn's initial_mtu is 1200, so we use that as our baseline constraint.
-    let max_dgram = 1200;
-    let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 8;
+    let max_dgram = 1140;
+    let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 64;
 
     while let Some(mut slice) = slice_rx.recv().await {
         // 1. Управление ID кадра: инкрементим, только когда пришел первый слайс нового кадра

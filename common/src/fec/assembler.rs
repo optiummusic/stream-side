@@ -2,9 +2,9 @@ use crate::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket, fec::builder:
 
 use super::*;
 
-const MAX_BUFFERED_FRAMES: u64 = 8;
+const MAX_BUFFERED_FRAMES: u64 = 140;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs (100 ms).
-const STALE_FRAME_US: u64 = 150_000;
+const STALE_FRAME_US: u64 = 20_000;
 
 /// A NACK will not be re-sent for the same (frame_id, slice_idx) more often
 /// than this interval (in µs). Set to ~one typical RTT on a LAN.
