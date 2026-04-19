@@ -13,7 +13,7 @@ pub(crate) async fn send_loop_to_client(
     let mut requested_initial_idr = false;
     let remote = conn.remote_address();
     
-    let _pacer = FramePacer::new(100.0, 4.0);
+    let mut pacer = FramePacer::new(100.0, 4.0);
     
     loop {
         tokio::select! {

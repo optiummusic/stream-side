@@ -111,33 +111,46 @@ pub(crate) async fn handle_uni_stream(
                 let _ = idr_tx.send(true);
                 let _ = idr_tx.send(false);
             }
-            ControlPacket::Nack { frame_id, slice_idx, received_mask } => {
+            ControlPacket::Nack {
+                frame_id,
+                slice_idx,
+                group_idx,
+                received_mask,
+            } => {
                 let label = info.label().await;
                 log::debug!(
-                    "[NACK] {label} requested retransmit frame={frame_id} slice={slice_idx} \
+                    "[NACK] {label} requested retransmit \
+                    frame={frame_id} slice={slice_idx} group={group_idx} \
                     received={received_mask:#066b}"
                 );
-    
-                let retransmit = shard_cache.retransmit(frame_id, slice_idx, received_mask);
+            
+                let retransmit = shard_cache.retransmit(
+                    frame_id,
+                    slice_idx,
+                    group_idx,   // ← pass group through to cache lookup
+                    received_mask,
+                );
                 let count = retransmit.len();
-    
+            
                 for dgram in retransmit {
-                    // Retransmitted shards go out immediately — no pacer —
-                    // because they are already late by definition.
                     if let Err(e) = conn.send_datagram(dgram) {
                         log::warn!("[NACK] retransmit send failed for {label}: {e}");
                         break;
                     }
                 }
-    
+            
                 if count > 0 {
-                    log::debug!("[NACK] retransmitted {count} shard(s) for frame={frame_id} slice={slice_idx} to {label}");
-                } else {
-                    // Cache miss — the frame is too old or was never in cache.
-                    log::warn!(
-                        "[NACK] frame={frame_id} slice={slice_idx} not in cache for {label}; \
-                        requesting IDR"
+                    log::debug!(
+                        "[NACK] retransmitted {count} shard(s) for \
+                        frame={frame_id} slice={slice_idx} group={group_idx} to {label}"
                     );
+                } else {
+                    // Cache miss — frame evicted or IDR was already triggered.
+                    log::warn!(
+                        "[NACK] frame={frame_id} slice={slice_idx} group={group_idx} \
+                        not in cache for {label}; requesting IDR"
+                    );
+                    let _ = idr_tx.send(true);
                 }
             }
         _ => {}
@@ -174,7 +187,9 @@ pub(crate) async fn handle_control(conn: &Connection, data: Bytes, info: &Connec
                         0,                  // m
                         bin.len() as u16,   // payload_len
                         TYPE_CONTROL,       // packet_type
-                        0,                  // flags
+                        0, 
+                        0,
+                        0,                 // flags
                         &bin                // data
                     );
                     let _ = conn.send_datagram(dgram);
