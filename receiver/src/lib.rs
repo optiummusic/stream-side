@@ -47,11 +47,11 @@ pub extern "C" fn JNI_OnLoad(
     jni::sys::JNI_VERSION_1_6
 }
 
-pub const JITTER_TARGET_MS: u64 = 0;
+pub const JITTER_TARGET_MS: u64 = 5;
  
 /// Maximum number of frames held simultaneously.  When exceeded the oldest
 /// frame is evicted (dropped) to bound memory use.
-pub const JITTER_MAX_FRAMES: usize = 32;
+pub const JITTER_MAX_FRAMES: usize = 64;
  
  pub enum UserEvent {
     NewFrame,

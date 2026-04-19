@@ -47,7 +47,7 @@
 // }
 // ```
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::{Duration, Instant}};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
@@ -90,6 +90,9 @@ pub struct DesktopFfmpegBackend {
     scaler_out:     Option<Video>,
     y_pool:         Vec<u8>,
     uv_pool:        Vec<u8>,
+
+    fps_counter: u32,
+    last_fps_check: Instant,
 
     // ── Zero-copy DMA-BUF путь ───────────────────────────────────────────────
 
@@ -202,6 +205,8 @@ impl DesktopFfmpegBackend {
             _drm_dev:       drm_dev,
             map_frame,
             dmabuf_enabled,
+            fps_counter: 0,
+            last_fps_check: Instant::now(),
         })
     }
     fn evaluate_dmabuf_support(initial: bool, gpu: GpuVendor) -> bool {
@@ -247,8 +252,20 @@ impl VideoBackend for DesktopFfmpegBackend {
         &mut self.slice_buffer
     }
     fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
-        if payload.len() < 5 {
-            return Ok(PushStatus::Dropped { age: None });
+        self.fps_counter += 1;
+
+        // 2. Проверка времени (раз в секунду)
+        let elapsed = self.last_fps_check.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            // Вычисляем FPS (с учетом возможной задержки потока)
+            let fps: f64 = self.fps_counter as f64 / elapsed.as_secs_f64();
+            
+            // Логируем или выводим куда-нибудь
+            log::info!("Current Input FPS: {:.2}", fps);
+
+            // Сбрасываем состояние
+            self.fps_counter = 0;
+            self.last_fps_check = Instant::now();
         }
 
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
