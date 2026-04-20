@@ -10,9 +10,8 @@ pub(crate) async fn send_loop_to_client(
     mut video_rx: broadcast::Receiver<Arc<SerializedFrame>>,
     info: Arc<ConnectionInfo>,
     clock_offset: &AtomicI64,
-    idr_tx: watch::Sender<bool>,
-    bitrate_tx: watch::Sender<u64>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
+    senders: Senders,
 ) {
     let mut started = false;
     let mut requested_initial_idr = false;
@@ -33,8 +32,8 @@ pub(crate) async fn send_loop_to_client(
                         if !started {
                             if !serialized_frame.is_key {
                                 if !requested_initial_idr {
-                                    let _ = idr_tx.send(true);
-                                    let _ = idr_tx.send(false);
+                                    let _ = senders.idr_tx.send(true);
+                                    let _ = senders.idr_tx.send(false);
                                     requested_initial_idr = true;
                                     log::info!("[QUIC] Client {remote} waiting for keyframe: requested IDR");
                                 }
@@ -99,10 +98,9 @@ pub(crate) async fn send_loop_to_client(
                     Ok(raw_data) => {
                         // Декодируем как наш чанк (клиент тоже шлет в этом формате)
                         if let Some(chunk) = DatagramChunk::decode(raw_data) {
-                            let idr_clone = idr_tx.clone();
-                            let bit_clone = bitrate_tx.clone();
+                            let senders_clone = senders.clone();
                             if chunk.packet_type == TYPE_CONTROL {
-                                handle_control(&conn, chunk.data, &info, clock_offset, idr_clone, bit_clone, congestion_ctl.clone()).await;
+                                handle_control(&conn, chunk.data, &info, clock_offset, congestion_ctl.clone(), senders_clone).await;
                             }
                         }
                     }

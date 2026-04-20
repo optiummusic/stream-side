@@ -328,7 +328,6 @@ fn run_encoder_loop(
                 if bitrate_rx.has_changed().unwrap_or(false) {
                     let new_bitrate = *bitrate_rx.borrow_and_update();
                     if new_bitrate != current_bitrate {
-                        log::info!("[Encoder] Bitrate watch changed: {} -> {}", current_bitrate, new_bitrate);
                         match create_vaapi_encoder(&codec, width, height, new_bitrate, hw_enc_ref) {
                             Ok(new_enc) => {
                                 encoder = new_enc;

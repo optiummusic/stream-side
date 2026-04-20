@@ -35,6 +35,8 @@
 use std::{fmt, future::Future};
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "linux")]
+use crate::Watchers;
 use crate::encode::EncodedFrame;
 
 #[cfg(target_os = "linux")]
@@ -42,6 +44,68 @@ pub mod linux;
 
 #[cfg(target_os = "linux")]
 pub mod wlroots;
+
+//
+// Fps limiter
+
+pub struct FpsLimiter {
+    next_allowed: std::time::Instant,
+    last_fps: Option<u32>,
+}
+
+impl FpsLimiter {
+    pub fn new() -> Self {
+        Self {
+            next_allowed: std::time::Instant::now(),
+            last_fps: None,
+        }
+    }
+
+    #[inline]
+    pub fn should_allow(
+        &mut self,
+        fps: Option<u32>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+
+        if fps != self.last_fps {
+            self.last_fps = fps;
+            self.next_allowed = now;
+        }
+
+        let Some(fps) = fps.filter(|&v| v > 0) else {
+            return true;
+        };
+
+        let interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+
+        if now < self.next_allowed {
+            return false;
+        }
+
+        self.next_allowed = now + interval;
+        true
+    }
+}
+
+pub(crate) struct FrameGate {
+    limiter: FpsLimiter,
+    fps_rx: tokio::sync::watch::Receiver<Option<u32>>,
+}
+
+impl FrameGate {
+    pub fn new(fps_rx: tokio::sync::watch::Receiver<Option<u32>>) -> Self {
+        Self {
+            limiter: FpsLimiter::new(),
+            fps_rx,
+        }
+    }
+
+    #[inline]
+    pub fn allow(&mut self) -> bool {
+        self.limiter.should_allow(*self.fps_rx.borrow())
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -109,19 +173,19 @@ enum LinuxSenderInner {
 #[cfg(target_os = "linux")]
 impl LinuxSender {
     /// Создать sender. Автоматически выбирает wlroots или PipeWire.
-    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate_rx: tokio::sync::watch::Receiver<u64>,) -> Self {
+    pub fn new(width: u32, height: u32, watchers: Watchers) -> Self {
         if wlroots::is_available() {
             log::info!("[LinuxSender] zwlr_screencopy_manager_v1 найден → WlrootsSender");
             Self {
                 inner: LinuxSenderInner::Wlroots(
-                    wlroots::WlrootsSender::new(width, height, idr_rx, bitrate_rx),
+                    wlroots::WlrootsSender::new(width, height, watchers),
                 ),
             }
         } else {
             log::info!("[LinuxSender] wlroots недоступен → LinuxPipeWireSender (XDG Portal)");
             Self {
                 inner: LinuxSenderInner::PipeWire(
-                    linux::LinuxPipeWireSender::new(width, height, idr_rx, bitrate_rx),
+                    linux::LinuxPipeWireSender::new(width, height, watchers),
                 ),
             }
         }

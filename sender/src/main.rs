@@ -15,8 +15,7 @@
 
 use std::{env, net::SocketAddr, sync::{Arc, Mutex}, time::Duration};
 use sender::{
-    capture::{LinuxSender, VideoSender},
-    network::{CongestionConfig, CongestionController, QuicServer},
+    Senders, Watchers, capture::{LinuxSender, VideoSender}, network::{CongestionConfig, CongestionController, QuicServer}
 };
 
 #[tokio::main]
@@ -45,6 +44,19 @@ async fn main() {
     // ── Transport ────────────────────────────────────────────────────────────
     let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
     let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(10_000_000u64);
+    let (fps_tx, fps_rx) = tokio::sync::watch::channel(Some(10));
+
+    let watchers = Watchers {
+        idr_rx,         // Вместо idr_rx: idr_rx
+        bitrate_rx, 
+        capture_fps_rx: fps_rx,
+    };
+
+    let senders = Senders {
+        idr_tx,
+        bitrate_tx,
+        capture_fps_tx: fps_tx,
+    };
 
     let config = CongestionConfig {
         min_bitrate: 500_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
@@ -56,11 +68,15 @@ async fn main() {
         update_interval: Duration::from_millis(500),    // Частота обычных проверок
         recovery_duration: Duration::from_millis(3500), // Сколько игнорим RTT после потерь
         base_lock_duration: Duration::from_secs(5),     // Начальный блок повышения
+        min_fps: 5,
+        max_fps: 140,
+        fps_step_down: 5,
+        fps_step_up: 10,
     };
 
     let shared_controller = Arc::new(Mutex::new(CongestionController::new(10_000_000, config)));
 
-    let server = Arc::new(QuicServer::new(listen_addr, idr_tx, bitrate_tx, shared_controller).await);
+    let server = Arc::new(QuicServer::new(listen_addr,shared_controller, senders).await);
     let sink   = server.frame_sink();
     // ── Capture + encode ─────────────────────────────────────────────────────
     //
@@ -68,7 +84,7 @@ async fn main() {
     //   • wlroots-compositor  → WlrootsSender  (zwlr_screencopy, низкая latency)
     //   • иначе               → LinuxPipeWireSender (XDG Portal + PipeWire)
 
-    let sender = LinuxSender::new(1, 1, idr_rx, bitrate_rx);
+    let sender = LinuxSender::new(1, 1, watchers);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

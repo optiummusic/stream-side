@@ -177,9 +177,8 @@ pub(crate) async fn handle_control(
     data: Bytes, 
     info: &ConnectionInfo, 
     clock_offset: &AtomicI64, 
-    idr_tx: watch::Sender<bool>, 
-    bitrate_tx: watch::Sender<u64>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
+    senders: Senders,
 ) {
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
@@ -190,20 +189,12 @@ pub(crate) async fn handle_control(
                 };
                 if let Ok(bin) = postcard::to_stdvec(&pong) {
                     // Отправляем ответ как TYPE_CONTROL
-                    let dgram = DatagramChunk::encode(
-                        0,                  // frame_id (для контроля можно 0)
-                        0,                  // slice_idx
-                        1,                  // total_slices
-                        0,                  // shard_idx
-                        1,                  // k
-                        0,                  // m
-                        bin.len() as u16,   // payload_len
-                        TYPE_CONTROL,       // packet_type
-                        0, 
-                        0,
-                        0,                 // flags
-                        &bin                // data
-                    );
+                    let dgram = DatagramChunk{                  
+                        payload_len: bin.len() as u16,
+                        packet_type: TYPE_CONTROL,
+                        data: bin.into(),
+                        ..Default::default()
+                    }.to_bytes();
                     let _ = conn.send_datagram(dgram);
                 }
             },
@@ -229,14 +220,11 @@ pub(crate) async fn handle_control(
                         rtt_ms, 
                         new_bitrate as f64 / 1e6
                     );
-                    let _ = bitrate_tx.send(new_bitrate);
+                    let _ = senders.bitrate_tx.send(new_bitrate);
                 }
 
-                // 4. Управляем FPS захвата
-                if action.drop_fps {
-                    // should_drop_fps.store(true, Ordering::Relaxed);
-                } else {
-                    // should_drop_fps.store(false, Ordering::Relaxed);
+                if let Some(fps) = action.target_fps {
+                    let _ = senders.capture_fps_tx.send(Some(fps));
                 }
             }
             ControlPacket::FrameFeedback { frame_id, trace } => {
@@ -271,7 +259,7 @@ pub(crate) async fn handle_control(
             ControlPacket::RequestKeyFrame => {
                 let label = info.label().await;
                 log::info!("[QUIC] Client {label} requested KeyFrame!");
-                let _ = idr_tx.send(true);
+                let _ = senders.idr_tx.send(true);
             }
             _ => ()
         }
