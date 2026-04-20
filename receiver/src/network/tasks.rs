@@ -16,7 +16,7 @@ pub(crate) fn spawn_control_writer_task(
 
         while let Some(packet) = control_rx.recv().await {
             let is_nack = matches!(packet, ControlPacket::Nack { .. });
-            
+
             if let Ok(bytes) = postcard::to_stdvec(&packet) {
                 if is_nack {
                     // --- ОТПРАВКА ЧЕРЕЗ STREAM (Надежно) ---
@@ -40,12 +40,12 @@ pub(crate) fn spawn_control_writer_task(
                     }
                 } else {
                     // --- ОТПРАВКА ЧЕРЕЗ DATAGRAM (Быстро/Ненадежно: Пинги, фидбек) ---
-                    let dgram = DatagramChunk::encode(
-                         0, 0, 1, 0, 1, 0, 
-                        bytes.len() as u16, 
-                        TYPE_CONTROL, 0, 
-                        0, 0, &bytes
-                    );
+                    let dgram = DatagramChunk{
+                        payload_len: bytes.len() as u16, 
+                        packet_type: TYPE_CONTROL,
+                        data: bytes.into(),
+                        ..Default::default()
+                    }.to_bytes();
                     let _ = conn.send_datagram(dgram);
                 }
             }
@@ -92,12 +92,13 @@ pub(crate) fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
             };
 
             if let Ok(bytes) = postcard::to_stdvec(&ping) {
-                let dgram = DatagramChunk::encode(
-                    0, 0, 1, 0, 1, 0, 
-                    bytes.len() as u16, 
-                    TYPE_CONTROL, 0, 
-                    0, 0, &bytes
-                );
+                let dgram = DatagramChunk {
+                    packet_type: TYPE_CONTROL,
+                    k: 1,
+                    payload_len: bytes.len() as u16,
+                    data: bytes.into(),
+                    ..Default::default()
+                }.to_bytes();
                 let _ = conn.send_datagram(dgram);
             }
 

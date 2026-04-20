@@ -79,7 +79,7 @@ pub struct VideoSlice {
 ///   `chunk_idx` and deserialise the result as a `VideoPacket` via postcard.
 /// - If a newer `frame_id` arrives before the current one is complete, evict
 ///   the stale entry (its P-frame data was already dropped by the network).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DatagramChunk {
     pub frame_id:     u64,
     pub slice_idx:    u8,  // Номер NALU (0..7)
@@ -154,11 +154,20 @@ impl DatagramChunk {
 
     #[inline]
     pub fn to_bytes(&self) -> Bytes {
-        Self::encode(
-            self.frame_id, self.slice_idx, self.total_slices, self.shard_idx,
-            self.k, self.m, self.payload_len, self.packet_type, self.flags, 
-            self.group_idx, self.total_groups, &self.data
-        )
+        let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + self.data.len());
+        buf.put_u64_le(self.frame_id);
+        buf.put_u8(self.slice_idx);
+        buf.put_u8(self.total_slices);
+        buf.put_u8(self.shard_idx);
+        buf.put_u8(self.k);
+        buf.put_u8(self.m);
+        buf.put_u16_le(self.payload_len);
+        buf.put_u8(self.packet_type);
+        buf.put_u8(self.flags);
+        buf.put_u8(self.group_idx);
+        buf.put_u8(self.total_groups);
+        buf.put_slice(&self.data);
+        buf.freeze()
     }
 }
 
@@ -183,6 +192,7 @@ pub enum ControlPacket {
         /// The sender retransmits shards whose bits are *clear*.
         received_mask: u64,
     },
+    LostFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

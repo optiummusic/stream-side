@@ -1,4 +1,7 @@
+
 use common::NaluType;
+
+use crate::network::congestion::CongestionController;
 
 use super::*;
 
@@ -9,6 +12,7 @@ pub(crate) async fn send_loop_to_client(
     clock_offset: &AtomicI64,
     idr_tx: watch::Sender<bool>,
     bitrate_tx: watch::Sender<u64>,
+    congestion_ctl: Arc<Mutex<CongestionController>>,
 ) {
     let mut started = false;
     let mut requested_initial_idr = false;
@@ -98,7 +102,7 @@ pub(crate) async fn send_loop_to_client(
                             let idr_clone = idr_tx.clone();
                             let bit_clone = bitrate_tx.clone();
                             if chunk.packet_type == TYPE_CONTROL {
-                                handle_control(&conn, chunk.data, &info, clock_offset, idr_clone, bit_clone).await;
+                                handle_control(&conn, chunk.data, &info, clock_offset, idr_clone, bit_clone, congestion_ctl.clone()).await;
                             }
                         }
                     }

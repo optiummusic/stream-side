@@ -1,4 +1,6 @@
-use std::time::Instant;
+use std::{sync::Mutex, time::Instant};
+
+use crate::network::congestion::CongestionController;
 
 use super::*;
 static mut LAST_UPDATE: Option<Instant> = None;
@@ -177,6 +179,7 @@ pub(crate) async fn handle_control(
     clock_offset: &AtomicI64, 
     idr_tx: watch::Sender<bool>, 
     bitrate_tx: watch::Sender<u64>,
+    congestion_ctl: Arc<Mutex<CongestionController>>,
 ) {
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
@@ -205,40 +208,35 @@ pub(crate) async fn handle_control(
                 }
             },
             ControlPacket::Pong{..} => (),
+            ControlPacket::LostFrame {..} => {
+                let mut cc = congestion_ctl.lock().unwrap();
+                cc.report_lost_frame();
+            },
             ControlPacket::OffsetUpdate { offset_us, rtt_us } => {
                 clock_offset.store(offset_us, Ordering::Relaxed);
                 let rtt_ms = rtt_us as f64 / 1000.0;
-                // Константы для настройки
-                const MIN_BITRATE: u64 = 100_000;  // 2 Мбит
-                const MAX_BITRATE: u64 = 50_000_000; // 30 Мбит
-                const RTT_THRESHOLD_MS: f64 = 60.0;  // Целевой пинг для облачного гейминга
-                const STEP_UP: u64 = 500_000;      // Прибавляем по 1 Мбит
-                const BACKOFF_FACTOR: f64 = 0.75;     // Срезаем 20% битрейта при лагах
 
-                let current_bitrate = *bitrate_tx.borrow();
-                let mut new_bitrate = current_bitrate;
+                // 1. Получаем доступ к контроллеру
+                let mut cc = congestion_ctl.lock().unwrap();
+                
+                // 2. Скармливаем метрики и получаем действие
+                let action = cc.on_metrics(rtt_ms);
 
-                if rtt_ms > RTT_THRESHOLD_MS {
-                    // 1. ЕСТЬ ЛАГ: Режем битрейт мультипликативно (быстро реагируем на затор)
-                    new_bitrate = (current_bitrate as f64 * BACKOFF_FACTOR) as u64;
-                } else if rtt_ms < (RTT_THRESHOLD_MS * 0.7) {
-                    // 2. ВСЁ ЧИСТО: Постепенно повышаем (аддитивно), чтобы не вызвать резкий затор
-                    new_bitrate = current_bitrate + STEP_UP;
+                // 3. Если контроллер решил сменить битрейт
+                if let Some(new_bitrate) = action.new_bitrate {
+                    log::warn!(
+                        "[Congestion] RTT: {:.1}ms. New bitrate: {:.2} Mbps", 
+                        rtt_ms, 
+                        new_bitrate as f64 / 1e6
+                    );
+                    let _ = bitrate_tx.send(new_bitrate);
                 }
 
-                // Зажимаем в рамки и проверяем на изменения
-                new_bitrate = new_bitrate.clamp(MIN_BITRATE, MAX_BITRATE);
-
-                let now = Instant::now();
-                let can_update = unsafe {
-                    LAST_UPDATE.map(|last| now.duration_since(last).as_millis() > 500).unwrap_or(true)
-                };
-                if new_bitrate != current_bitrate && can_update {
-                    if (new_bitrate as i64 - current_bitrate as i64).abs() >= 50_000 {
-                        log::warn!("[Congestion] RTT high ({:.1}ms), dropping bitrate to {:.2} Mbps", rtt_ms, new_bitrate as f64 / 1e6);
-                        let _ = bitrate_tx.send(new_bitrate);
-                        unsafe { LAST_UPDATE = Some(now); }
-                    }
+                // 4. Управляем FPS захвата
+                if action.drop_fps {
+                    // should_drop_fps.store(true, Ordering::Relaxed);
+                } else {
+                    // should_drop_fps.store(false, Ordering::Relaxed);
                 }
             }
             ControlPacket::FrameFeedback { frame_id, trace } => {
