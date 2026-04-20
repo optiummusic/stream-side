@@ -2,6 +2,7 @@ mod endpoint;
 mod handlers;
 mod clients;
 mod connections;
+mod congestion;
 
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 pub(crate) use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -13,11 +14,13 @@ pub(crate) use tokio::sync::{RwLock, broadcast, mpsc, watch};
 pub(crate) use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, VideoSlice};
 pub(crate) use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame, ShardCache};
 pub(crate) use crate::encode::EncodedFrame;
+pub(crate) use std::sync::Mutex;
 
 use endpoint::*;
 use handlers::*;
 use clients::*;
 use connections::*;
+pub use congestion::*;
 
 pub struct QuicServer {
     /// Cloneable handle for pushing encoded frames into the transport pipeline.
@@ -32,7 +35,7 @@ impl QuicServer {
     /// current Tokio runtime.
     ///
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
-    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>, bitrate_tx: watch::Sender<u64>,) -> Self {
+    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>, bitrate_tx: watch::Sender<u64>, congestion_ctl: Arc<Mutex<CongestionController>>,) -> Self {
         let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(32);
         let (bcast_tx, _) = broadcast::channel::<Arc<SerializedFrame>>(64);
         let shard_cache = Arc::new(ShardCache::new());
@@ -48,7 +51,7 @@ impl QuicServer {
         let idr_accept = idr_tx.clone();
         let sc_accept = shard_cache.clone();
         
-        tokio::spawn(run_accept_loop(endpoint, bcast_accept, idr_accept, sc_accept, bitrate_tx));
+        tokio::spawn(run_accept_loop(endpoint, bcast_accept, idr_accept, sc_accept, bitrate_tx, congestion_ctl));
 
         Self { frame_tx, idr_tx }
     }

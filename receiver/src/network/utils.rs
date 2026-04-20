@@ -6,7 +6,12 @@ pub(crate) async fn send_offset_update(conn: &quinn::Connection, rtt_us: u64) ->
     let packet = ControlPacket::OffsetUpdate { offset_us: offset, rtt_us };
 
     let bin = postcard::to_stdvec(&packet)?;
-    let dgram = DatagramChunk::encode(0, 0, 1, 0, 1, 0, bin.len() as u16, TYPE_CONTROL, 0, 0, 0, &bin);
+    let dgram = DatagramChunk{
+        payload_len: bin.len() as u16, 
+        packet_type: TYPE_CONTROL, 
+        data: bin.into(),
+        ..Default::default()
+    }.to_bytes();
     conn.send_datagram(dgram)?;
 
     Ok(())

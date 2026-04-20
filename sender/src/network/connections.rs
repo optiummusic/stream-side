@@ -1,3 +1,4 @@
+
 use super::*;
 
 pub(crate) async fn handle_connection(
@@ -6,6 +7,7 @@ pub(crate) async fn handle_connection(
     idr_tx: watch::Sender<bool>,
     shard_cache: Arc<ShardCache>,
     bitrate_tx: watch::Sender<u64>,
+    congestion_ctl: Arc<Mutex<CongestionController>>,
 ) {
     let remote_addr = conn.remote_address();
     log::info!("[QUIC] Client connected: {}", remote_addr);
@@ -54,7 +56,7 @@ pub(crate) async fn handle_connection(
     });
 
     // 3. Основной цикл отправки (Datagrams)
-    send_loop_to_client(conn, client_rx, info_main, &clock_off_main, idr_tx_main, bitrate_tx).await;
+    send_loop_to_client(conn, client_rx, info_main, &clock_off_main, idr_tx_main, bitrate_tx, congestion_ctl).await;
 }
 
 pub(crate) async fn run_accept_loop(
@@ -63,16 +65,18 @@ pub(crate) async fn run_accept_loop(
     idr_tx: watch::Sender<bool>,
     shard_cache: Arc<ShardCache>,
     bitrate_tx: watch::Sender<u64>,
+    congestion_ctl: Arc<Mutex<CongestionController>>,
 ) {
     while let Some(connecting) = endpoint.accept().await {
         let bcast_tx = bcast_tx.clone();
         let idr_tx = idr_tx.clone();
         let shard_cache = shard_cache.clone();
         let bit_tx = bitrate_tx.clone();
+        let cong_clone = congestion_ctl.clone();
         tokio::spawn(async move {
             match connecting.await {
                 Ok(conn) => {
-                    handle_connection(conn, bcast_tx, idr_tx, shard_cache, bit_tx).await;
+                    handle_connection(conn, bcast_tx, idr_tx, shard_cache, bit_tx, cong_clone).await;
                 }
                 Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
             }

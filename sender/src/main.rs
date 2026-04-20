@@ -13,10 +13,10 @@
 //! На wlroots-композиторах (Sway, Hyprland) автоматически используется
 //! `zwlr_screencopy_manager_v1`. На остальных — XDG Portal + PipeWire.
 
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, net::SocketAddr, sync::{Arc, Mutex}, time::Duration};
 use sender::{
-    capture::{VideoSender, LinuxSender},
-    network::QuicServer,
+    capture::{LinuxSender, VideoSender},
+    network::{CongestionConfig, CongestionController, QuicServer},
 };
 
 #[tokio::main]
@@ -46,9 +46,22 @@ async fn main() {
     let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
     let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(10_000_000u64);
 
-    let server = Arc::new(QuicServer::new(listen_addr, idr_tx, bitrate_tx).await);
-    let sink   = server.frame_sink();
+    let config = CongestionConfig {
+        min_bitrate: 500_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
+        max_bitrate: 50_000_000,       // 50 Мбит
+        rtt_threshold_ms: 60.0,        // Порог задержки
+        step_up: 500_000,              // +0.5 Мбит при хорошей связи
+        backoff_congested: 0.8,        // -20% битрейта при высоком RTT
+        backoff_lossy: 0.7,            // -50% битрейта при потерях (агрессивно!)
+        update_interval: Duration::from_millis(500),    // Частота обычных проверок
+        recovery_duration: Duration::from_millis(3500), // Сколько игнорим RTT после потерь
+        base_lock_duration: Duration::from_secs(5),     // Начальный блок повышения
+    };
 
+    let shared_controller = Arc::new(Mutex::new(CongestionController::new(10_000_000, config)));
+
+    let server = Arc::new(QuicServer::new(listen_addr, idr_tx, bitrate_tx, shared_controller).await);
+    let sink   = server.frame_sink();
     // ── Capture + encode ─────────────────────────────────────────────────────
     //
     // LinuxSender автоматически выбирает бэкенд:

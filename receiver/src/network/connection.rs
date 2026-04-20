@@ -297,7 +297,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
         }
         // Clear slice buffer
         backend.clear_buffer();
-        
+        let _ = control_tx.try_send(ControlPacket::LostFrame);
 
         state.waiting_for_key = true;
         request_idr(state, idr_needed_tx, packet.frame_id);
