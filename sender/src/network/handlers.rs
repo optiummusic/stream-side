@@ -215,7 +215,7 @@ pub(crate) async fn handle_control(
 
                 // 3. Если контроллер решил сменить битрейт
                 if let Some(new_bitrate) = action.new_bitrate {
-                    log::warn!(
+                    log::info!(
                         "[Congestion] RTT: {:.1}ms. New bitrate: {:.2} Mbps", 
                         rtt_ms, 
                         new_bitrate as f64 / 1e6
@@ -224,6 +224,10 @@ pub(crate) async fn handle_control(
                 }
 
                 if let Some(fps) = action.target_fps {
+                    log::info!(
+                        "[Congestion] FPS: {}.", 
+                        fps
+                    );
                     let _ = senders.capture_fps_tx.send(Some(fps));
                 }
             }

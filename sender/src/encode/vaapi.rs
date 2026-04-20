@@ -216,6 +216,7 @@ unsafe fn apply_encoder_params(
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
         (*raw).slices       = 4;
+        (*raw).refs           = 1;
     }
 }
 
@@ -244,6 +245,9 @@ fn create_vaapi_encoder(
     opts.set("mbtree", "0");
     opts.set("tune", "zerolatency");
     opts.set("rc_mode", "CBR");
+    opts.set("bf", "0");
+    opts.set("refs", "1");
+    opts.set("b_strategy", "0");
 
     enc_ctx.encoder().video()?.open_with(opts)
 }

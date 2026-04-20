@@ -44,7 +44,7 @@ async fn main() {
     // ── Transport ────────────────────────────────────────────────────────────
     let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
     let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(10_000_000u64);
-    let (fps_tx, fps_rx) = tokio::sync::watch::channel(Some(10));
+    let (fps_tx, fps_rx) = tokio::sync::watch::channel(Some(120));
 
     let watchers = Watchers {
         idr_rx,         // Вместо idr_rx: idr_rx
@@ -62,13 +62,13 @@ async fn main() {
         min_bitrate: 500_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
         max_bitrate: 50_000_000,       // 50 Мбит
         rtt_threshold_ms: 60.0,        // Порог задержки
-        step_up: 500_000,              // +0.5 Мбит при хорошей связи
+        step_up: 350_000,              // +0.5 Мбит при хорошей связи
         backoff_congested: 0.8,        // -20% битрейта при высоком RTT
         backoff_lossy: 0.7,            // -50% битрейта при потерях (агрессивно!)
         update_interval: Duration::from_millis(500),    // Частота обычных проверок
-        recovery_duration: Duration::from_millis(3500), // Сколько игнорим RTT после потерь
-        base_lock_duration: Duration::from_secs(5),     // Начальный блок повышения
-        min_fps: 5,
+        recovery_duration: Duration::from_millis(100), // Сколько игнорим RTT после потерь
+        base_lock_duration: Duration::from_secs(4),     // Начальный блок повышения
+        min_fps: 25,
         max_fps: 140,
         fps_step_down: 5,
         fps_step_up: 10,

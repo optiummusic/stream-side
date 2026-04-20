@@ -34,8 +34,7 @@
 //! автоматически откатывается на SHM-путь.
 
 use std::{
-    os::{fd::{BorrowedFd, OwnedFd, FromRawFd, RawFd}, unix::io::AsRawFd},
-    time::{Duration, Instant},
+    os::{fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd}, unix::io::AsRawFd}, sync::Arc, time::{Duration, Instant}
 };
 use common::FrameTrace;
 use wayland_client::WEnum;
@@ -635,6 +634,40 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
 ///
 /// Приоритет: DMA-BUF (zero-copy) → SHM (fallback).
 /// Вызывается либо из `BufferDone` (v2+), либо из `Buffer` (v1).
+
+const DMA_BUF_POOL_TARGET: usize = 4;
+
+fn dma_buf_matches(buf: &DmaBuf, info: DmaBufInfo) -> bool {
+    buf.width == info.width
+        && buf.height == info.height
+        && buf.format == info.format
+        && buf.modifier == info.modifier
+}
+
+fn warm_dma_pool(
+    dma_pool: &mut Vec<Arc<DmaBuf>>,
+    gbm: &gbm::Device<std::fs::File>,
+    dmabuf_proto: &ZwpLinuxDmabufV1,
+    qh: &QueueHandle<AppState>,
+    info: DmaBufInfo,
+) -> Result<(), SenderError> {
+    let matching = dma_pool.iter().filter(|b| dma_buf_matches(b, info)).count();
+
+    for i in matching..DMA_BUF_POOL_TARGET {
+        let buf = DmaBuf::alloc(gbm, dmabuf_proto, qh, info)?;
+        log::info!(
+            "[wlroots] DMA-BUF warmup {}/{} ({}x{})",
+            i + 1,
+            DMA_BUF_POOL_TARGET,
+            info.width,
+            info.height,
+        );
+        dma_pool.push(Arc::new(buf));
+    }
+
+    Ok(())
+}
+
 fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle<AppState>) {
     // Уже копируем — не вызывать copy() второй раз
     if state.status == CaptureStatus::Copying {
@@ -668,30 +701,43 @@ fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle
         }
 
         if let Some(gbm) = &state.gbm {
-            // 3. Ищем подходящий буфер в пуле
-            let existing_idx = state.dma_pool.iter().position(|b| {
-                b.width == dma_info.width && 
-                b.height == dma_info.height && 
-                b.format == dma_info.format &&
-                b.modifier == dma_info.modifier
-            });
+            if state.dma_buf_back.is_none() {
+                let existing_idx = state
+                    .dma_pool
+                    .iter()
+                    .position(|b| dma_buf_matches(b, dma_info));
 
-            if let Some(idx) = existing_idx {
-                state.dma_buf_back = Some(state.dma_pool.remove(idx));
-            } 
-            // 4. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-            // Аллоцируем только если в пуле пусто И у нас нет готового буфера в dma_buf_back
-            else if state.dma_buf_back.is_none() && state.dma_pool.len() < 3 { 
-                match DmaBuf::alloc(gbm, dmabuf_proto, qh, dma_info) {
-                    Ok(buf) => {
-                        log::info!("[wlroots] Добавлен новый DMA-BUF в пул ({}x{})", dma_info.width, dma_info.height);
-                        state.dma_buf_back = Some(std::sync::Arc::new(buf));
+                if let Some(idx) = existing_idx {
+                    state.dma_buf_back = Some(state.dma_pool.remove(idx));
+                } else {
+                    let warm_result = match state.gbm.as_ref() {
+                        Some(gbm) => warm_dma_pool(
+                            &mut state.dma_pool,
+                            gbm,
+                            dmabuf_proto,
+                            qh,
+                            dma_info,
+                        ),
+                        None => {
+                            log::warn!("[wlroots] GBM not initialized — откат на SHM");
+                            Ok(())
+                        }
+                    };
+
+                    if let Err(e) = warm_result {
+                        log::warn!("[wlroots] DMA-BUF alloc failed: {e} — откат на SHM");
                     }
-                    Err(_) => { /* откат на SHM */ }
+
+                    if let Some(idx) = state
+                        .dma_pool
+                        .iter()
+                        .position(|b| dma_buf_matches(b, dma_info))
+                    {
+                        state.dma_buf_back = Some(state.dma_pool.remove(idx));
+                    }
                 }
             }
 
-            // 5. Если в итоге буфер есть (из пула или новый), копируем
             if let Some(buf) = &state.dma_buf_back {
                 frame.copy(&buf.buffer);
                 state.status = CaptureStatus::Copying;
@@ -944,14 +990,20 @@ fn run_encode_loop(
                 "[wlroots-encode] DMA-BUF fd={} stride={} offset={} mod=0x{:016x}",
                 dma.fd.as_raw_fd(), dma.stride, dma.offset, dma.modifier,
             );
-            enc.encode_dmabuf(
-                dma.fd.as_raw_fd(),
-                dma.stride,
-                dma.offset,
-                dma.modifier,
-                ts,
-            );
-            let _ = recycle_dma_tx.try_send(frame.dma_buf.unwrap());
+            if let Some(dma) = frame.dma_buf {
+                enc.encode_dmabuf(
+                    dma.fd.as_raw_fd(),
+                    dma.stride,
+                    dma.offset,
+                    dma.modifier,
+                    ts,
+                );
+                // blocking_send — ждём место в канале вместо дропа
+                // encode loop всё равно синхронный, блокировка минимальна
+                if recycle_dma_tx.blocking_send(dma).is_err() {
+                    log::warn!("[encode] recycle channel closed");
+                }
+            }
         } else if let Some(ref shm_buf) = frame.shm_buffer {
             // ── SHM fallback: CPU copy ─────────────────────────────────────
             let pixels = shm_buf.as_bytes();

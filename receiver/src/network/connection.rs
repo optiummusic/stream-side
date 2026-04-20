@@ -3,6 +3,7 @@ use common::fec::assembler::FrameAssembler;
 
 
 const IDR_INTERVAL_MS: u64 = 500; 
+const FAIL_WINDOW: usize = 26;
 use crate::VideoWorkerMsg;
 
 use super::*;
@@ -12,6 +13,37 @@ pub(crate) struct VideoState {
     pub expected_frame_id: Option<u64>,
     pub expected_slice_idx: u8,
     pub last_idr: Instant,
+    pub recovery: RecoveryState,
+    pub loss_window: [bool; FAIL_WINDOW],
+    pub loss_window_pos: usize,
+}
+
+impl VideoState {
+    fn record_loss(&mut self) {
+        self.loss_window[self.loss_window_pos] = true;
+        // Было % 16, стало % FAIL_WINDOW
+        self.loss_window_pos = (self.loss_window_pos + 1) % FAIL_WINDOW;
+    }
+
+    fn record_success(&mut self) {
+        self.loss_window[self.loss_window_pos] = false;
+        // Было % 16, стало % FAIL_WINDOW
+        self.loss_window_pos = (self.loss_window_pos + 1) % FAIL_WINDOW;
+    }
+
+    fn loss_rate(&self) -> u32 {
+        self.loss_window.iter().filter(|&&x| x).count() as u32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecoveryState {
+    /// Обычный режим — concealment включён
+    Concealing,
+    /// Запросили IDR, дропаем все кадры до него
+    WaitingForIdr,
+    /// IDR получен, ждём N хороших кадров перед тем как снова concealment
+    StabilizingAfterIdr { good_frames_left: u32 },
 }
 
 pub(crate) fn spawn_video_backend_worker<B: VideoBackend>(
@@ -45,9 +77,12 @@ where
     std::thread::spawn(move || {
         let mut state = VideoState {
             waiting_for_key: true,
+            loss_window: [false; FAIL_WINDOW],
+            loss_window_pos: 0,
             expected_frame_id: None,
             expected_slice_idx: 0,
             last_idr: Instant::now(),
+            recovery: RecoveryState::Concealing,
         };
 
         while let Ok(msg) = rx.recv() {
@@ -271,88 +306,134 @@ pub(crate) async fn receive_datagrams(
 
 pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     mut packet: VideoPacket,
-    state:      &mut VideoState,
+    state: &mut VideoState,
     backend: &mut B,
     control_tx: &mpsc::Sender<ControlPacket>,
-    idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
+    idr_needed_tx: &watch::Sender<bool>,
 ) {
-    // ── In-order / IDR gate ───────────────────────────────────────────────
-    if packet.is_key && state.waiting_for_key{
-        state.waiting_for_key = false;
+    // ── IDR gate ─────────────────────────────────────────────────────────
+    if packet.is_key && packet.slice_idx == 0 {
+        // Всегда синхронизируемся на IDR, независимо от waiting_for_key
         state.expected_frame_id = Some(packet.frame_id);
-        state.expected_slice_idx = 0; 
-        let _ = idr_needed_tx.send(false);
-        log::trace!("[Video] Keyframe start received, synced to frame #{}", packet.frame_id);
-    } 
+        state.expected_slice_idx = 0;
+        
+        if state.waiting_for_key {
+            state.loss_window.fill(false);
+            state.loss_window_pos = 0;
+            state.waiting_for_key = false;
+            let _ = idr_needed_tx.send(false);
+            log::info!("[Video] IDR received, stabilizing (5 frames)");
+            state.recovery = RecoveryState::StabilizingAfterIdr { good_frames_left: 5 };
+        }
+    }
 
     if state.waiting_for_key {
-        log::trace!("[Video] Slice dropped on frame #{} because we still wait for I-Frame", packet.frame_id);
+        log::trace!("[Video] Dropped frame #{} — waiting for IDR", packet.frame_id);
         return;
     }
 
+    // ── Frame gap detection ───────────────────────────────────────────────
     if Some(packet.frame_id) != state.expected_frame_id {
         if Some(packet.frame_id) < state.expected_frame_id {
-            log::trace!("[Video] Slice dropped on frame #{} because it's older than expected #{}", packet.frame_id, state.expected_frame_id.unwrap());
-            return;
+            return; // старый кадр
         }
-        // Clear slice buffer
-        backend.clear_buffer();
+        state.record_loss();
         let _ = control_tx.try_send(ControlPacket::LostFrame);
 
-        state.waiting_for_key = true;
-        request_idr(state, idr_needed_tx, packet.frame_id);
-        return;
+        match state.recovery {
+            RecoveryState::StabilizingAfterIdr { .. } => {
+                // Потеря во время стабилизации — сразу снова IDR
+                log::info!("[Video] Loss during stabilization, re-requesting IDR");
+                state.waiting_for_key = true;
+                state.recovery = RecoveryState::WaitingForIdr;
+                request_idr(state, idr_needed_tx, packet.frame_id);
+                return;
+            }
+            RecoveryState::Concealing => {
+                backend.conceal_and_clear(state.expected_frame_id.unwrap_or(packet.frame_id));
+                if state.loss_rate() > 4 {
+                    log::info!("[Video] Too many losses ({}), switching to IDR", state.loss_rate());
+
+                    state.waiting_for_key = true;
+                    state.recovery = RecoveryState::WaitingForIdr;
+                    request_idr(state, idr_needed_tx, packet.frame_id);
+                    return;
+                }
+            }
+            RecoveryState::WaitingForIdr => {
+                return; // уже ждём IDR
+            }
+        }
+
+        state.expected_frame_id = Some(packet.frame_id);
+        state.expected_slice_idx = 0;
     }
 
+    // ── Slice order check ─────────────────────────────────────────────────
     if packet.slice_idx != state.expected_slice_idx {
-        log::trace!(
-            "[Video] Slice mismatch on frame #{}: got {}, expected {}. Dropping frame.",
-            packet.frame_id, packet.slice_idx, state.expected_slice_idx
-        );
-        // Clear slice buffer
-        backend.clear_buffer();
-        
-        state.waiting_for_key = true;
+        log::trace!("[Video] Slice mismatch frame #{}: got {} expected {}",
+            packet.frame_id, packet.slice_idx, state.expected_slice_idx);
 
-        request_idr(state, idr_needed_tx, packet.frame_id);
+        match state.recovery {
+            RecoveryState::Concealing => {
+                backend.conceal_and_clear(packet.frame_id);
+                state.record_loss();
+                if state.loss_rate() > 4 {
+                    state.waiting_for_key = true;
+                    state.recovery = RecoveryState::WaitingForIdr;
+                    request_idr(state, idr_needed_tx, packet.frame_id);
+                }
+            }
+            RecoveryState::StabilizingAfterIdr { .. } => {
+                state.waiting_for_key = true;
+                state.recovery = RecoveryState::WaitingForIdr;
+                request_idr(state, idr_needed_tx, packet.frame_id);
+            }
+            RecoveryState::WaitingForIdr => {}
+        }
+
+        state.expected_slice_idx = 0;
+        state.expected_frame_id = Some(packet.frame_id + 1);
         return;
     }
-    
 
+    // ── Успешный слайс ────────────────────────────────────────────────────
+    log::info!("[NETWORK] Loss rate: {}", state.loss_rate());
     state.expected_slice_idx += 1;
 
     if packet.is_last {
-        log::trace!(
-            "[Video] Frame #{} fully assembled ({} slices), pushing to backend", 
-            packet.frame_id, state.expected_slice_idx
-        );
+        state.record_success();
         state.expected_frame_id = Some(packet.frame_id + 1);
         state.expected_slice_idx = 0;
+
+        // Считаем хорошие кадры в режиме стабилизации
+        if let RecoveryState::StabilizingAfterIdr { good_frames_left } = &mut state.recovery {
+            *good_frames_left = good_frames_left.saturating_sub(1);
+            if *good_frames_left == 0 {
+                log::info!("[Video] Stream stable, concealment re-enabled");
+                state.recovery = RecoveryState::Concealing;
+            }
+        }
     }
- 
-    let frame_id    = packet.frame_id;
-    let payload     = packet.payload;
-    let trace       = packet.trace.take();
-    let ctrl        = control_tx.clone();
- 
+
+    // ── Push to decoder ───────────────────────────────────────────────────
+    let frame_id = packet.frame_id;
+    let payload  = packet.payload;
+    let trace    = packet.trace.take();
+    let ctrl     = control_tx.clone();
+
     match backend.push_encoded(&payload, frame_id, trace, packet.is_last) {
         Ok(PushStatus::Dropped { age }) => {
             let _ = ctrl.try_send(ControlPacket::Communication {
-                message: format!(
-                    "DROPPED ON PUSH#{}, age: {:.1}ms",
-                    frame_id,
-                    age.unwrap_or(0.0)
-                ),
+                message: format!("DROPPED ON PUSH#{}, age: {:.1}ms", frame_id, age.unwrap_or(0.0)),
             });
         }
-        Ok(PushStatus::Accepted {fps}) => {
+        Ok(PushStatus::Accepted { fps }) => {
             #[cfg(target_os = "android")]
-            if fps > 0 
-            {            
-                let _ = ctrl.try_send(ControlPacket::Communication { 
-                message: format!(
-                    "My fps is {fps}"
-                ) });
+            if fps > 0 {
+                let _ = ctrl.try_send(ControlPacket::Communication {
+                    message: format!("My fps is {fps}"),
+                });
             }
         }
         Ok(PushStatus::Accumulating) => {}
