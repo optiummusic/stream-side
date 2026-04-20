@@ -24,7 +24,8 @@ use jni::{
 use std::sync::mpsc::SyncSender;
 use once_cell::sync::OnceCell;
 use bytes::BytesMut;
-
+use std::time::Instant;
+use std::time::Duration;
 use super::{BackendError, FrameOutput, PushStatus, VideoBackend};
 use common::FrameTrace;
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +84,8 @@ pub struct AndroidMediaCodecBackend {
     pts_to_frame: HashMap<u64, (u64, FrameTrace)>,
     current_trace: Option<FrameTrace>,
     slice_buffer: BytesMut,
+    fps_counter: u64,
+    last_fps_check: Instant,
 }
 
 impl AndroidMediaCodecBackend {
@@ -93,6 +96,8 @@ impl AndroidMediaCodecBackend {
             pts_to_frame: HashMap::new(),
             slice_buffer:   BytesMut::with_capacity(1024 * 512),
             current_trace: None,
+            fps_counter: 0,
+            last_fps_check: Instant::now(),
         }
     }
 
@@ -132,6 +137,18 @@ impl VideoBackend for AndroidMediaCodecBackend {
             }
         }
 
+        self.fps_counter += 1;
+        let mut fps = 0.0;
+        let elapsed = self.last_fps_check.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            // Вычисляем FPS (с учетом возможной задержки потока)
+            fps = self.fps_counter as f64 / elapsed.as_secs_f64();
+                        
+            // Сбрасываем состояние
+            self.fps_counter = 0;
+            self.last_fps_check = Instant::now();
+        }
+
         let pts_us = FrameTrace::now_us(); 
         unsafe {
             let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2000);
@@ -149,7 +166,7 @@ impl VideoBackend for AndroidMediaCodecBackend {
 
             ndk_sys::AMediaCodec_queueInputBuffer(state.codec, idx as usize, 0, copy_len, pts_us, 0);
         }
-        Ok(PushStatus::Accepted)
+        Ok(PushStatus::Accepted {fps: fps as u32})
     }
 
     fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {

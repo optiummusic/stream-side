@@ -104,11 +104,12 @@ pub struct WlrootsSender {
     width:  u32,
     height: u32,
     idr_rx: watch::Receiver<bool>,
+    bitrate_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl WlrootsSender {
-    pub fn new(width: u32, height: u32, idr_rx: watch::Receiver<bool>) -> Self {
-        Self { width, height, idr_rx }
+    pub fn new(width: u32, height: u32, idr_rx: watch::Receiver<bool>, bitrate_rx: tokio::sync::watch::Receiver<u64>,) -> Self {
+        Self { width, height, idr_rx, bitrate_rx }
     }
 }
 
@@ -123,7 +124,7 @@ impl super::VideoSender for WlrootsSender {
             .name("wlroots-capture".into())
             .spawn(move || {
                 let _g = rt.enter();
-                if let Err(e) = run_capture_loop(self.width, self.height, sink, self.idr_rx) {
+                if let Err(e) = run_capture_loop(self.width, self.height, sink, self.idr_rx, self.bitrate_rx) {
                     let _ = err_tx.send(e);
                 }
             })
@@ -737,6 +738,7 @@ fn run_capture_loop(
     height: u32,
     sink:   mpsc::Sender<EncodedFrame>,
     idr_rx: watch::Receiver<bool>,
+    bitrate_rx: tokio::sync::watch::Receiver<u64>,
 ) -> Result<(), SenderError> {
     let conn = Connection::connect_to_env()
         .map_err(|e| SenderError::CaptureInit(format!("Wayland connect: {e}")))?;
@@ -751,10 +753,11 @@ fn run_capture_loop(
     let (recycle_dma_tx, mut recycle_dma_rx) = mpsc::channel::<std::sync::Arc<DmaBuf>>(24);
     let sink_clone = sink.clone();
     let idr_clone = idr_rx.clone();
+    let bit_clone = bitrate_rx.clone();
 
     std::thread::Builder::new()
         .name("wlroots-encode".into())
-        .spawn(move || run_encode_loop(width, height, sink_clone, idr_clone, enc_rx, recycle_tx, recycle_dma_tx))
+        .spawn(move || run_encode_loop(width, height, sink_clone, idr_clone, enc_rx, recycle_tx, recycle_dma_tx, bit_clone))
         .map_err(|e| SenderError::CaptureInit(format!("encode thread: {e}")))?;
 
     let mut state = AppState {
@@ -906,6 +909,7 @@ fn run_encode_loop(
     mut rx:  mpsc::Receiver<RawFrame>,
     recycle_tx:     mpsc::Sender<std::sync::Arc<ShmBuf>>,
     recycle_dma_tx: mpsc::Sender<std::sync::Arc<DmaBuf>>,
+    bitrate_rx: tokio::sync::watch::Receiver<u64>,
 ) {
     let mut encoder: Option<AnyEncoder> = None;
     let mut flip_buf: Vec<u8> = Vec::new();
@@ -920,6 +924,7 @@ fn run_encode_loop(
                 frame.info.height,
                 sink.clone(),
                 idr_rx.clone(),
+                bitrate_rx.clone(),
             )
         });
 

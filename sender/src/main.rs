@@ -44,7 +44,9 @@ async fn main() {
 
     // ── Transport ────────────────────────────────────────────────────────────
     let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
-    let server = Arc::new(QuicServer::new(listen_addr, idr_tx).await);
+    let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(10_000_000u64);
+
+    let server = Arc::new(QuicServer::new(listen_addr, idr_tx, bitrate_tx).await);
     let sink   = server.frame_sink();
 
     // ── Capture + encode ─────────────────────────────────────────────────────
@@ -53,7 +55,7 @@ async fn main() {
     //   • wlroots-compositor  → WlrootsSender  (zwlr_screencopy, низкая latency)
     //   • иначе               → LinuxPipeWireSender (XDG Portal + PipeWire)
 
-    let sender = LinuxSender::new(1, 1, idr_rx);
+    let sender = LinuxSender::new(1, 1, idr_rx, bitrate_rx);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

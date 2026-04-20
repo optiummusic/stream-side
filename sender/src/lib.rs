@@ -120,7 +120,7 @@ pub const HEADER_LEN:       usize = 19;
 // ── Cache parameters ──────────────────────────────────────────────────────────
  
 /// How many distinct frame IDs to keep in the retransmit cache.
-const SHARD_CACHE_FRAMES: usize = 32;
+const SHARD_CACHE_FRAMES: usize = 256;
  
 // ── ShardCache ────────────────────────────────────────────────────────────────
 //

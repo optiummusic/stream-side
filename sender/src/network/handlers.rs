@@ -1,4 +1,7 @@
+use std::time::Instant;
+
 use super::*;
+static mut LAST_UPDATE: Option<Instant> = None;
 
 pub(crate) async fn handle_bi_stream(
     send: &mut quinn::SendStream,
@@ -148,9 +151,8 @@ pub(crate) async fn handle_uni_stream(
                     // Cache miss — frame evicted or IDR was already triggered.
                     log::warn!(
                         "[NACK] frame={frame_id} slice={slice_idx} group={group_idx} \
-                        not in cache for {label}; requesting IDR"
+                        not in cache for {label}."
                     );
-                    let _ = idr_tx.send(true);
                 }
             }
         _ => {}
@@ -168,7 +170,14 @@ pub(crate) fn client_to_server_us(t: u64, clock_offset: &AtomicI64) -> u64 {
     }
 }
 
-pub(crate) async fn handle_control(conn: &Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64, idr_tx: watch::Sender<bool>,) {
+pub(crate) async fn handle_control(
+    conn: &Connection, 
+    data: Bytes, 
+    info: &ConnectionInfo, 
+    clock_offset: &AtomicI64, 
+    idr_tx: watch::Sender<bool>, 
+    bitrate_tx: watch::Sender<u64>,
+) {
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
             ControlPacket::Ping { client_time_us } => {
@@ -198,7 +207,39 @@ pub(crate) async fn handle_control(conn: &Connection, data: Bytes, info: &Connec
             ControlPacket::Pong{..} => (),
             ControlPacket::OffsetUpdate { offset_us, rtt_us } => {
                 clock_offset.store(offset_us, Ordering::Relaxed);
-                log::info!("[{}] RTT: {:.1}ms", info.label().await, rtt_us as f64 / 1000.0);
+                let rtt_ms = rtt_us as f64 / 1000.0;
+                // Константы для настройки
+                const MIN_BITRATE: u64 = 100_000;  // 2 Мбит
+                const MAX_BITRATE: u64 = 50_000_000; // 30 Мбит
+                const RTT_THRESHOLD_MS: f64 = 60.0;  // Целевой пинг для облачного гейминга
+                const STEP_UP: u64 = 500_000;      // Прибавляем по 1 Мбит
+                const BACKOFF_FACTOR: f64 = 0.75;     // Срезаем 20% битрейта при лагах
+
+                let current_bitrate = *bitrate_tx.borrow();
+                let mut new_bitrate = current_bitrate;
+
+                if rtt_ms > RTT_THRESHOLD_MS {
+                    // 1. ЕСТЬ ЛАГ: Режем битрейт мультипликативно (быстро реагируем на затор)
+                    new_bitrate = (current_bitrate as f64 * BACKOFF_FACTOR) as u64;
+                } else if rtt_ms < (RTT_THRESHOLD_MS * 0.7) {
+                    // 2. ВСЁ ЧИСТО: Постепенно повышаем (аддитивно), чтобы не вызвать резкий затор
+                    new_bitrate = current_bitrate + STEP_UP;
+                }
+
+                // Зажимаем в рамки и проверяем на изменения
+                new_bitrate = new_bitrate.clamp(MIN_BITRATE, MAX_BITRATE);
+
+                let now = Instant::now();
+                let can_update = unsafe {
+                    LAST_UPDATE.map(|last| now.duration_since(last).as_millis() > 500).unwrap_or(true)
+                };
+                if new_bitrate != current_bitrate && can_update {
+                    if (new_bitrate as i64 - current_bitrate as i64).abs() >= 50_000 {
+                        log::warn!("[Congestion] RTT high ({:.1}ms), dropping bitrate to {:.2} Mbps", rtt_ms, new_bitrate as f64 / 1e6);
+                        let _ = bitrate_tx.send(new_bitrate);
+                        unsafe { LAST_UPDATE = Some(now); }
+                    }
+                }
             }
             ControlPacket::FrameFeedback { frame_id, trace } => {
                 let t = trace;

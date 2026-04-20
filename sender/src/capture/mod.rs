@@ -109,19 +109,19 @@ enum LinuxSenderInner {
 #[cfg(target_os = "linux")]
 impl LinuxSender {
     /// Создать sender. Автоматически выбирает wlroots или PipeWire.
-    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate_rx: tokio::sync::watch::Receiver<u64>,) -> Self {
         if wlroots::is_available() {
             log::info!("[LinuxSender] zwlr_screencopy_manager_v1 найден → WlrootsSender");
             Self {
                 inner: LinuxSenderInner::Wlroots(
-                    wlroots::WlrootsSender::new(width, height, idr_rx),
+                    wlroots::WlrootsSender::new(width, height, idr_rx, bitrate_rx),
                 ),
             }
         } else {
             log::info!("[LinuxSender] wlroots недоступен → LinuxPipeWireSender (XDG Portal)");
             Self {
                 inner: LinuxSenderInner::PipeWire(
-                    linux::LinuxPipeWireSender::new(width, height, idr_rx),
+                    linux::LinuxPipeWireSender::new(width, height, idr_rx, bitrate_rx),
                 ),
             }
         }

@@ -102,10 +102,10 @@ pub(crate) fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
             }
 
             count += 1;
-            let delay = if count < 10 {
-                Duration::from_millis(200)
+            let delay = if count < 20 {
+                Duration::from_millis(50)
             } else {
-                Duration::from_secs(3)
+                Duration::from_millis(100)
             };
 
             tokio::time::sleep(delay).await;
