@@ -12,6 +12,7 @@ pub(crate) use quinn::crypto::rustls::QuicServerConfig;
 pub(crate) use socket2::{Domain, Protocol, Socket, Type};
 pub(crate) use tokio::sync::{RwLock, broadcast, mpsc, watch};
 pub(crate) use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, VideoSlice};
+use crate::Senders;
 pub(crate) use crate::{ClientIdentity, ConnectionInfo, FramePacer, SerializedFrame, ShardCache};
 pub(crate) use crate::encode::EncodedFrame;
 pub(crate) use std::sync::Mutex;
@@ -25,7 +26,7 @@ pub use congestion::*;
 pub struct QuicServer {
     /// Cloneable handle for pushing encoded frames into the transport pipeline.
     frame_tx: mpsc::Sender<EncodedFrame>,
-    idr_tx: tokio::sync::watch::Sender<bool>,
+    senders: Senders,
 }
 
 impl QuicServer {
@@ -35,7 +36,7 @@ impl QuicServer {
     /// current Tokio runtime.
     ///
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
-    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>, bitrate_tx: watch::Sender<u64>, congestion_ctl: Arc<Mutex<CongestionController>>,) -> Self {
+    pub async fn new(listen_addr: SocketAddr, congestion_ctl: Arc<Mutex<CongestionController>>, senders: Senders,) -> Self {
         let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(32);
         let (bcast_tx, _) = broadcast::channel::<Arc<SerializedFrame>>(64);
         let shard_cache = Arc::new(ShardCache::new());
@@ -48,12 +49,12 @@ impl QuicServer {
         // 2. Задача приема соединений
         let endpoint = build_server_endpoint(listen_addr);
         let bcast_accept = bcast_tx.clone();
-        let idr_accept = idr_tx.clone();
+        let senders_clone = senders.clone();
         let sc_accept = shard_cache.clone();
         
-        tokio::spawn(run_accept_loop(endpoint, bcast_accept, idr_accept, sc_accept, bitrate_tx, congestion_ctl));
+        tokio::spawn(run_accept_loop(endpoint, bcast_accept, sc_accept, congestion_ctl, senders_clone, ));
 
-        Self { frame_tx, idr_tx }
+        Self { frame_tx, senders }
     }
 
     /// Return a cloneable sender for delivering encoded `(nal_bytes, is_key)` frames.

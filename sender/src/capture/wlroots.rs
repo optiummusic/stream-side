@@ -54,7 +54,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
 
-use crate::encode::{AnyEncoder, EncodedFrame, HwEncoder};
+use crate::{Watchers, capture::FrameGate, encode::{AnyEncoder, EncodedFrame, HwEncoder}};
 use super::SenderError;
 
 // ─── Detection ───────────────────────────────────────────────────────────────
@@ -103,13 +103,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for DetectState {
 pub struct WlrootsSender {
     width:  u32,
     height: u32,
-    idr_rx: watch::Receiver<bool>,
-    bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    watchers: Watchers
 }
 
 impl WlrootsSender {
-    pub fn new(width: u32, height: u32, idr_rx: watch::Receiver<bool>, bitrate_rx: tokio::sync::watch::Receiver<u64>,) -> Self {
-        Self { width, height, idr_rx, bitrate_rx }
+    pub fn new(width: u32, height: u32, watchers: Watchers) -> Self {
+        Self { width, height, watchers, }
     }
 }
 
@@ -124,7 +123,7 @@ impl super::VideoSender for WlrootsSender {
             .name("wlroots-capture".into())
             .spawn(move || {
                 let _g = rt.enter();
-                if let Err(e) = run_capture_loop(self.width, self.height, sink, self.idr_rx, self.bitrate_rx) {
+                if let Err(e) = run_capture_loop(sink, self.watchers) {
                     let _ = err_tx.send(e);
                 }
             })
@@ -644,6 +643,10 @@ fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle
 
     // ── DMA-BUF путь ────────────────────────────────────────────────────────
     if let (Some(dma_info), Some(dmabuf_proto)) = (state.dma_buf_info, state.linux_dmabuf.as_ref()) {
+        while let Ok(returned_buf) = state.recycle_dma_rx.try_recv() {
+            state.dma_pool.push(returned_buf);
+        }
+
         // Лениво инициализируем GBM.
         if state.gbm.is_none() {
             match open_drm_device() {
@@ -665,11 +668,7 @@ fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle
         }
 
         if let Some(gbm) = &state.gbm {
-            // Забираем переработанные DMA-BUF буферы.
-            while let Ok(returned_buf) = state.recycle_dma_rx.try_recv() {
-                state.dma_pool.push(returned_buf);
-            }
-
+            // 3. Ищем подходящий буфер в пуле
             let existing_idx = state.dma_pool.iter().position(|b| {
                 b.width == dma_info.width && 
                 b.height == dma_info.height && 
@@ -678,19 +677,21 @@ fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle
             });
 
             if let Some(idx) = existing_idx {
-                // Нашли готовый — забираем его
                 state.dma_buf_back = Some(state.dma_pool.remove(idx));
-            } else if state.dma_pool.len() < 3 { 
-                // Если в пуле пусто и буферов всего создано мало (< 3), создаем новый
+            } 
+            // 4. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
+            // Аллоцируем только если в пуле пусто И у нас нет готового буфера в dma_buf_back
+            else if state.dma_buf_back.is_none() && state.dma_pool.len() < 3 { 
                 match DmaBuf::alloc(gbm, dmabuf_proto, qh, dma_info) {
                     Ok(buf) => {
                         log::info!("[wlroots] Добавлен новый DMA-BUF в пул ({}x{})", dma_info.width, dma_info.height);
                         state.dma_buf_back = Some(std::sync::Arc::new(buf));
                     }
-                    Err(e) => { /* откат на SHM */ }
+                    Err(_) => { /* откат на SHM */ }
                 }
             }
 
+            // 5. Если в итоге буфер есть (из пула или новый), копируем
             if let Some(buf) = &state.dma_buf_back {
                 frame.copy(&buf.buffer);
                 state.status = CaptureStatus::Copying;
@@ -734,11 +735,8 @@ fn do_copy(state: &mut AppState, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle
 // ─── Основной цикл захвата ───────────────────────────────────────────────────
 
 fn run_capture_loop(
-    width:  u32,
-    height: u32,
     sink:   mpsc::Sender<EncodedFrame>,
-    idr_rx: watch::Receiver<bool>,
-    bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    watchers: Watchers
 ) -> Result<(), SenderError> {
     let conn = Connection::connect_to_env()
         .map_err(|e| SenderError::CaptureInit(format!("Wayland connect: {e}")))?;
@@ -752,12 +750,11 @@ fn run_capture_loop(
     let (recycle_tx, mut recycle_rx) = mpsc::channel::<std::sync::Arc<ShmBuf>>(24);
     let (recycle_dma_tx, mut recycle_dma_rx) = mpsc::channel::<std::sync::Arc<DmaBuf>>(24);
     let sink_clone = sink.clone();
-    let idr_clone = idr_rx.clone();
-    let bit_clone = bitrate_rx.clone();
+    let watch_clone = watchers.clone();
 
     std::thread::Builder::new()
         .name("wlroots-encode".into())
-        .spawn(move || run_encode_loop(width, height, sink_clone, idr_clone, enc_rx, recycle_tx, recycle_dma_tx, bit_clone))
+        .spawn(move || run_encode_loop(sink_clone, enc_rx, recycle_tx, recycle_dma_tx, watch_clone))
         .map_err(|e| SenderError::CaptureInit(format!("encode thread: {e}")))?;
 
     let mut state = AppState {
@@ -783,7 +780,7 @@ fn run_capture_loop(
         dma_pool:           Vec::new(),
         encode_tx:          enc_tx,
         sink,
-        idr_rx,
+        idr_rx:             watchers.idr_rx,
         fatal:              None,
     };
 
@@ -808,7 +805,7 @@ fn run_capture_loop(
     log::info!("[wlroots] Старт screencopy-петли (protocol v{})", state.screencopy_version);
     // Запускаем первый кадр
     request_next_frame(&mut state, &qh);
-
+    let mut fps_gate = FrameGate::new(watchers.capture_fps_rx);
     // Главный event loop — blocking_dispatch блокируется до прихода событий,
     // благодаря чему мы получаем frame-pacing от compositor (vblank).
     loop {
@@ -839,6 +836,20 @@ fn run_capture_loop(
                 state.y_invert      = false;
                 state.copy_used_dma = false;
                 state.status        = CaptureStatus::Idle;
+
+                if !fps_gate.allow() {
+                    if used_dma {
+                        if let Some(buf) = state.dma_buf_front.take() {
+                            state.dma_buf_back = Some(buf);
+                        }
+                    } else {
+                        if let Some(buf) = state.shm_buf_front.take() {
+                            state.shm_buf_back = Some(buf);
+                        }
+                    }
+                    request_next_frame(&mut state, &qh);
+                    continue;
+                }
 
                 if used_dma {
                     if let (Some(buf), Some(dma_info)) = (state.dma_buf_front.take(), saved_dma_info) {
@@ -902,14 +913,11 @@ fn run_capture_loop(
 }
 
 fn run_encode_loop(
-    width:   u32,
-    height:  u32,
     sink:    mpsc::Sender<EncodedFrame>,
-    idr_rx:  watch::Receiver<bool>,
     mut rx:  mpsc::Receiver<RawFrame>,
     recycle_tx:     mpsc::Sender<std::sync::Arc<ShmBuf>>,
     recycle_dma_tx: mpsc::Sender<std::sync::Arc<DmaBuf>>,
-    bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    watchers: Watchers
 ) {
     let mut encoder: Option<AnyEncoder> = None;
     let mut flip_buf: Vec<u8> = Vec::new();
@@ -923,8 +931,8 @@ fn run_encode_loop(
                 frame.info.width,
                 frame.info.height,
                 sink.clone(),
-                idr_rx.clone(),
-                bitrate_rx.clone(),
+                watchers.idr_rx.clone(),
+                watchers.bitrate_rx.clone(),
             )
         });
 

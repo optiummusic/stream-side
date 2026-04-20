@@ -4,10 +4,9 @@ use super::*;
 pub(crate) async fn handle_connection(
     conn: Connection,
     bcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
-    idr_tx: watch::Sender<bool>,
     shard_cache: Arc<ShardCache>,
-    bitrate_tx: watch::Sender<u64>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
+    senders: Senders,
 ) {
     let remote_addr = conn.remote_address();
     log::info!("[QUIC] Client connected: {}", remote_addr);
@@ -28,8 +27,8 @@ pub(crate) async fn handle_connection(
     let info_bi = info.clone();
     let info_uni = info.clone();
     let info_main = info.clone();
-    let idr_tx_uni = idr_tx.clone();
-    let idr_tx_main = idr_tx.clone();
+    let idr_tx_uni = senders.idr_tx.clone();
+    let send_main = senders.clone();
     let clock_off_main = clock_offset.clone();
     let conn_bi = conn.clone();
     let conn_uni = conn.clone();
@@ -56,27 +55,25 @@ pub(crate) async fn handle_connection(
     });
 
     // 3. Основной цикл отправки (Datagrams)
-    send_loop_to_client(conn, client_rx, info_main, &clock_off_main, idr_tx_main, bitrate_tx, congestion_ctl).await;
+    send_loop_to_client(conn, client_rx, info_main, &clock_off_main,congestion_ctl, send_main).await;
 }
 
 pub(crate) async fn run_accept_loop(
     endpoint: Endpoint,
     bcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
-    idr_tx: watch::Sender<bool>,
     shard_cache: Arc<ShardCache>,
-    bitrate_tx: watch::Sender<u64>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
+    senders: Senders,
 ) {
     while let Some(connecting) = endpoint.accept().await {
         let bcast_tx = bcast_tx.clone();
-        let idr_tx = idr_tx.clone();
         let shard_cache = shard_cache.clone();
-        let bit_tx = bitrate_tx.clone();
         let cong_clone = congestion_ctl.clone();
+        let senders_clone = senders.clone();
         tokio::spawn(async move {
             match connecting.await {
                 Ok(conn) => {
-                    handle_connection(conn, bcast_tx, idr_tx, shard_cache, bit_tx, cong_clone).await;
+                    handle_connection(conn, bcast_tx, shard_cache, cong_clone, senders_clone).await;
                 }
                 Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
             }

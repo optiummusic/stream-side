@@ -67,6 +67,8 @@ use pipewire::spa::sys as spa_sys;
 use pw::properties::properties;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::Watchers;
+use crate::capture::FrameGate;
 use crate::encode::{self, EncodedFrame};
 
 use super::SenderError;
@@ -80,14 +82,13 @@ use super::super::encode::{AnyEncoder, HwEncoder};
 pub struct LinuxPipeWireSender {
     width:  u32,
     height: u32,
-    idr_rx: tokio::sync::watch::Receiver<bool>,
-    bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    watchers: Watchers
 }
 
 impl LinuxPipeWireSender {
     /// Создать sender для захвата и кодирования в разрешении `width × height`.
-    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>, bitrate_rx: tokio::sync::watch::Receiver<u64>,) -> Self {
-        Self { width, height, idr_rx, bitrate_rx }
+    pub fn new(width: u32, height: u32, watchers: Watchers) -> Self {
+        Self { width, height, watchers }
     }
 }
 
@@ -122,7 +123,7 @@ impl super::VideoSender for LinuxPipeWireSender {
             .name("pipewire-capture".into())
             .spawn(move || {
                 let _guard = rt_handle.enter();
-                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.idr_rx, self.bitrate_rx) {
+                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.watchers) {
                     let _ = err_tx.send(e);
                 }
             })
@@ -172,8 +173,7 @@ fn run_pipewire(
     width:   u32,
     height:  u32,
     sink:    mpsc::Sender<EncodedFrame>,
-    idr_rx: tokio::sync::watch::Receiver<bool>,
-    bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    watchers: Watchers
 ) -> Result<(), SenderError> {
     pw::init();
 
@@ -210,7 +210,8 @@ fn run_pipewire(
     let mut fps_tick    = std::time::Instant::now();
 
     use common::FrameTrace;
-
+    let mut fps_gate = FrameGate::new(watchers.capture_fps_rx);
+    
     let _listener = stream
         .add_local_listener::<()>()
         .state_changed(|stream, _user_data, old, new| { 
@@ -287,10 +288,14 @@ fn run_pipewire(
                     return;
                 }
 
+                if !fps_gate.allow() {
+                    stream.queue_raw_buffer(raw);
+                    return;
+                }
                 let enc = encoder.get_or_insert_with(|| {
                     log::info!("[ENCODER] Init with width {:?}, height {:?}", pw_width.get(), pw_height.get(),);
                     AnyEncoder::detect_and_create(
-                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(), bitrate_rx.clone()
+                        pw_width.get(), pw_height.get(), sink.clone(), watchers.idr_rx.clone(), watchers.bitrate_rx.clone()
                     )
                 });
 

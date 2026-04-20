@@ -2,7 +2,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use common::fec::assembler::FrameAssembler;
 
 
-const IDR_INTERVAL_MS: u64 = 100; 
+const IDR_INTERVAL_MS: u64 = 500; 
 use crate::VideoWorkerMsg;
 
 use super::*;

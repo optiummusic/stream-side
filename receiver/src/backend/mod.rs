@@ -183,6 +183,8 @@ pub trait VideoBackend: Send + 'static {
     /// Безопасно вызывать несколько раз.
     fn shutdown(&mut self);
 
+
+    
     #[cfg(target_os = "android")]
     unsafe fn init_with_surface(
         &mut self, 

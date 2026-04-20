@@ -21,6 +21,20 @@ pub struct ClientIdentity {
     ready: bool,
 }
 
+#[derive(Clone)]
+pub struct Watchers {
+    pub idr_rx: tokio::sync::watch::Receiver<bool>, 
+    pub bitrate_rx: tokio::sync::watch::Receiver<u64>, 
+    pub capture_fps_rx: tokio::sync::watch::Receiver<Option<u32>>,
+}
+
+#[derive(Clone)]
+pub struct Senders {
+    pub idr_tx: tokio::sync::watch::Sender<bool>, 
+    pub bitrate_tx: tokio::sync::watch::Sender<u64>, 
+    pub capture_fps_tx: tokio::sync::watch::Sender<Option<u32>>,
+}
+
 #[derive(Default)]
 pub struct ConnectionInfo {
     remote: String,
