@@ -57,7 +57,7 @@ use std::ptr;
 use bytes::BytesMut;
 use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 
-use crate::backend::PushStatus;
+use crate::backend::{HevcSpsInfo, PushStatus, SkipFrameTemplate, SliceHeaderInfo};
 #[cfg(unix)]
 use crate::types::DmaBufFrame;
 
@@ -83,6 +83,11 @@ pub struct DesktopFfmpegBackend {
     pending_traces: HashMap<u64, (u64, Option<FrameTrace>)>,
     current_frame_trace: Option<FrameTrace>,
     slice_buffer:   BytesMut,
+    poc_lsb:             u32,
+    next_slice_idx:      u8,
+    skip_frame_template: Option<SkipFrameTemplate>,
+    sps_info: Option<HevcSpsInfo>,
+
     // ── CPU-путь (fallback) ──────────────────────────────────────────────────
 
     /// Переиспользуемый CPU AVFrame для av_hwframe_transfer_data.
@@ -134,8 +139,10 @@ impl DesktopFfmpegBackend {
 
         unsafe {
             let raw = ctx.as_mut_ptr();
-            (*raw).flags |= AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*raw).flags  |= AV_CODEC_FLAG_LOW_DELAY as i32;
             (*raw).flags2 |= AV_CODEC_FLAG2_CHUNKS as i32;
+            (*raw).flags2 |= AV_CODEC_FLAG2_SHOW_ALL as i32; // показывать битые кадры
+            (*raw).err_recognition = AV_EF_CAREFUL as i32;   // мягкая детекция ошибок
             (*raw).thread_count = 1;
         }
 
@@ -198,6 +205,10 @@ impl DesktopFfmpegBackend {
             pending_traces: HashMap::new(),
             slice_buffer:   BytesMut::with_capacity(1024 * 512),
             current_frame_trace: None,
+            sps_info: None,
+            poc_lsb: 0,
+            next_slice_idx: 0,
+            skip_frame_template: None,
             transfer_frame,
             scaler_out:     None,
             y_pool:         Vec::new(),
@@ -244,7 +255,35 @@ impl Drop for DesktopFfmpegBackend {
 // VideoBackend
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn iter_nalus(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut positions = vec![];
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let is_3 = data[i] == 0 && data[i+1] == 0 && data[i+2] == 1;
+        let is_4 = i + 4 <= data.len() && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1;
+        if is_4 { positions.push(i + 4); i += 4; }
+        else if is_3 { positions.push(i + 3); i += 3; }
+        else { i += 1; }
+    }
+    positions.windows(2)
+        .map(|w| &data[w[0]..w[1]])
+        .chain(positions.last().map(|&start| &data[start..]))
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+fn hevc_nal_type(nalu: &[u8]) -> u8 {
+    if nalu.is_empty() { return 0xff; }
+    (nalu[0] >> 1) & 0x3F
+}
+
 impl VideoBackend for DesktopFfmpegBackend {
+    fn get_poc_lsb(&mut self) -> &mut u32 {
+        &mut self.poc_lsb
+    }
+    fn get_skip_frame_template(&self) -> Option<&SkipFrameTemplate> {
+        self.skip_frame_template.as_ref()
+    }
     fn get_current_trace(&mut self) -> &mut Option<FrameTrace> {
         &mut self.current_frame_trace
     }
@@ -252,6 +291,51 @@ impl VideoBackend for DesktopFfmpegBackend {
         &mut self.slice_buffer
     }
     fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+        if self.sps_info.is_none() {
+            for nalu in iter_nalus(payload) {
+                let nal_type = hevc_nal_type(nalu);
+                if nal_type == 33 { // SPS_NUT
+                    // Парсим log2_max_pic_order_cnt_lsb_minus4 из SPS RBSP
+                    // В SPS после 2-байт NAL header идут поля, нам нужно добраться до нужного
+                    if let Some(log2_max) = SkipFrameTemplate::parse_sps_poc_bits(nalu) {
+                        self.sps_info = Some(HevcSpsInfo {
+                            log2_max_poc_lsb: log2_max + 4,
+                        });
+                        log::info!("[Concealment] SPS parsed, log2_max_poc_lsb={}", log2_max + 4);
+                    }
+                }
+            }
+        }
+
+        // Строим шаблон из первого P-slice
+        if self.sps_info.is_some() && self.skip_frame_template.is_none() {
+            for nalu in iter_nalus(payload) {
+                let nal_type = hevc_nal_type(nalu);
+                if nal_type == 1 { // TRAIL_R — обычный P-кадр
+                    if let Some(sps) = &self.sps_info {
+                        if let Some(info) = SliceHeaderInfo::parse(nalu, sps) {
+                            log::info!("[Concealment] Built template from TRAIL_R, poc_bit_offset={}", info.poc_lsb_bit_offset);
+                            self.skip_frame_template = Some(SkipFrameTemplate::from_real_frame(nalu, &info));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(sps) = &self.sps_info {
+            for nalu in iter_nalus(payload) {
+                let nal_type = hevc_nal_type(nalu);
+                // TRAIL_R (1), TRAIL_N (0) — обычные P-кадры
+                if nal_type == 0 || nal_type == 1 {
+                    if let Some(info) = SliceHeaderInfo::parse(nalu, sps) {
+                        self.poc_lsb = info.poc_lsb;
+                        break;
+                    }
+                }
+            }
+        }
+
         self.fps_counter += 1;
 
         // 2. Проверка времени (раз в секунду)

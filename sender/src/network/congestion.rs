@@ -121,8 +121,8 @@ impl CongestionController {
         // 2. Очистка устаревших состояний контроля
         match self.control_state {
             ControlState::Recovering { until } if now >= until => {
-                let lock_time =
-                    self.config.base_lock_duration * (2_u32.pow(self.consecutive_failures));
+                let lock_time = self.config.base_lock_duration 
+                    * (2_u32.pow(self.consecutive_failures.min(2)));
                 self.control_state = ControlState::Locked { until: now + lock_time };
             }
             ControlState::Locked { until } if now >= until => {
