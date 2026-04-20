@@ -65,6 +65,8 @@ impl AnyEncoder {
         height: u32,
         sink:   mpsc::Sender<EncodedFrame>,
         idr_rx: watch::Receiver<bool>,
+        bitrate_rx: tokio::sync::watch::Receiver<u64>,
+        
     ) -> Self {
         match detect_gpu_vendor() {
             GpuVendor::Nvidia => {
@@ -73,7 +75,7 @@ impl AnyEncoder {
             }
             v => {
                 log::info!("[Encoder] Vendor {v:?} → hevc_vaapi (VAAPI)");
-                Self::Vaapi(VaapiEncoder::new(width, height, sink, idr_rx))
+                Self::Vaapi(VaapiEncoder::new(width, height, sink, idr_rx, bitrate_rx))
             }
         }
     }

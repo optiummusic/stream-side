@@ -1,6 +1,8 @@
 use std::sync::mpsc::{SyncSender, sync_channel};
 use common::fec::assembler::FrameAssembler;
 
+
+const IDR_INTERVAL_MS: u64 = 100; 
 use crate::VideoWorkerMsg;
 
 use super::*;
@@ -9,6 +11,7 @@ pub(crate) struct VideoState {
     pub waiting_for_key: bool,
     pub expected_frame_id: Option<u64>,
     pub expected_slice_idx: u8,
+    pub last_idr: Instant,
 }
 
 pub(crate) fn spawn_video_backend_worker<B: VideoBackend>(
@@ -44,6 +47,7 @@ where
             waiting_for_key: true,
             expected_frame_id: None,
             expected_slice_idx: 0,
+            last_idr: Instant::now(),
         };
 
         while let Ok(msg) = rx.recv() {
@@ -142,6 +146,28 @@ where
     });
 
     tx
+}
+
+pub(crate) fn request_idr(
+    state:      &mut VideoState,
+    idr_needed_tx: &watch::Sender<bool>,
+    packet_frame_id: u64, 
+) {
+    let elapsed = state.last_idr.elapsed();
+    if elapsed >= Duration::from_millis(IDR_INTERVAL_MS) {
+        state.last_idr = Instant::now();
+        let _ = idr_needed_tx.send(true);
+        
+        log::info!(
+            "IDR Requested. Frame mismatch at #{} (Expected {:?}). Last request was {:?} ago", 
+            packet_frame_id, 
+            state.expected_frame_id,
+            elapsed
+        );
+    } else {
+        log::trace!("IDR request suppressed: cooldown active ({:?} left)", 
+            Duration::from_millis(IDR_INTERVAL_MS).saturating_sub(elapsed));
+    }
 }
 
 pub(crate) async fn connect_quic(
@@ -251,19 +277,22 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
 ) {
     // ── In-order / IDR gate ───────────────────────────────────────────────
-    if packet.is_key && state.waiting_for_key {
+    if packet.is_key && state.waiting_for_key{
         state.waiting_for_key = false;
         state.expected_frame_id = Some(packet.frame_id);
         state.expected_slice_idx = 0; 
         let _ = idr_needed_tx.send(false);
-        log::info!("[Video] Keyframe start received, synced to frame #{}", packet.frame_id);
+        log::trace!("[Video] Keyframe start received, synced to frame #{}", packet.frame_id);
     } 
 
     if state.waiting_for_key {
+        log::trace!("[Video] Slice dropped on frame #{} because we still wait for I-Frame", packet.frame_id);
         return;
     }
+
     if Some(packet.frame_id) != state.expected_frame_id {
         if Some(packet.frame_id) < state.expected_frame_id {
+            log::trace!("[Video] Slice dropped on frame #{} because it's older than expected #{}", packet.frame_id, state.expected_frame_id.unwrap());
             return;
         }
         // Clear slice buffer
@@ -271,21 +300,21 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
         
 
         state.waiting_for_key = true;
-        log::info!("Request keyframe: Frame jump detected (got {}, expected {:?})", packet.frame_id, state.expected_frame_id);
-        let _ = idr_needed_tx.send(true);
+        request_idr(state, idr_needed_tx, packet.frame_id);
         return;
     }
 
     if packet.slice_idx != state.expected_slice_idx {
+        log::trace!(
+            "[Video] Slice mismatch on frame #{}: got {}, expected {}. Dropping frame.",
+            packet.frame_id, packet.slice_idx, state.expected_slice_idx
+        );
         // Clear slice buffer
         backend.clear_buffer();
         
         state.waiting_for_key = true;
-        log::info!(
-            "Request keyframe: Slice gap in frame #{} (got {}, expected {})", 
-            packet.frame_id, packet.slice_idx, state.expected_slice_idx
-        );
-        let _ = idr_needed_tx.send(true);
+
+        request_idr(state, idr_needed_tx, packet.frame_id);
         return;
     }
     
@@ -293,6 +322,10 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     state.expected_slice_idx += 1;
 
     if packet.is_last {
+        log::trace!(
+            "[Video] Frame #{} fully assembled ({} slices), pushing to backend", 
+            packet.frame_id, state.expected_slice_idx
+        );
         state.expected_frame_id = Some(packet.frame_id + 1);
         state.expected_slice_idx = 0;
     }
@@ -312,7 +345,16 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
                 ),
             });
         }
-        Ok(PushStatus::Accepted) => {}
+        Ok(PushStatus::Accepted {fps}) => {
+            #[cfg(target_os = "android")]
+            if fps > 0 
+            {            
+                let _ = ctrl.try_send(ControlPacket::Communication { 
+                message: format!(
+                    "My fps is {fps}"
+                ) });
+            }
+        }
         Ok(PushStatus::Accumulating) => {}
         Err(e) => {
             let _ = ctrl.try_send(ControlPacket::Communication {

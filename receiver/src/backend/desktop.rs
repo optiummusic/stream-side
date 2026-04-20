@@ -285,7 +285,7 @@ impl VideoBackend for DesktopFfmpegBackend {
         // (2 000 000 µs ≈ 2 s; covers any realistic decode latency.)
         const HORIZON_US: u64 = 5_000_000;
         self.pending_traces.retain(|&k, _| k >= pts_key.saturating_sub(HORIZON_US));
-        Ok(PushStatus::Accepted)
+        Ok(PushStatus::Accepted {fps: 0})
     }
 
     fn poll_output(&mut self) -> Result<FrameOutput, BackendError> {

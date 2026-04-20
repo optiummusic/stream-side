@@ -32,7 +32,7 @@ impl QuicServer {
     /// current Tokio runtime.
     ///
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
-    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>) -> Self {
+    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>, bitrate_tx: watch::Sender<u64>,) -> Self {
         let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(32);
         let (bcast_tx, _) = broadcast::channel::<Arc<SerializedFrame>>(64);
         let shard_cache = Arc::new(ShardCache::new());
@@ -48,7 +48,7 @@ impl QuicServer {
         let idr_accept = idr_tx.clone();
         let sc_accept = shard_cache.clone();
         
-        tokio::spawn(run_accept_loop(endpoint, bcast_accept, idr_accept, sc_accept));
+        tokio::spawn(run_accept_loop(endpoint, bcast_accept, idr_accept, sc_accept, bitrate_tx));
 
         Self { frame_tx, idr_tx }
     }

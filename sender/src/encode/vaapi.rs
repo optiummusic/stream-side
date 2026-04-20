@@ -53,7 +53,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 20_000_000;
+const BITRATE: i64 = 30_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +104,13 @@ impl VaapiEncoder {
     ///
     /// # Panics
     /// Паникует, если `hevc_vaapi` недоступен или VAAPI/DRM недоступны.
-    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn new(
+        width: u32, 
+        height: u32, 
+        sink: async_mpsc::Sender<EncodedFrame>, 
+        idr_rx: tokio::sync::watch::Receiver<bool>,
+        bitrate_rx: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (free_tx, free_rx)   = mpsc::channel::<Vec<u8>>();
@@ -116,10 +122,11 @@ impl VaapiEncoder {
 
         ffmpeg::init().unwrap();
         let idr_rx_clone = idr_rx.clone();
+        let bitrate_rx_clone = bitrate_rx.clone();
         let worker = thread::Builder::new()
             .name("vaapi-encoder".into())
             .spawn(move || {
-                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone);
+                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone, bitrate_rx_clone);
             })
             .expect("failed to spawn encoder thread");
 
@@ -191,49 +198,54 @@ impl Drop for VaapiConvertGraph {
     }
 }
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Цикл энкодера (отдельный OS-поток)
-// ─────────────────────────────────────────────────────────────────────────────
-unsafe fn dump_transfer_formats(
-    label: &str,
-    frames_ref: *mut AVBufferRef,
-    dir: AVHWFrameTransferDirection,
+unsafe fn apply_encoder_params(
+    raw: *mut ffmpeg::ffi::AVCodecContext,
+    width: u32,
+    height: u32,
+    bitrate: u64,
 ) {
-    if frames_ref.is_null() {
-        log::warn!("[HWFMT] {label}: frames_ref is null");
-        return;
+    unsafe {
+        (*raw).width          = width  as i32;
+        (*raw).height         = height as i32;
+        (*raw).time_base      = AVRational { num: 1, den: 60 };
+        (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*raw).bit_rate       = bitrate as i64;
+        (*raw).rc_max_rate    = bitrate as i64;
+        (*raw).rc_buffer_size = bitrate as i32 / 2;
+        (*raw).max_b_frames   = 0;
+        (*raw).delay          = 0;
+        (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+        (*raw).slices       = 4;
     }
+}
 
-    let mut formats: *mut AVPixelFormat = std::ptr::null_mut();
-    let ret = av_hwframe_transfer_get_formats(frames_ref, dir, &mut formats, 0);
-
-    if ret < 0 {
-        log::warn!("[HWFMT] {label}: av_hwframe_transfer_get_formats failed: {ret}");
-        return;
-    }
-
-    log::warn!("[HWFMT] {label}: supported transfer formats:");
-
-    let mut i = 0usize;
-    loop {
-        let fmt = *formats.add(i);
-        if fmt == AVPixelFormat::AV_PIX_FMT_NONE {
-            break;
+fn create_vaapi_encoder(
+    codec: &ffmpeg_next::Codec,
+    width: u32,
+    height: u32,
+    bitrate: u64,
+    hw_frames_ctx: *mut ffmpeg::ffi::AVBufferRef,
+) -> Result<ffmpeg::encoder::Video, ffmpeg::Error> {
+    let mut enc_ctx = ffmpeg::codec::context::Context::new_with_codec(codec.clone());
+    
+    unsafe {
+        let raw = enc_ctx.as_mut_ptr();
+        apply_encoder_params(raw, width, height, bitrate);
+        if !hw_frames_ctx.is_null() {
+            (*raw).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(hw_frames_ctx);
         }
-
-        let name_ptr = av_get_pix_fmt_name(fmt);
-        if !name_ptr.is_null() {
-            let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
-            log::warn!("[HWFMT]   - {name}");
-        } else {
-            log::warn!("[HWFMT]   - {:?}", fmt);
-        }
-
-        i += 1;
     }
 
-    av_free(formats as *mut _);
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("async_depth", "1");
+    opts.set("low_delay_brc", "1");
+    opts.set("intra_refresh", "1");
+    opts.set("intra_refresh_type", "both");
+    opts.set("mbtree", "0");
+    opts.set("tune", "zerolatency");
+    opts.set("rc_mode", "CBR");
+
+    enc_ctx.encoder().video()?.open_with(opts)
 }
 
 fn run_encoder_loop(
@@ -244,62 +256,24 @@ fn run_encoder_loop(
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
     mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    mut bitrate_rx: tokio::sync::watch::Receiver<u64>,
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
 
     let codec = codec::encoder::find_by_name("hevc_vaapi")
         .expect("hevc_vaapi encoder not found; ensure VA-API is available");
 
-    let mut enc_ctx = codec::context::Context::new_with_codec(codec);
+    let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) = unsafe {
+        // dummy ctx для получения референсов
+        let mut tmp_ctx = codec::context::Context::new_with_codec(codec.clone());
+        (*tmp_ctx.as_mut_ptr()).width = width as i32;
+        (*tmp_ctx.as_mut_ptr()).height = height as i32;
+        init_hw_contexts(tmp_ctx.as_mut_ptr(), width, height)
+    };
 
-    unsafe {
-        let raw = enc_ctx.as_mut_ptr();
-        (*raw).width          = width  as i32;
-        (*raw).height         = height as i32;
-        (*raw).time_base      = AVRational { num: 1, den: 60 };
-        (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*raw).bit_rate       = BITRATE;
-        (*raw).rc_max_rate    = BITRATE;
-        (*raw).rc_buffer_size = BITRATE as i32 / 2;
-        (*raw).max_b_frames   = 0;
-        (*raw).delay          = 0;
-        (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
-        (*raw).slices       = 4;
-    }
-
-    let mut opts = ffmpeg::Dictionary::new();
-    opts.set("async_depth",   "1");
-    opts.set("low_delay_brc", "1");
-    opts.set("intra_refresh", "1");
-    opts.set("intra_refresh_type", "both");
-    opts.set("mbtree", "0"); 
-    opts.set("tune", "zerolatency");
-    // VAAPI + DRM: создаём оба контекста через единый DRM-девайс.
-    // ВАЖНО: VAAPI должен быть ПРОИЗВОДНЫМ от DRM-девайса, чтобы оба контекста
-    // разделяли один и тот же fd DRM-устройства. Только тогда av_hwframe_transfer_data
-    // (DRM_PRIME → VAAPI) сможет шарить DMA-BUF без EINVAL (-22).
-    let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) =
-        unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) };
-
-    if drm_frames_ref.is_null() {
-        log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
-                    SPA_DATA_DmaBuf frames will be dropped.");
-    } else {
-        log::info!("[Encoder] DMA-BUF zero-copy.");
-    }
-
-    let mut encoder = enc_ctx
-        .encoder()
-        .video()
-        .expect("video encoder")
-        .open_with(opts)
-        .expect("avcodec_open2 failed");
-
-    unsafe {
-        (*encoder.as_mut_ptr()).gop_size = 300;
-    }
-
-    // ── SwsScale для CPU-пути (BGRA → NV12) ─────────────────────────────────
+    let mut current_bitrate = *bitrate_rx.borrow();
+    let mut encoder: codec::encoder::Video = create_vaapi_encoder(&codec, width, height, current_bitrate, hw_enc_ref)
+        .expect("Initial encoder open failed");
 
     let mut scaler = scaling::Context::get(
         Pixel::BGRA, width, height,
@@ -311,6 +285,23 @@ fn run_encoder_loop(
     // Сигнал о готовности.
     ready_tx.send(()).unwrap();
 
+    unsafe {
+        let mut current_rc_mode: i64 = 0;
+        let rc_mode_str = std::ffi::CString::new("rc_mode").unwrap();
+        
+        // Пытаемся достать текущий режим из приватных данных
+        ffmpeg::ffi::av_opt_get_int((*encoder.as_mut_ptr()).priv_data, rc_mode_str.as_ptr(), 0, &mut current_rc_mode);
+        
+        log::info!("[VAAPI-Check] Current RC Mode: {}", match current_rc_mode {
+            0 => "DEFAULT (Auto)",
+            1 => "CQP (Constant QP)",
+            2 => "CBR (Constant Bit Rate)",
+            3 => "VBR (Variable Bit Rate)",
+            4 => "ICQ (Intelligent Constant Quality)",
+            _ => "OTHER",
+        });
+    }
+
     // ── Цикл кадров ──────────────────────────────────────────────────────────
 
     let mut started    = false;
@@ -320,7 +311,6 @@ fn run_encoder_loop(
 
     // We add this for P-Skip frames
     let mut last_hw_frame: *mut AVFrame = std::ptr::null_mut();
-
     loop {
         // Получаем VAAPI hw_frame в зависимости от типа входа.
         let hw_frame_opt: Option<*mut AVFrame> = match rx.recv_timeout(std::time::Duration::from_millis(100)) { // Starvation = give frames at 10 FPS pace
@@ -333,6 +323,20 @@ fn run_encoder_loop(
                     }
                     frame_data  = newer.0;
                     capture_us  = newer.1;
+                }
+
+                if bitrate_rx.has_changed().unwrap_or(false) {
+                    let new_bitrate = *bitrate_rx.borrow_and_update();
+                    if new_bitrate != current_bitrate {
+                        log::info!("[Encoder] Bitrate watch changed: {} -> {}", current_bitrate, new_bitrate);
+                        match create_vaapi_encoder(&codec, width, height, new_bitrate, hw_enc_ref) {
+                            Ok(new_enc) => {
+                                encoder = new_enc;
+                                current_bitrate = new_bitrate;
+                            }
+                            Err(e) => log::error!("Failed to switch bitrate: {:?}", e),
+                        }
+                    }
                 }
 
                 if idr_rx.has_changed().unwrap_or(false) {

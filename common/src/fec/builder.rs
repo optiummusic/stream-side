@@ -20,6 +20,10 @@ pub(crate) struct FrameBuilder {
     pub(crate) total_slices: u8,
     pub(crate) first_us: u64,
     next_emit_idx: u8,
+    /// Packets that have been decoded and are waiting for the HOL flush loop
+    /// to release them in order.  Populated incrementally as slices complete;
+    /// drained all at once by [`take_packets`] when the frame is complete.
+    ready_packets: Vec<VideoPacket>,
 }
 
 impl FrameBuilder {
@@ -33,17 +37,26 @@ impl FrameBuilder {
             total_slices,
             first_us: FrameTrace::now_us(),
             next_emit_idx: 0,
+            ready_packets: Vec::new(),
         }
     }
 
+    /// Returns `true` once every slice has been decoded and staged in
+    /// `ready_packets`.
     pub(crate) fn is_complete(&self) -> bool {
         self.next_emit_idx == self.total_slices
     }
 
-    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Option<Vec<VideoPacket>> {
+    /// Insert a chunk into this builder.
+    ///
+    /// Unlike the old API this method no longer returns packets directly;
+    /// decoded packets are accumulated in `ready_packets` and released only
+    /// when the [`FrameAssembler`]'s HOL flush loop decides it is this
+    /// frame's turn.
+    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) {
         let slice_idx = chunk.slice_idx as usize;
         if slice_idx >= self.decoded_slices.len() {
-            return None;
+            return;
         }
 
         let ready = {
@@ -56,15 +69,29 @@ impl FrameBuilder {
         };
 
         if !ready || self.decoded_slices[slice_idx].is_some() {
-            return None;
+            return;
         }
 
         if let Some(video_slice) = self.decode_slice(chunk.slice_idx) {
             self.decoded_slices[slice_idx] = Some(video_slice);
         }
 
-        let packets = self.try_emit_ordered();
-        if packets.is_empty() { None } else { Some(packets) }
+        // Drain any newly unlocked slices (in-order from next_emit_idx)
+        // into the internal staging buffer.
+        let new_packets = self.try_emit_ordered();
+        self.ready_packets.extend(new_packets);
+    }
+
+    /// Drain all staged packets if the frame is fully assembled.
+    ///
+    /// Returns `None` if the frame is still incomplete.  After returning
+    /// `Some(_)` the caller should remove this builder from the map.
+    pub(crate) fn take_packets(&mut self) -> Option<Vec<VideoPacket>> {
+        if self.is_complete() {
+            Some(std::mem::take(&mut self.ready_packets))
+        } else {
+            None
+        }
     }
 
     fn decode_slice(&self, slice_idx: u8) -> Option<VideoSlice> {
@@ -74,7 +101,10 @@ impl FrameBuilder {
         Some(video_slice)
     }
 
-    pub fn try_emit_ordered(&mut self) -> Vec<VideoPacket> {
+    /// Advance `next_emit_idx` as far as possible in slice order and return
+    /// the newly-unlocked packets.  Called internally; results are staged in
+    /// `ready_packets`, not returned to the assembler directly.
+    pub(crate) fn try_emit_ordered(&mut self) -> Vec<VideoPacket> {
         let mut packets = Vec::new();
 
         while self.next_emit_idx < self.total_slices {

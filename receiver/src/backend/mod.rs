@@ -96,7 +96,7 @@ pub enum FrameOutput {
 }
 
 pub enum PushStatus {
-    Accepted,
+    Accepted{fps: u32},
     Accumulating,
     Dropped{age: Option<f32>},
 }
