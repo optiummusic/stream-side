@@ -171,20 +171,6 @@ pub trait VideoBackend: Send + 'static {
     /// Вызывается при обнаружении потери вместо clear_buffer.
     /// Отправляет skip-заглушку декодеру чтобы не рвать prediction chain,
     /// затем чистит буфер слайсов.
-    fn conceal_and_clear(&mut self, lost_frame_id: u64) {
-        // poc_lsb указывает на СЛЕДУЮЩИЙ ожидаемый кадр,
-        // заглушка должна иметь этот poc и ссылаться на poc-1
-        let poc = *self.get_poc_lsb();
-
-        let skip_frame = self.get_skip_frame_template()
-            .map(|t| t.make_frame(poc));
-
-        if let Some(frame) = skip_frame {
-            let _ = self.submit_to_decoder(&frame, lost_frame_id, None);
-            log::info!("[Concealment] Freeze frame for lost frame_id={lost_frame_id}, poc_lsb={poc}");
-        }
-        self.clear_buffer();
-    }
 
     fn clear_buffer(&mut self) {
         self.get_slice_buffer().clear();
@@ -201,13 +187,6 @@ pub trait VideoBackend: Send + 'static {
     /// Освободить все ресурсы (codec, surface, GPU handles).
     /// Безопасно вызывать несколько раз.
     fn shutdown(&mut self);
-
-
-    /// Текущий PicOrderCntLsb — трекаем на каждом submit_to_decoder
-    fn get_poc_lsb(&mut self) -> &mut u32;
-
-    fn get_skip_frame_template(&self) -> Option<&SkipFrameTemplate>;
-
     
     #[cfg(target_os = "android")]
     unsafe fn init_with_surface(
@@ -223,8 +202,6 @@ pub trait VideoBackend: Send + 'static {
 // Экспорт конкретных реализаций
 // ─────────────────────────────────────────
 
-pub(crate) mod hevc_parser;
-pub(crate) use hevc_parser::*;
 
 #[cfg(not(target_os = "android"))]
 pub mod desktop;
