@@ -37,7 +37,7 @@ pub(crate) fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
     // Path MTU = 1500 (Ethernet) - 20 (IP) - 8 (UDP) - ~20 (QUIC) = ~1452.
     // We probe at 1400 to stay safe across VPN tunnels and 802.11 frames.
     // Quinn will discover the actual maximum via PMTUD automatically.
-    t.initial_mtu(1200);
+    t.initial_mtu(9000);
 
     // Keep-alive: prevents NAT table expiry and detects dead connections within
     // ~1.5 × keep_alive_interval, long before `max_idle_timeout` fires.

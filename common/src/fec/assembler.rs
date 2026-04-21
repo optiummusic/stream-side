@@ -1,4 +1,4 @@
-use crate::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket, fec::builder::FrameBuilder};
+use crate::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket, fec::{builder::FrameBuilder, stats::RecoveryStats}};
 
 use super::*;
 
@@ -22,10 +22,10 @@ const MAX_BUFFERED_FRAMES: u64 = 140;
 /// Without case 2 the HOL pointer would stall until `out_of_window` fires,
 /// which at 60 fps takes 140 frames ≈ 2.3 s — causing a multi-second freeze
 /// rather than the intended sub-STALE_FRAME_US hiccup.
-const STALE_FRAME_US: u64 = 40_000;
+const STALE_FRAME_US: u64 = 80_000;
 
 /// Minimum interval between NACKs for the same (frame, slice, group) triple.
-const NACK_SUPPRESS_US: u64 = 50_000;
+const NACK_SUPPRESS_US: u64 = 2_000;
 
 /// Do NOT fire a NACK for a frame whose first shard arrived less than this
 /// long ago.  Shards are paced by the sender and will still be in flight.
@@ -57,6 +57,8 @@ pub struct FrameAssembler {
     /// absent frame, bounding the worst-case freeze to one `STALE_FRAME_US`
     /// interval regardless of packet-loss pattern.
     hol_stall_since_us: Option<u64>,
+    stats: RecoveryStats,
+    stats_every_us: u64,
 }
 
 impl FrameAssembler {
@@ -67,6 +69,8 @@ impl FrameAssembler {
             last_evicted_id: None,
             next_to_push_id: None,
             hol_stall_since_us: None,
+            stats: RecoveryStats::default(),
+            stats_every_us: 5_000_000,
         }
     }
 
@@ -82,6 +86,12 @@ impl FrameAssembler {
         let frame_id = chunk.frame_id;
         let now_us   = FrameTrace::now_us();
 
+        let key = (chunk.frame_id, chunk.slice_idx, chunk.group_idx);
+        let was_nacked = self.nack_sent_at.contains_key(&key);
+
+        self.stats.note_chunk(chunk, was_nacked);
+        self.stats.maybe_log(now_us, self.stats_every_us);
+
         // Initialise the HOL pointer on the very first packet ever received.
         // Start from this frame_id so a mid-stream connect does not stall
         // waiting for frames that will never arrive.
@@ -91,19 +101,29 @@ impl FrameAssembler {
         let min_frame_id = frame_id.saturating_sub(MAX_BUFFERED_FRAMES);
         let mut max_evicted = self.last_evicted_id;
 
-        self.frames.retain(|&id, builder| {
+        // Собираем ID кадров, которые пора выкинуть
+        let mut to_evict = Vec::new();
+        for (&id, builder) in &self.frames {
             let keep = id >= min_frame_id
                 && now_us.saturating_sub(builder.first_us) < STALE_FRAME_US;
             if !keep {
+                to_evict.push(id);
                 max_evicted = Some(max_evicted.map_or(id, |m| m.max(id)));
             }
-            keep
-        });
+        }
 
         self.last_evicted_id = max_evicted;
 
         if let Some(cutoff) = max_evicted {
             self.nack_sent_at.retain(|key, _| key.0 > cutoff);
+        }
+
+        // Удаляем кадры и логируем потери по недособранным группам
+        for id in to_evict {
+            if let Some(builder) = self.frames.remove(&id) {
+                let (failed_groups, wasted_bytes, lost_chunks) = builder.count_wasted();
+                self.stats.note_wasted(failed_groups, wasted_bytes, lost_chunks);
+            }
         }
 
         // ── NACK scan (before inserting so current frame is not checked) ─────
@@ -115,7 +135,12 @@ impl FrameAssembler {
                 .frames
                 .entry(frame_id)
                 .or_insert_with(|| FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0));
-            builder.insert_chunk(chunk);
+
+            let recoveries = builder.insert_chunk(chunk);
+
+            for recovery in recoveries {
+                self.stats.note_group_recovery(recovery);
+            }
         }
 
         // ── HOL flush loop ───────────────────────────────────────────────────
@@ -155,6 +180,7 @@ impl FrameAssembler {
                 if builder.is_complete() {
                     // ── Frame ready ──────────────────────────────────────────
                     if let Some(packets) = builder.take_packets() {
+                        self.stats.note_frame_emitted(packets.len());
                         output.extend(packets);
                     }
                     self.frames.remove(&next_id);
@@ -175,6 +201,8 @@ impl FrameAssembler {
                         "[HOL] skipping lost frame={} (evicted={}, out_of_window={})",
                         next_id, was_evicted, out_of_window,
                     );
+                    if was_evicted {self.stats.note_frame_lost_evicted();}
+                    if out_of_window {self.stats.note_frame_lost_out_of_window();}
                     self.next_to_push_id  = Some(next_id + 1);
                     self.hol_stall_since_us = None;
                 } else {
@@ -194,6 +222,9 @@ impl FrameAssembler {
                             stall_us / 1_000,
                             next_id,
                         );
+                        self.stats.note_frame_lost_timeout();
+                        self.next_to_push_id  = Some(next_id + 1);
+                        self.hol_stall_since_us = None;
                         self.next_to_push_id  = Some(next_id + 1);
                         self.hol_stall_since_us = None;
                         // Continue: successor may already be complete.
@@ -268,7 +299,7 @@ impl FrameAssembler {
                             slice_builder.total_groups,
                             received_mask,
                         );
-
+                        self.stats.note_nack();
                         return Some(ControlPacket::Nack {
                             frame_id: target_frame_id,
                             slice_idx,

@@ -256,21 +256,6 @@ impl VideoBackend for DesktopFfmpegBackend {
         &mut self.slice_buffer
     }
     fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
-        self.fps_counter += 1;
-
-        // 2. Проверка времени (раз в секунду)
-        let elapsed = self.last_fps_check.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            // Вычисляем FPS (с учетом возможной задержки потока)
-            let fps: f64 = self.fps_counter as f64 / elapsed.as_secs_f64();
-            
-            // Логируем или выводим куда-нибудь
-            log::info!("Current Input FPS: {:.2}", fps);
-
-            // Сбрасываем состояние
-            self.fps_counter = 0;
-            self.last_fps_check = Instant::now();
-        }
 
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
         if let Some(dst) = pkt.data_mut() {

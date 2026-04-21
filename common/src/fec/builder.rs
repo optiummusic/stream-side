@@ -14,6 +14,11 @@ use super::*;
 
 // ── FrameBuilder ─────────────────────────────────────────────────────────────
 
+pub(crate) enum GroupRecovery {
+    Direct,
+    Fec { missing_data_shards: u8 },
+}
+
 pub(crate) struct FrameBuilder {
     pub(crate) slices: HashMap<u8, SliceBuilder>,
     decoded_slices: Vec<Option<VideoSlice>>,
@@ -47,39 +52,70 @@ impl FrameBuilder {
         self.next_emit_idx == self.total_slices
     }
 
+    pub(crate) fn count_wasted(&self) -> (u64, u64, u64) {
+        let mut failed_groups = 0;
+        let mut wasted_payload_bytes = 0;
+        let mut lost_chunks = 0;
+
+        for sb in self.slices.values() {
+            for gb in sb.groups.values() {
+                if !gb.is_ready() {
+                    failed_groups += 1;
+                    // Считаем сколько шардов (data+parity) не дошло в этой группе
+                    let total_expected = (gb.k + gb.m) as u64;
+                    lost_chunks += total_expected.saturating_sub(gb.received as u64);
+                }
+                
+                for i in 0..(gb.k as usize) {
+                    if gb.shards[i].is_some() {
+                        wasted_payload_bytes += gb.payload_lens[i] as u64;
+                    }
+                }
+            }
+        }
+
+        (failed_groups, wasted_payload_bytes, lost_chunks)
+    }
+
     /// Insert a chunk into this builder.
     ///
     /// Unlike the old API this method no longer returns packets directly;
     /// decoded packets are accumulated in `ready_packets` and released only
     /// when the [`FrameAssembler`]'s HOL flush loop decides it is this
     /// frame's turn.
-    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) {
+    pub(crate) fn insert_chunk(&mut self, chunk: &DatagramChunk) -> Vec<GroupRecovery> {
         let slice_idx = chunk.slice_idx as usize;
         if slice_idx >= self.decoded_slices.len() {
-            return;
+            return Vec::new();
         }
+
+        let mut recoveries = Vec::new();
 
         let ready = {
             let sb = self
                 .slices
                 .entry(chunk.slice_idx)
                 .or_insert_with(|| SliceBuilder::new(chunk.total_groups));
-            sb.insert(chunk);
+
+            if let Some(recovery) = sb.insert(chunk) {
+                recoveries.push(recovery);
+            }
+
             sb.is_ready()
         };
 
         if !ready || self.decoded_slices[slice_idx].is_some() {
-            return;
+            return recoveries;
         }
 
         if let Some(video_slice) = self.decode_slice(chunk.slice_idx) {
             self.decoded_slices[slice_idx] = Some(video_slice);
         }
 
-        // Drain any newly unlocked slices (in-order from next_emit_idx)
-        // into the internal staging buffer.
         let new_packets = self.try_emit_ordered();
         self.ready_packets.extend(new_packets);
+
+        recoveries
     }
 
     /// Drain all staged packets if the frame is fully assembled.
@@ -157,7 +193,7 @@ impl SliceBuilder {
         }
     }
 
-    pub(crate) fn insert(&mut self, chunk: &DatagramChunk) {
+    pub(crate) fn insert(&mut self, chunk: &DatagramChunk) -> Option<GroupRecovery> {
         if chunk.total_groups > 0 {
             self.total_groups = chunk.total_groups;
         }
@@ -172,7 +208,20 @@ impl SliceBuilder {
 
         if !was_ready && group.is_ready() {
             self.ready_groups = self.ready_groups.saturating_add(1);
+
+            let data_present = group.data_received_count();
+            let missing_data = group.k.saturating_sub(data_present);
+
+            return Some(if missing_data == 0 {
+                GroupRecovery::Direct
+            } else {
+                GroupRecovery::Fec {
+                    missing_data_shards: missing_data,
+                }
+            });
         }
+
+        None
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -261,5 +310,15 @@ impl GroupBuilder {
 
     pub(crate) fn get_data(&self) -> Option<Vec<u8>> {
         FecDecoder::decode(self.k, self.m, &self.shards, &self.payload_lens)
+    }
+
+    pub(crate) fn data_received_count(&self) -> u8 {
+        let mut c = 0u8;
+        for i in 0..self.k as usize {
+            if self.shards[i].is_some() {
+                c += 1;
+            }
+        }
+        c
     }
 }

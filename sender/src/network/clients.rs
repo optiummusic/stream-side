@@ -17,25 +17,51 @@ pub(crate) async fn send_loop_to_client(
     let mut requested_initial_idr = false;
     let remote = conn.remote_address();
     
-    let mut pacer = FramePacer::new(100.0, 4.0);
-    
+    // Очередь для плавного выталкивания
+    let mut pending_dgrams: std::collections::VecDeque<Bytes> = std::collections::VecDeque::with_capacity(4096);
+    let mut pacer = FramePacer::new(1000.0, 4.0); // 100 Mbps baseline
+
     loop {
         tokio::select! {
-            // 1. ОТПРАВКА ВИДЕО
+            // 1. ПЕЙСЕР: Отправка следующей датаграммы из очереди
+            _ = async {
+                if pending_dgrams.is_empty() {
+                    std::future::pending::<()>().await; // Бесконечно ждем, если очередь пуста
+                }
+                
+                let next_len = pending_dgrams.front().unwrap().len();
+                let wait = pacer.consume(DatagramChunk::HEADER_LEN + next_len);
+                
+                if wait.is_zero() {
+                    return; // Можно слать немедленно
+                } else if wait < std::time::Duration::from_millis(1) {
+                    tokio::task::yield_now().await; // Микро-пауза
+                } else {
+                    tokio::time::sleep(wait).await; // Честный сон
+                }
+            }, if !pending_dgrams.is_empty() => {
+                // Отправляем не 1 пакет, а небольшую пачку (например, 4 пакета), 
+                // чтобы компенсировать задержки планировщика.
+                for _ in 0..4 {
+                    if let Some(dgram) = pending_dgrams.pop_front() {
+                        if let Err(e) = conn.send_datagram(dgram.clone()) {
+                            handle_send_error(e, &conn, &remote);
+                        }
+                    } else { break; }
+                }
+            }
+
+            // 2. ПРИЕМ НОВЫХ КАДРОВ: Просто складываем их в очередь
             video_result = video_rx.recv() => {
                 match video_result {
                     Ok(serialized_frame) => { 
-                        if !info.ready.load(Ordering::Acquire) {
-                            continue;
-                        }
+                        if !info.ready.load(Ordering::Acquire) { continue; }
 
                         if !started {
                             if !serialized_frame.is_key {
                                 if !requested_initial_idr {
                                     let _ = senders.idr_tx.send(true);
-                                    let _ = senders.idr_tx.send(false);
                                     requested_initial_idr = true;
-                                    log::info!("[QUIC] Client {remote} waiting for keyframe: requested IDR");
                                 }
                                 continue;
                             }
@@ -43,78 +69,51 @@ pub(crate) async fn send_loop_to_client(
                             requested_initial_idr = false;
                         }
 
-                        // Just pace and send the pre-computed bytes. Zero-copy.
+                        // Вместо немедленной отправки — пушим в очередь.
+                        // Это и есть "разблокировка" — мы мгновенно освобождаем video_rx.
                         for dgram in &serialized_frame.datagrams {
-                            // As of now commented out because wait inside tokio produces blocking.
-                            // let wait = pacer.consume(DatagramChunk::HEADER_LEN + dgram.len());
-                            // if !wait.is_zero() {
-                            //     tokio::time::sleep(wait).await;
-                            // }
-
-                            // .clone() on Bytes is extremely cheap (atomic ref-count bump)
-                            if let Err(e) = conn.send_datagram(dgram.clone()) {
-                                log::error!("[QUIC] Failed to send datagram to {}: {:?}", remote, e);
-                                match e {
-                                    quinn::SendDatagramError::TooLarge => {
-                                        let limit = conn.max_datagram_size().unwrap_or(0);
-                                        log::error!(
-                                            "[QUIC] Datagram ({} bytes) is larger than allowed limit ({} bytes)", 
-                                            dgram.len(), 
-                                            limit
-                                        );
-                                        continue;
-                                    }
-                                    quinn::SendDatagramError::UnsupportedByPeer => {
-                                        // Сеть перегружена. 
-                                        // Вариант А: Просто пропустить (dropped by sender). 
-                                        // Вариант Б: Немного подождать и попробовать снова (но это может вызвать лаг).
-                                        return; 
-                                    }
-                                    quinn::SendDatagramError::Disabled => {
-                                        return; // Смысла продолжать нет
-                                    }
-                                    quinn::SendDatagramError::ConnectionLost(_) => {
-                                        return; 
-                                    }
-                                }
-                                // Если ошибка "TooManyInFlight", можно попробовать 
-                                // не делать return, а просто пропустить этот чанк.
-                            }
+                            pending_dgrams.push_back(dgram.clone());
+                        }
+                        
+                        // Если очередь стала слишком большой (> 500 пакетов), 
+                        // значит мы катастрофически не успеваем. Можно дропнуть старое.
+                        if pending_dgrams.len() > 2048 {
+                            log::warn!("[QUIC] Pacer overflow, current size: {}", pending_dgrams.len());
+                            pending_dgrams.drain(..1024);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("[QUIC] Client {remote} lagged {n} frames, resetting to next IDR");
-                        started = false; 
-                        continue;
+                        log::warn!("[QUIC] Client {remote} lagged {n} frames");
+                        started = false;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
 
-            // 2. ПРИЕМ КОМАНД ОТ КЛИЕНТА (Ping, RequestKeyFrame, и т.д.)
-            
+            // 3. ПРИЕМ КОМАНД: Читается параллельно, не дожидаясь отправки видео
             incoming = conn.read_datagram() => {
-                match incoming {
-                    Ok(raw_data) => {
-                        // Декодируем как наш чанк (клиент тоже шлет в этом формате)
-                        if let Some(chunk) = DatagramChunk::decode(raw_data) {
-                            let senders_clone = senders.clone();
-                            if chunk.packet_type == TYPE_CONTROL {
-                                handle_control(&conn, chunk.data, &info, clock_offset, congestion_ctl.clone(), senders_clone).await;
-                            }
+                if let Ok(raw_data) = incoming {
+                    if let Some(chunk) = DatagramChunk::decode(raw_data) {
+                        if chunk.packet_type == TYPE_CONTROL {
+                            handle_control(&conn, chunk.data, &info, clock_offset, congestion_ctl.clone(), senders.clone()).await;
                         }
                     }
-                    Err(e) => {
-                        log::info!("[QUIC] Client {remote} read error: {e}");
-                        break;
-                    }
-                }
+                } else { break; }
             }
         }
-        
-            // 3. (В БУДУЩЕМ) ОТПРАВКА АУДИО
-            // Ok(audio_msg) = audio_rx.recv() => { ... }
-        
+    }
+}
+
+// Вынес обработку ошибок в хелпер для чистоты
+fn handle_send_error(e: quinn::SendDatagramError, conn: &Connection, remote: &std::net::SocketAddr) {
+    match e {
+        quinn::SendDatagramError::TooLarge => {
+            let limit = conn.max_datagram_size().unwrap_or(0);
+            log::error!("[QUIC] Datagram too large: limit is {limit} bytes");
+        }
+        quinn::SendDatagramError::UnsupportedByPeer => log::warn!("[QUIC] Peer {remote} doesn't support datagrams"),
+        quinn::SendDatagramError::Disabled => log::error!("[QUIC] Datagrams disabled"),
+        _ => log::error!("[QUIC] Send error to {remote}: {:?}", e),
     }
 }
 
