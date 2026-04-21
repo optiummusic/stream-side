@@ -57,7 +57,7 @@ use std::ptr;
 use bytes::BytesMut;
 use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 
-use crate::backend::{HevcSpsInfo, PushStatus, SkipFrameTemplate, SliceHeaderInfo};
+use crate::backend::{HevcSpsInfo, HevcState, PushStatus, SkipFrameTemplate, SliceHeaderInfo, vaapi_concealment::make_default_pic_params};
 #[cfg(unix)]
 use crate::types::DmaBufFrame;
 
@@ -87,6 +87,11 @@ pub struct DesktopFfmpegBackend {
     next_slice_idx:      u8,
     skip_frame_template: Option<SkipFrameTemplate>,
     sps_info: Option<HevcSpsInfo>,
+    hevc_state: HevcState,
+    concealment: crate::backend::vaapi_concealment::VaapiConcealment,
+    sps_fields: Option<crate::backend::hevc_parser::SpsFields>,
+    pps_fields: Option<crate::backend::hevc_parser::PpsFields>,
+    vps_raw: Option<Vec<u8>>,
 
     // ── CPU-путь (fallback) ──────────────────────────────────────────────────
 
@@ -167,6 +172,7 @@ impl DesktopFfmpegBackend {
                 // hw_device_ctx берёт ref; исходный vaapi_dev мы отдадим в _drm_dev.
                 (*raw).hw_device_ctx = av_buffer_ref(vaapi_dev);
                 (*raw).get_format    = Some(get_hw_format);
+                (*raw).pix_fmt       = std::mem::transmute(117i32);
                 // vaapi_dev нам больше не нужен — декодер держит ref через codec ctx.
                 // Но мы должны вернуть его в поле, чтобы освободить при Drop.
                 // Поэтому НЕ делаем av_buffer_unref здесь; передаём владение в поле.
@@ -187,7 +193,7 @@ impl DesktopFfmpegBackend {
         }
 
         // AVFrame для av_hwframe_map (zero-copy path).
-        let map_frame = unsafe { av_frame_alloc() };
+        let map_frame: *mut AVFrame = unsafe { av_frame_alloc() };
         if map_frame.is_null() {
             return Err(BackendError::ConfigError("av_frame_alloc (map) failed".into()));
         }
@@ -218,6 +224,11 @@ impl DesktopFfmpegBackend {
             dmabuf_enabled,
             fps_counter: 0,
             last_fps_check: Instant::now(),
+            hevc_state: HevcState::new(8),
+            concealment: crate::backend::vaapi_concealment::VaapiConcealment::default(),
+            sps_fields: None,
+            pps_fields: None,
+            vps_raw: None,
         })
     }
     fn evaluate_dmabuf_support(initial: bool, gpu: GpuVendor) -> bool {
@@ -278,8 +289,23 @@ fn hevc_nal_type(nalu: &[u8]) -> u8 {
 }
 
 impl VideoBackend for DesktopFfmpegBackend {
+    fn get_pps(&self) -> &Option<super::PpsFields> {
+        &self.pps_fields
+    }
+    fn get_sps(&self) -> &Option<super::SpsFields> {
+        &self.sps_fields
+    }
+    fn get_vps(&self) -> &Option<Vec<u8>> {
+        &self.vps_raw
+    }
+    fn get_concealment(&mut self) -> &mut super::vaapi_concealment::VaapiConcealment {
+        &mut self.concealment
+    }
     fn get_poc_lsb(&mut self) -> &mut u32 {
         &mut self.poc_lsb
+    }
+    fn get_hevc_state(&mut self) -> &mut HevcState {
+        &mut self.hevc_state
     }
     fn get_skip_frame_template(&self) -> Option<&SkipFrameTemplate> {
         self.skip_frame_template.as_ref()
@@ -294,28 +320,84 @@ impl VideoBackend for DesktopFfmpegBackend {
         if self.sps_info.is_none() {
             for nalu in iter_nalus(payload) {
                 let nal_type = hevc_nal_type(nalu);
+                
+                if nal_type == 32 {
+                    log::info!("[Concealment] VPS found, length={}", nalu.len());
+                    self.vps_raw = Some(nalu.to_vec());
+                }
                 if nal_type == 33 { // SPS_NUT
-                    // Парсим log2_max_pic_order_cnt_lsb_minus4 из SPS RBSP
-                    // В SPS после 2-байт NAL header идут поля, нам нужно добраться до нужного
-                    if let Some(log2_max) = SkipFrameTemplate::parse_sps_poc_bits(nalu) {
-                        self.sps_info = Some(HevcSpsInfo {
-                            log2_max_poc_lsb: log2_max + 4,
-                        });
-                        log::info!("[Concealment] SPS parsed, log2_max_poc_lsb={}", log2_max + 4);
+                    if let Some(sps_f) = crate::backend::hevc_parser::SpsFields::parse(nalu) {
+                        let log2_max_poc_lsb = sps_f.log2_max_poc_lsb_minus4 as u32 + 4;
+                        log::info!(
+                            "[Concealment] SPS parsed: log2_max_poc_lsb={} amp={} sao={} \
+                            temporal_mvp={} scaling_list={} st_rps_count={}",
+                            log2_max_poc_lsb,
+                            sps_f.amp_enabled_flag,
+                            sps_f.sample_adaptive_offset_enabled_flag,
+                            sps_f.sps_temporal_mvp_enabled_flag,
+                            sps_f.scaling_list_enabled_flag,
+                            sps_f.num_short_term_ref_pic_sets,
+                        );
+                        if self.sps_info.is_none() {
+                            self.sps_info = Some(HevcSpsInfo {
+                                log2_max_poc_lsb: log2_max_poc_lsb as u8,
+                            });
+                            self.hevc_state = HevcState::new(log2_max_poc_lsb as u8);
+                        }
+                        self.sps_fields = Some(sps_f);
+                    }
+                }
+    
+                if nal_type == 34 { // PPS_NUT
+                    if let Some(pps_f) = crate::backend::hevc_parser::PpsFields::parse(nalu) {
+                        log::info!(
+                            "[Concealment] PPS parsed: pps_id={} deblock_override={} \
+                            disable_deblock={} chroma_qp_present={} cabac_init={} \
+                            init_qp={} extra_header_bits={}",
+                            pps_f.pps_pic_parameter_set_id,
+                            pps_f.deblocking_filter_override_enabled_flag,
+                            pps_f.pps_disable_deblocking_filter_flag,
+                            pps_f.pps_slice_chroma_qp_offsets_present_flag,
+                            pps_f.cabac_init_present_flag,
+                            pps_f.init_qp_minus26,
+                            pps_f.num_extra_slice_header_bits,
+                        );
+                        self.pps_fields = Some(pps_f);
+                        // Инвалидируем template — PPS мог измениться
+                        self.concealment.pic_params_template = None;
                     }
                 }
             }
         }
 
         // Строим шаблон из первого P-slice
-        if self.sps_info.is_some() && self.skip_frame_template.is_none() {
+        if trace.is_some() && self.sps_info.is_some() && self.skip_frame_template.is_none() {
             for nalu in iter_nalus(payload) {
                 let nal_type = hevc_nal_type(nalu);
                 if nal_type == 1 { // TRAIL_R — обычный P-кадр
                     if let Some(sps) = &self.sps_info {
                         if let Some(info) = SliceHeaderInfo::parse(nalu, sps) {
-                            log::info!("[Concealment] Built template from TRAIL_R, poc_bit_offset={}", info.poc_lsb_bit_offset);
-                            self.skip_frame_template = Some(SkipFrameTemplate::from_real_frame(nalu, &info));
+                            self.poc_lsb = info.poc_lsb;
+
+                            let abs_poc = self.hevc_state.remember_picture(
+                                info.poc_lsb,
+                                true,   
+                                false,  
+                                false,  
+                            );
+                            self.hevc_state.mark_output_and_prune(abs_poc);
+
+                            // ВАЖНО: Инициализируем шаблон для concealment!
+                            self.skip_frame_template = Some(SkipFrameTemplate {
+                                data: nalu.to_vec(),
+                                poc_lsb_bit_offset: info.poc_lsb_bit_offset,
+                                poc_lsb_len: info.poc_lsb_len,
+                                max_poc_lsb: 1 << sps.log2_max_poc_lsb,
+                                rps_bit_offset: info.rps_bit_offset,
+                                rps_original_bit_len: info.rps_original_bit_len,
+                                pps_id: info.pps_id
+                            });
+
                             break;
                         }
                     }
@@ -326,11 +408,53 @@ impl VideoBackend for DesktopFfmpegBackend {
         if let Some(sps) = &self.sps_info {
             for nalu in iter_nalus(payload) {
                 let nal_type = hevc_nal_type(nalu);
-                // TRAIL_R (1), TRAIL_N (0) — обычные P-кадры
-                if nal_type == 0 || nal_type == 1 {
+                log::trace!(
+                    "[Concealment] DecoderIn frame_id={} nal_type={} len={} head={:02X?}",
+                    frame_id,
+                    nal_type,
+                    nalu.len(),
+                    &nalu.get(0..6).unwrap_or(&[]),
+                );
+                // 1. Обработка ключевых кадров (IDR)
+                if nal_type == 19 || nal_type == 20 { // IDR_W_RADL, IDR_N_LP
+                    // Декодер сбросил буферы, мы тоже должны
+                    self.hevc_state.dpb.clear();
+                    self.hevc_state.prev_poc_lsb = 0;
+                    self.hevc_state.prev_poc_msb = 0;
+                    self.poc_lsb = 0;
+                    
+                    self.skip_frame_template = None;
+                    
+                    // Запоминаем IDR как нулевой референс
+                    let abs_poc = self.hevc_state.remember_picture(0, true, false, false);
+                    self.hevc_state.mark_output_and_prune(abs_poc);
+                }
+                // 2. Обработка обычных кадров
+                else if nal_type == 0 || nal_type == 1 { // TRAIL_N, TRAIL_R
                     if let Some(info) = SliceHeaderInfo::parse(nalu, sps) {
                         self.poc_lsb = info.poc_lsb;
-                        break;
+                        
+                        let abs_poc = self.hevc_state.remember_picture(
+                            info.poc_lsb,
+                            true,
+                            false,
+                            false,
+                        );
+                        self.hevc_state.mark_output_and_prune(abs_poc);
+                        
+                        // ВАЖНО: Всегда обновляем шаблон самым свежим кадром!
+                        // Это гарантирует, что PPS ID и другие флаги всегда актуальны.
+                        self.skip_frame_template = Some(SkipFrameTemplate {
+                            data: nalu.to_vec(),
+                            poc_lsb_bit_offset: info.poc_lsb_bit_offset,
+                            poc_lsb_len: info.poc_lsb_len,
+                            max_poc_lsb: 1 << sps.log2_max_poc_lsb,
+                            rps_bit_offset: info.rps_bit_offset,
+                            rps_original_bit_len: info.rps_original_bit_len,
+                            pps_id: info.pps_id
+                        });
+                        
+                        break; // Одного VCL NALU из кадра достаточно
                     }
                 }
             }
@@ -378,6 +502,56 @@ impl VideoBackend for DesktopFfmpegBackend {
         let mut raw = Video::empty();
         if self.decoder.receive_frame(&mut raw).is_err() {
             return Ok(FrameOutput::Pending);
+        }
+
+        unsafe {
+            let raw_fmt = (*raw.as_ptr()).format;
+            if raw_fmt == 44 { // AV_PIX_FMT_VAAPI
+                let curr_abs_poc = self.hevc_state.derive_abs_poc(self.poc_lsb);
+                let w = (*raw.as_ptr()).width as u16;
+                let h = (*raw.as_ptr()).height as u16;
+
+                crate::backend::vaapi_concealment::capture_concealment_state(
+                    &mut self.concealment,
+                    raw.as_ptr(),
+                    self.decoder.as_ptr() as *const ffmpeg_next::ffi::AVCodecContext,
+                    curr_abs_poc,
+                );
+
+                if self.concealment.pic_params_template.is_none() {
+                    match (&self.sps_fields, &self.pps_fields) {
+                        (Some(sps_f), Some(pps_f)) => {
+                            let params = crate::backend::hevc_parser::build_concealment_pic_params(
+                                w, h, sps_f, pps_f,
+                            );
+                            log::info!(
+                                "[Concealment] PicParams initialized from SPS+PPS: \
+                                 pps_id={} pic_fields={:#010x} slice_parsing={:#010x}",
+                                params.pps_id,
+                                params.pic_fields,
+                                params.slice_parsing_fields,
+                            );
+                            self.concealment.pic_params_template = Some(params);
+                        }
+                        _ => {
+                            // Fallback: дефолтные значения пока не пришли SPS+PPS
+                            if let Some(sps) = &self.sps_info {
+                                let pps_id = self.skip_frame_template.as_ref()
+                                    .map(|t| t.pps_id)
+                                    .unwrap_or(0);
+                                log::warn!(
+                                    "[Concealment] PPS not yet parsed, using defaults \
+                                     (pic_fields=0, may fail on radeonsi)"
+                                );
+                                // make_default_pic_params как раньше, но это НЕ будет
+                                // работать на radeonsi если SPS имеет нестандартные флаги.
+                                // Используем только как временный placeholder.
+                            }
+                        }
+                    }
+                }
+            }
+            
         }
 
         // ── 2. Метаданные ─────────────────────────────────────────────────────
@@ -757,11 +931,16 @@ unsafe extern "C" fn get_hw_format(
     unsafe {
         let mut p = pix_fmts;
         while *p != AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == AVPixelFormat::AV_PIX_FMT_VAAPI {
-                return *p;
-            }
+            let name_ptr = ffmpeg_sys_next::av_get_pix_fmt_name(*p);
+            let name = if name_ptr.is_null() {
+                "unknown".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().to_string()
+            };
+            log::info!("[Decoder] format {} = {}", *p as i32, name);
             p = p.add(1);
         }
-        AVPixelFormat::AV_PIX_FMT_NONE
+        // временно просто возвращаем первый
+        *pix_fmts
     }
 }

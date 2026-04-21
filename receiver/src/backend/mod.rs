@@ -19,6 +19,7 @@ use std::fmt;
 use bytes::BytesMut;
 use common::FrameTrace;
 
+use crate::backend::vaapi_concealment::VaapiConcealment;
 #[cfg(unix)]
 pub use crate::types::DmaBufFrame;
 
@@ -171,18 +172,78 @@ pub trait VideoBackend: Send + 'static {
     /// Вызывается при обнаружении потери вместо clear_buffer.
     /// Отправляет skip-заглушку декодеру чтобы не рвать prediction chain,
     /// затем чистит буфер слайсов.
-    fn conceal_and_clear(&mut self, lost_frame_id: u64) {
-        // poc_lsb указывает на СЛЕДУЮЩИЙ ожидаемый кадр,
-        // заглушка должна иметь этот poc и ссылаться на poc-1
-        let poc = *self.get_poc_lsb();
+    unsafe fn conceal_and_clear(&mut self, lost_frame_id: u64) {
+        // ── Шаг 1: стандартный FFmpeg skip-frame путь ────────────────────────
+        // (базовая реализация из mod.rs — поддерживает prediction chain в декодере)
+        // Вызываем super-реализацию вручную, т.к. Rust не поддерживает super::
+        {
+            let poc_lsb = *self.get_poc_lsb();
+            let max_poc_lsb = self.get_hevc_state().max_poc_lsb;
+            let next_poc = poc_lsb.wrapping_add(1) & (max_poc_lsb - 1);
 
-        let skip_frame = self.get_skip_frame_template()
-            .map(|t| t.make_frame(poc));
+            let template = self.get_skip_frame_template().cloned();
+            let frame = template.as_ref().and_then(|t| {
+                let state = self.get_hevc_state();
+                t.make_frame(next_poc, state)
+            });
 
-        if let Some(frame) = skip_frame {
-            let _ = self.submit_to_decoder(&frame, lost_frame_id, None);
-            log::info!("[Concealment] Freeze frame for lost frame_id={lost_frame_id}, poc_lsb={poc}");
+            if let Some(frame) = frame {
+                if self.submit_to_decoder(&frame, lost_frame_id, None).is_ok() {
+                    *self.get_poc_lsb() = next_poc;
+                    let abs_poc = self.get_hevc_state().remember_picture(
+                        next_poc, true, false, false,
+                    );
+                    self.get_hevc_state().mark_output_and_prune(abs_poc);
+                    log::info!(
+                        "[Concealment] FFmpeg skip frame sent: lost={lost_frame_id} poc={next_poc}"
+                    );
+                }
+            } else {
+                log::warn!("[Concealment] No skip frame template yet for lost_frame_id={lost_frame_id}");
+            }
         }
+
+        // ── Шаг 2: VA-API freeze (прямая заморозка surface на GPU) ──────────
+        // Работает параллельно с FFmpeg путём и перезаписывает surface
+        // последним хорошим кадром вместо серого артефакта.
+        #[cfg(unix)]
+        {
+            // 1. Получаем poc_lsb (копируется, заимствование self сразу завершается)
+            let poc_lsb = *self.get_poc_lsb(); 
+            
+            // 2. Получаем шаблон (клонируется, заимствование self завершается)
+            let template = self.get_skip_frame_template().cloned();
+
+            // 3. Трюк с указателем для HevcState:
+            // Вызываем мутабельный геттер, берем указатель и ТУТ ЖЕ завершаем заимствование self.
+            let hevc_ptr = self.get_hevc_state() as *const HevcState;
+
+            let vps = self.get_vps().clone();
+            let pps = self.get_pps().clone();
+            let sps = self.get_sps().clone();
+
+            let conceal = self.get_concealment();
+            let result = unsafe {
+                // Превращаем указатель обратно в ссылку &HevcState прямо при вызове.
+                // Это безопасно, так как мы знаем, что hevc_state и concealment 
+                // — это разные поля в структуре, реализующей трейт.
+                crate::backend::vaapi_concealment::vaapi_concealment_freeze(
+                    conceal,
+                    &*hevc_ptr,
+                    poc_lsb,
+                    &template,
+                    &sps,
+                    &pps,
+                    &vps,
+                )
+            };
+
+            match result {
+                Ok(()) => log::info!("[Concealment] VA-API freeze OK"),
+                Err(e) => log::warn!("[Concealment] VA-API freeze failed: {e}"),
+            }
+        }
+
         self.clear_buffer();
     }
 
@@ -205,9 +266,12 @@ pub trait VideoBackend: Send + 'static {
 
     /// Текущий PicOrderCntLsb — трекаем на каждом submit_to_decoder
     fn get_poc_lsb(&mut self) -> &mut u32;
-
+    fn get_hevc_state(&mut self) -> &mut HevcState;
     fn get_skip_frame_template(&self) -> Option<&SkipFrameTemplate>;
-
+    fn get_concealment(&mut self) -> &mut VaapiConcealment;
+    fn get_sps(&self) -> &Option<SpsFields>;
+    fn get_pps(&self) -> &Option<PpsFields>;
+    fn get_vps(&self) -> &Option<Vec<u8>>;
     
     #[cfg(target_os = "android")]
     unsafe fn init_with_surface(
@@ -219,12 +283,44 @@ pub trait VideoBackend: Send + 'static {
     
 }
 
+#[cfg(unix)]
+pub(crate) fn dump_debug_hevc(
+    vps: &[u8],
+    sps: &Option<SpsFields>,
+    pps: &Option<PpsFields>,
+    slice: &[u8],
+) {
+    let mut out = Vec::new();
+
+    // VPS (можно захардкодить или пропустить, ffmpeg иногда прощает)
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(vps);
+
+    if let Some(sps) = sps {
+        out.extend_from_slice(&[0,0,0,1]);
+        out.extend_from_slice(&sps.raw); // <-- ВАЖНО: сохрани raw SPS!
+    }
+
+    if let Some(pps) = pps {
+        out.extend_from_slice(&[0,0,0,1]);
+        out.extend_from_slice(&pps.raw); // <-- и PPS тоже
+    }
+
+    // slice
+    out.extend_from_slice(&[0, 0, 0, 1]); // Убедись, что перед слайсом тоже есть старт-код
+    out.extend_from_slice(slice);
+
+    std::fs::write("/tmp/test.h265", out).unwrap();
+}
 // ─────────────────────────────────────────
 // Экспорт конкретных реализаций
 // ─────────────────────────────────────────
 
 pub(crate) mod hevc_parser;
 pub(crate) use hevc_parser::*;
+
+#[cfg(unix)]
+pub mod vaapi_concealment;
 
 #[cfg(not(target_os = "android"))]
 pub mod desktop;

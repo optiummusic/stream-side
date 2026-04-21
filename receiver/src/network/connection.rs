@@ -350,7 +350,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
                 return;
             }
             RecoveryState::Concealing => {
-                backend.conceal_and_clear(state.expected_frame_id.unwrap_or(packet.frame_id));
+                unsafe { backend.conceal_and_clear(state.expected_frame_id.unwrap_or(packet.frame_id)) };
                 if state.loss_rate() > 4 {
                     log::info!("[Video] Too many losses ({}), switching to IDR", state.loss_rate());
 
@@ -376,7 +376,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
 
         match state.recovery {
             RecoveryState::Concealing => {
-                backend.conceal_and_clear(packet.frame_id);
+                backend.clear_buffer();
                 state.record_loss();
                 if state.loss_rate() > 4 {
                     state.waiting_for_key = true;
@@ -398,7 +398,6 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     }
 
     // ── Успешный слайс ────────────────────────────────────────────────────
-    log::info!("[NETWORK] Loss rate: {}", state.loss_rate());
     state.expected_slice_idx += 1;
 
     if packet.is_last {

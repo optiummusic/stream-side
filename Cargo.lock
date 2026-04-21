@@ -2765,6 +2765,7 @@ dependencies = [
  "criterion",
  "env_logger",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "jni 0.22.4",
  "libc",
  "log",
