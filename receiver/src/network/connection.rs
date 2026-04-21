@@ -341,7 +341,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
         }
         state.record_loss();
         let _ = control_tx.try_send(ControlPacket::LostFrame);
-
+        state.got_zero_slice = false;
         match state.recovery {
             RecoveryState::StabilizingAfterIdr { .. } => {
                 // Потеря во время стабилизации — сразу снова IDR
