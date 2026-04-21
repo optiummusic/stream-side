@@ -2,7 +2,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use common::fec::assembler::FrameAssembler;
 
 
-const IDR_INTERVAL_MS: u64 = 500; 
+const IDR_INTERVAL_MS: u64 = 50; 
 const FAIL_WINDOW: usize = 26;
 use crate::VideoWorkerMsg;
 
@@ -16,6 +16,7 @@ pub(crate) struct VideoState {
     pub recovery: RecoveryState,
     pub loss_window: [bool; FAIL_WINDOW],
     pub loss_window_pos: usize,
+    pub got_zero_slice: bool,
 }
 
 impl VideoState {
@@ -83,6 +84,7 @@ where
             expected_slice_idx: 0,
             last_idr: Instant::now(),
             recovery: RecoveryState::Concealing,
+            got_zero_slice: false,
         };
 
         while let Ok(msg) = rx.recv() {
@@ -357,49 +359,40 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
                     state.waiting_for_key = true;
                     state.recovery = RecoveryState::WaitingForIdr;
                     request_idr(state, idr_needed_tx, packet.frame_id);
-                    return;
+                    return
                 }
             }
             RecoveryState::WaitingForIdr => {
                 return; // уже ждём IDR
             }
         }
-
         state.expected_frame_id = Some(packet.frame_id);
         state.expected_slice_idx = 0;
     }
 
+    if packet.slice_idx == 0 {
+        state.got_zero_slice = true;
+    }
+
+    if !state.got_zero_slice {
+        log::trace!("[Video] Dropping slice {} for frame #{} - no start slice yet", 
+            packet.slice_idx, packet.frame_id);
+        return; // Пока не увидим 0-й слайс, остальное игнорируем
+    }
     // ── Slice order check ─────────────────────────────────────────────────
-    if packet.slice_idx != state.expected_slice_idx {
-        log::trace!("[Video] Slice mismatch frame #{}: got {} expected {}",
-            packet.frame_id, packet.slice_idx, state.expected_slice_idx);
-
-        match state.recovery {
-            RecoveryState::Concealing => {
-                backend.clear_buffer();
-                state.record_loss();
-                if state.loss_rate() > 4 {
-                    state.waiting_for_key = true;
-                    state.recovery = RecoveryState::WaitingForIdr;
-                    request_idr(state, idr_needed_tx, packet.frame_id);
-                }
-            }
-            RecoveryState::StabilizingAfterIdr { .. } => {
-                state.waiting_for_key = true;
-                state.recovery = RecoveryState::WaitingForIdr;
-                request_idr(state, idr_needed_tx, packet.frame_id);
-            }
-            RecoveryState::WaitingForIdr => {}
-        }
-
-        state.expected_slice_idx = 0;
-        state.expected_frame_id = Some(packet.frame_id + 1);
+    if packet.slice_idx < state.expected_slice_idx {
+        log::trace!("[Video] Old slice for frame #{} dropped", packet.frame_id);
         return;
     }
 
-    // ── Успешный слайс ────────────────────────────────────────────────────
-    log::info!("[NETWORK] Loss rate: {}", state.loss_rate());
-    state.expected_slice_idx += 1;
+    if packet.slice_idx > state.expected_slice_idx {
+        log::debug!("[Video] Slice loss detected in frame #{} (gap {}->{})", 
+            packet.frame_id, state.expected_slice_idx, packet.slice_idx);
+        // Мы НЕ выходим из функции, а позволяем слайсу уйти в бэкенд
+    }
+
+    // Обновляем ожидание: следующий слайс должен быть сразу за текущим
+    state.expected_slice_idx = packet.slice_idx + 1;
 
     if packet.is_last {
         state.record_success();
