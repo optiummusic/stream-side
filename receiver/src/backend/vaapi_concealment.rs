@@ -1111,13 +1111,13 @@ pub fn fill_slice_param_hevc(
 
     let slice_data_size = slice_data.len() as u32;
     let slice_data_offset = 4; // пропускаем 00 00 00 01
-    let byte_offset = (2 + header_bytes) as u32;
+    let byte_offset: u32 = (2 + header_bytes) as u32;
 
     va::VASliceParameterBufferHEVC {
         slice_data_size: slice_data_size, // без start code
         slice_data_offset: slice_data_offset,
         slice_data_flag: 0x01, // VA_SLICE_DATA_FLAG_ALL
-        slice_data_byte_offset: 0,
+        slice_data_byte_offset: 2,
         slice_segment_address: 0, // first slice
         RefPicList: [ref_list_0, [0xFF; 15]],
         LongSliceFlags: long_flags,
@@ -1382,7 +1382,10 @@ pub unsafe fn vaapi_concealment_freeze(
     // Вычисляем POC следующего (потерянного) кадра
     let curr_abs_poc = state.derive_abs_poc(poc_lsb);
     let last_good_poc = concealment.last_good_abs_poc;
-    let delta = curr_abs_poc.saturating_sub(last_good_poc);
+    let delta = last_good_poc - curr_abs_poc; // отрицательное, т.к. last < curr
+    if delta == 0 {
+        return Err("last_good_poc == curr_abs_poc, cannot build RPS".into());
+    }
     log::info!("[Concealment] Delta is: {}", delta);
     // Берём RPS из состояния DPB
     let rps = ShortTermRps {
@@ -1394,6 +1397,11 @@ pub unsafe fn vaapi_concealment_freeze(
         }],
         positive: vec![],
     };
+
+    log::info!(
+        "[Concealment] RPS: curr_abs_poc={} last_good_poc={} delta={}",
+        curr_abs_poc, last_good_poc, delta
+    );
 
     // Генерируем slice NALU
     let slice = generate_concealment_slice(
@@ -1427,7 +1435,7 @@ pub unsafe fn vaapi_concealment_freeze(
     let slice_param = fill_slice_param_hevc(&slice, &rps, params);
 
     // Данные слайса без Annex B start code (4 байта)
-    let slice_data = &slice.nalu_bytes;
+    let slice_data = &slice.nalu_bytes[4..];
     let vps_raw = vps.as_deref();
     dump_debug_hevc(
         vps_raw.unwrap_or_default(),

@@ -176,7 +176,8 @@ pub trait VideoBackend: Send + 'static {
         // ── Шаг 1: стандартный FFmpeg skip-frame путь ────────────────────────
         // (базовая реализация из mod.rs — поддерживает prediction chain в декодере)
         // Вызываем super-реализацию вручную, т.к. Rust не поддерживает super::
-        {
+        
+            let poc_before_ffmpeg = *self.get_poc_lsb();
             let poc_lsb = *self.get_poc_lsb();
             let max_poc_lsb = self.get_hevc_state().max_poc_lsb;
             let next_poc = poc_lsb.wrapping_add(1) & (max_poc_lsb - 1);
@@ -201,7 +202,7 @@ pub trait VideoBackend: Send + 'static {
             } else {
                 log::warn!("[Concealment] No skip frame template yet for lost_frame_id={lost_frame_id}");
             }
-        }
+        
 
         // ── Шаг 2: VA-API freeze (прямая заморозка surface на GPU) ──────────
         // Работает параллельно с FFmpeg путём и перезаписывает surface
@@ -209,7 +210,7 @@ pub trait VideoBackend: Send + 'static {
         #[cfg(unix)]
         {
             // 1. Получаем poc_lsb (копируется, заимствование self сразу завершается)
-            let poc_lsb = *self.get_poc_lsb(); 
+            let poc_lsb = poc_before_ffmpeg; 
             
             // 2. Получаем шаблон (клонируется, заимствование self завершается)
             let template = self.get_skip_frame_template().cloned();
@@ -307,7 +308,6 @@ pub(crate) fn dump_debug_hevc(
     }
 
     // slice
-    out.extend_from_slice(&[0, 0, 0, 1]); // Убедись, что перед слайсом тоже есть старт-код
     out.extend_from_slice(slice);
 
     std::fs::write("/tmp/test.h265", out).unwrap();
