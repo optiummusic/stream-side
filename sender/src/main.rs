@@ -59,7 +59,7 @@ async fn main() {
     };
 
     let config = CongestionConfig {
-        min_bitrate: 350_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
+        min_bitrate: 2_000_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
         max_bitrate: 50_000_000,       // 50 Мбит
         rtt_threshold_ms: 60.0,        // Порог задержки
         step_up: 150_000,              // +0.5 Мбит при хорошей связи

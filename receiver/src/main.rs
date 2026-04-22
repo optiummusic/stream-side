@@ -976,9 +976,15 @@ impl ApplicationHandler<UserEvent> for App {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let warn = log::LevelFilter::Warn;
     env_logger::Builder::from_default_env()
-    .write_style(env_logger::WriteStyle::Always) // Форсировать цвета даже с grep
-    .init();
+        .filter_module("quinn", log::LevelFilter::Warn) // Quinn в мусор (только ошибки)
+        .filter_module("winit", log::LevelFilter::Warn) // Winit в мусор
+        .filter_module("tracing", log::LevelFilter::Warn) // И сам трейсинг туда же
+        .filter_module("wgpu_core", warn)
+        .filter_module("calloop", warn)
+        .write_style(env_logger::WriteStyle::Always)
+        .init();
 
     let args: Vec<String> = std::env::args().collect();
 

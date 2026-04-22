@@ -2,8 +2,7 @@ use std::collections::VecDeque;
 
 use crate::{
     ControlPacket, DatagramChunk, FrameTrace, NackEntry, VideoPacket, fec::{
-        builder::{ComputePool, FrameBuilder, GroupRecovery, GroupState},
-        stats::RecoveryStats,
+        decode_task::ComputePool, frame_builder::{FrameBuilder, FrameState}, group_builder::GroupState, slice_builder::SliceState, stats::RecoveryStats
     }
 };
 
@@ -11,7 +10,7 @@ use super::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const MAX_BUFFERED_FRAMES: u64 = 140;
+const MAX_BUFFERED_FRAMES: u64 = 340;
 const NACK_BATCH_SIZE: u32 = 64;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs.
 ///
@@ -25,7 +24,7 @@ const NACK_BATCH_SIZE: u32 = 64;
 ///    `retain` cannot evict what doesn't exist.  Instead, `hol_stall_since_us`
 ///    measures how long the HOL pointer has been blocked on the absent frame
 ///    and forces a skip after the same deadline.
-const STALE_FRAME_US: u64 = 80_000;
+const STALE_FRAME_US: u64 = 200_000;
 
 // ── FrameAssembler ───────────────────────────────────────────────────────────
 
@@ -114,7 +113,7 @@ impl FrameAssembler {
                 .entry(frame_id)
                 .or_insert_with(|| FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0));
 
-            let (recoveries, maybe_task, is_nack_recovery, newly_stalled) = builder.insert_chunk(chunk);
+            let (recoveries, tasks, is_nack_recovery, newly_stalled) = builder.insert_chunk(chunk);
 
             if let Some((slice_idx, group_idx)) = newly_stalled {
                 self.nack_queue.push_back((frame_id, slice_idx, group_idx));
@@ -125,7 +124,7 @@ impl FrameAssembler {
             }
 
             // Если требуется FEC — отправляем в async пул, не блокируя hot path.
-            if let Some(task) = maybe_task {
+            for task in tasks {
                 self.compute_pool.submit(task);
             }
 
@@ -134,11 +133,16 @@ impl FrameAssembler {
         }
 
         // ── Apply async FEC results ──────────────────────────────────────────
-        // Non-blocking drain: забираем всё, что пул успел посчитать.
+        // Non-blocking drain: take everything the pool has finished.
+        // We pass the data through even on RS failure (None) so apply_decode_result
+        // can use decode_slice_sync for the full multi-group assembly; it guards
+        // internally against frames/slices that are already done.
         for result in self.compute_pool.drain_results() {
-            if let Some(data) = result.data {
-                if let Some(builder) = self.frames.get_mut(&result.frame_id) {
-                    builder.apply_decode_result(result.slice_idx, data);
+            if let Some(builder) = self.frames.get_mut(&result.frame_id) {
+                if builder.state == FrameState::Receiving {
+                    // Pass an empty Vec on RS failure — apply_decode_result will
+                    // call decode_slice_sync which handles per-group recovery.
+                    builder.apply_decode_result(result.slice_idx, result.data.unwrap_or_default());
                 }
             }
         }
@@ -171,6 +175,7 @@ impl FrameAssembler {
 
             if let Some(builder) = self.frames.get_mut(&next_id) {
                 if builder.is_complete() {
+                    // ── Fast path: frame fully assembled ─────────────────────
                     if let Some(packets) = builder.take_packets() {
                         self.stats.note_frame_emitted(packets.len());
                         output.extend(packets);
@@ -179,9 +184,37 @@ impl FrameAssembler {
                     self.next_to_push_id    = Some(next_id + 1);
                     self.hol_stall_since_us = None;
                 } else {
-                    break;
+                    // ── Builder exists but frame is incomplete ────────────────
+                    // Check if we should conceal and move on.
+                    let stall_start = *self.hol_stall_since_us.get_or_insert(now_us);
+                    let stall_us    = now_us.saturating_sub(stall_start);
+
+                    if stall_us >= STALE_FRAME_US {
+                        log::debug!(
+                            "[HOL] stall timeout ({} ms) for incomplete frame={}, concealing",
+                            stall_us / 1_000,
+                            next_id,
+                        );
+                        self.stats.note_frame_lost_timeout();
+
+                        // ↓ NEW: выплёвываем то, что есть + concealment-пустышки
+                        let partial = builder.take_partial_packets(next_id);
+                        if !partial.is_empty() {
+                            self.stats.note_frame_emitted(partial.len());
+                            output.extend(partial);
+                        }
+
+                        self.frames.remove(&next_id);
+                        self.stats.note_partial_slicing();
+                        self.next_to_push_id    = Some(next_id + 1);
+                        self.hol_stall_since_us = None;
+                        // Continue: successor may already be complete.
+                    } else {
+                        break; // Still within wait window — keep blocking HOL.
+                    }
                 }
             } else {
+                // ── No builder at all (zero packets received for this frame) ──
                 let was_evicted   = self.last_evicted_id.map_or(false, |e| next_id <= e);
                 let out_of_window = next_id < min_frame_id;
 
@@ -190,8 +223,8 @@ impl FrameAssembler {
                         "[HOL] skipping lost frame={} (evicted={}, out_of_window={})",
                         next_id, was_evicted, out_of_window,
                     );
-                    if was_evicted    { self.stats.note_frame_lost_evicted(); }
-                    if out_of_window  { self.stats.note_frame_lost_out_of_window(); }
+                    if was_evicted   { self.stats.note_frame_lost_evicted(); }
+                    if out_of_window { self.stats.note_frame_lost_out_of_window(); }
                     self.next_to_push_id    = Some(next_id + 1);
                     self.hol_stall_since_us = None;
                 } else {
@@ -207,7 +240,6 @@ impl FrameAssembler {
                         self.stats.note_frame_lost_timeout();
                         self.next_to_push_id    = Some(next_id + 1);
                         self.hol_stall_since_us = None;
-                        // Continue: successor may already be complete.
                     } else {
                         break;
                     }
@@ -245,14 +277,19 @@ impl FrameAssembler {
 
             if let Some(builder) = self.frames.get_mut(&frame_id) {
                 if let Some(sb) = builder.slices.get_mut(&slice_idx) {
-                    if let Some(gb) = sb.groups.get_mut(&group_idx) {
-                        if gb.state.needs_nack(now_us) {
-                            needs_nack = true;
-                            mask = gb.received_mask();
-                            gb.state = GroupState::Requested { sent_at_us: now_us };
-                            keep_in_queue = true;
-                        } else if matches!(gb.state, GroupState::Stalled { .. } | GroupState::Requested { .. }) {
-                            keep_in_queue = true;
+                    // Only groups in Assembling slices can still benefit from a NACK.
+                    // Slices in EmittingFec/Emitted/Abandoned have either queued RS
+                    // tasks or are dead — retransmitting shards can't help them.
+                    if sb.state == SliceState::Assembling {
+                        if let Some(gb) = sb.groups.get_mut(&group_idx) {
+                            if gb.state.needs_nack(now_us) {
+                                needs_nack = true;
+                                mask = gb.received_mask();
+                                gb.state = GroupState::Requested { sent_at_us: now_us };
+                                keep_in_queue = true;
+                            } else if matches!(gb.state, GroupState::Stalled { .. } | GroupState::Requested { .. }) {
+                                keep_in_queue = true;
+                            }
                         }
                     }
                 }

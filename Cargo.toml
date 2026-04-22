@@ -2,3 +2,7 @@
 members = ["receiver", "sender", "common"]
 resolver = "2"
 default-members = ["sender"]
+
+[profile.release]
+debug = true
+opt-level = 3

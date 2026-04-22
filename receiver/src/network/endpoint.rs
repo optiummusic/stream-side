@@ -49,8 +49,10 @@ pub(crate) fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
     socket.bind(&addr.into())?;
     let std_socket: std::net::UdpSocket = socket.into();
 
+    let mut endpoint_config = quinn::EndpointConfig::default();
+
     let mut endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
+        endpoint_config,
         None,
         std_socket,
         Arc::new(quinn::TokioRuntime), // Если используешь tokio

@@ -47,6 +47,71 @@ pub enum RecoveryState {
     StabilizingAfterIdr { good_frames_left: u32 },
 }
 
+
+fn drain_logical<B: VideoBackend>(
+    backend: &mut B, 
+    frame_tx: &Option<mpsc::Sender<DecodedFrame>>, 
+    proxy: &AppProxy,
+    control_tx: &mpsc::Sender<ControlPacket>
+) {
+    let mut drained = 0;
+    while drained < 32 {
+        match backend.poll_output() {
+            Ok(FrameOutput::Pending) => {
+                break},
+
+            Ok(FrameOutput::Dropped { age }) => {
+                let _ = control_tx.try_send(ControlPacket::Communication {
+                    message: format!(
+                        "DROPPED ON POLL, age: {:.1}ms",
+                        age.unwrap_or(0.0)
+                    ),
+                });
+            }
+
+            Ok(FrameOutput::Yuv(f)) => {
+                if let Some(tx) = &frame_tx {
+                    if tx.try_send(DecodedFrame::Yuv(f)).is_err() {
+                        break;
+                    }
+                }
+
+                #[cfg(not(target_os = "android"))]
+                if let Some(p) = &proxy {
+                    let _ = p.send_event(crate::UserEvent::NewFrame);
+                }
+
+                drained += 1;
+            }
+
+            #[cfg(unix)]
+            Ok(FrameOutput::DmaBuf(f)) => {
+                if let Some(tx) = &frame_tx {
+                    if tx.try_send(DecodedFrame::DmaBuf(f)).is_err() {
+                        break;
+                    }
+                }
+
+                #[cfg(not(target_os = "android"))]
+                if let Some(p) = &proxy {
+                    let _ = p.send_event(crate::UserEvent::NewFrame);
+                }
+
+                drained += 1;
+            }
+
+            Ok(_) => {}
+
+            Err(e) => {
+                let _ = control_tx.try_send(ControlPacket::Communication {
+                    message: format!("poll_output error: {e:?}"),
+                });
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) fn spawn_video_backend_worker<B: VideoBackend>(
     mut backend: B,
     control_tx: mpsc::Sender<ControlPacket>,
@@ -97,72 +162,9 @@ where
                         &control_tx,
                         &idr_needed_tx,
                     );
+                    drain_logical(&mut backend, &frame_tx, &proxy, &control_tx);
                 },
-                VideoWorkerMsg::PollDecoder => {
-                    const MAX_DRAIN_PER_TICK: usize = 32;
-
-                    let mut drained = 0usize;
-
-                    loop {
-                        if drained >= MAX_DRAIN_PER_TICK {
-                            break;
-                        }
-
-                        match backend.poll_output() {
-                            Ok(FrameOutput::Pending) => {
-                                break},
-
-                            Ok(FrameOutput::Dropped { age }) => {
-                                let _ = control_tx.try_send(ControlPacket::Communication {
-                                    message: format!(
-                                        "DROPPED ON POLL, age: {:.1}ms",
-                                        age.unwrap_or(0.0)
-                                    ),
-                                });
-                            }
-
-                            Ok(FrameOutput::Yuv(f)) => {
-                                if let Some(tx) = &frame_tx {
-                                    if tx.try_send(DecodedFrame::Yuv(f)).is_err() {
-                                        break;
-                                    }
-                                }
-
-                                #[cfg(not(target_os = "android"))]
-                                if let Some(p) = &proxy {
-                                    let _ = p.send_event(crate::UserEvent::NewFrame);
-                                }
-
-                                drained += 1;
-                            }
-
-                            #[cfg(unix)]
-                            Ok(FrameOutput::DmaBuf(f)) => {
-                                if let Some(tx) = &frame_tx {
-                                    if tx.try_send(DecodedFrame::DmaBuf(f)).is_err() {
-                                        break;
-                                    }
-                                }
-
-                                #[cfg(not(target_os = "android"))]
-                                if let Some(p) = &proxy {
-                                    let _ = p.send_event(crate::UserEvent::NewFrame);
-                                }
-
-                                drained += 1;
-                            }
-
-                            Ok(_) => {}
-
-                            Err(e) => {
-                                let _ = control_tx.try_send(ControlPacket::Communication {
-                                    message: format!("poll_output error: {e:?}"),
-                                });
-                                break;
-                            }
-                        }
-                    }
-                },
+                VideoWorkerMsg::PollDecoder => {},
                 VideoWorkerMsg::Shutdown => {
                     backend.shutdown();
                     break;
@@ -202,8 +204,6 @@ pub(crate) fn request_idr(
             elapsed
         );
     } else {
-        log::trace!("IDR request suppressed: cooldown active ({:?} left)", 
-            Duration::from_millis(IDR_INTERVAL_MS).saturating_sub(elapsed));
     }
 }
 
@@ -221,88 +221,86 @@ pub(crate) async fn receive_datagrams(
     worker_tx: SyncSender<VideoWorkerMsg>,
     control_tx: mpsc::Sender<ControlPacket>,
 ) {
-    let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
+    let jitter_buf = Arc::new(Mutex::new(JitterBuffer::new(JITTER_TARGET_MS)));
     let mut assembler = FrameAssembler::new();
     
-    let sleep_until = Instant::now() + Duration::from_secs(3600);
-    let sleep = time::sleep_until(sleep_until);
-    
-    tokio::pin!(sleep);
-    loop {
-        // ── Sleep duration until the next buffered frame is due ───────────────
-        // If the buffer is empty we park the timer for 1 hour; it will be
-        // cancelled the moment the datagram arm fires.
-        let next_deadline = match jitter_buf.time_to_next() {
-            Some(d) => Instant::now() + d,
-            None    => Instant::now() + Duration::from_secs(3600),
-        };
-        sleep.as_mut().reset(next_deadline);
+    let jitter_clone = Arc::clone(&jitter_buf);
+    let worker_tx_clone = worker_tx.clone();
 
-        
-        tokio::select! {
-            // ── 1. Incoming datagram ─────────────────────────────────────────
-            // ── 2. Jitter-buffer drain timer ─────────────────────────────────
-            // Fires when the earliest buffered frame has waited long enough.
-            // All frames whose deadline has now passed are released at once.
-            _ = &mut sleep => {
-                let ready = jitter_buf.drain_ready();
-                if ready.is_empty() { continue; }
+    tokio::spawn(async move {
+        loop {
+            let next_sleep = {
+                let mut lock = jitter_clone.lock().unwrap();
+                lock.time_to_next()
+            };
 
-                for packet in ready {
-                    if let Err(e) = worker_tx.send(VideoWorkerMsg::Push(packet)) {
-                        log::error!("Video worker channel closed: {e}");
-                        return;
+            match next_sleep {
+                Some(duration) => {
+                    if !duration.is_zero() {
+                        tokio::time::sleep(duration).await;
+                    }
+                    
+                    let ready_packets = {
+                        let mut lock = jitter_clone.lock().unwrap();
+                        lock.drain_ready()
+                    };
+
+                    for packet in ready_packets {
+                        if let Err(_) = worker_tx_clone.send(VideoWorkerMsg::Push(packet)) {
+                            return; // Канал закрыт, выходим
+                        }
                     }
                 }
-            }
-
-            raw = conn.read_datagram() => {
-                let raw = match raw {
-                    Ok(b)  => b,
-                    Err(e) => { log::error!("QUIC READ ERROR: {:?}", e); break; }
-                };
- 
-                log::trace!("Got packet: {} bytes", raw.len());
- 
-                let chunk = match DatagramChunk::decode(raw) {
-                    Some(c) => c,
-                    None    => { log::warn!("Failed to decode chunk header"); continue; }
-                };
- 
-                match chunk.packet_type {
-                    TYPE_VIDEO => { // WE RECEIVE VIDEOSLICE TYPE HERE
-                        // Reassemble; if a frame completed, enqueue it in the
-                        // jitter buffer instead of pushing to the backend directly.
-                        let (assembled, nacks) = assembler.insert(&chunk);
-                        for nack in nacks {
-                            if let Err(e) = control_tx.try_send(nack) {
-                                log::debug!("[NACK] control_tx full, NACK dropped: {e}");
-                            }
-                        }
-                        for packet in assembled {
-                            // Если твой джиттер-буфер принимает по одному пакету:
-                            jitter_buf.push(packet);
-                        }
-                    }
-                    TYPE_AUDIO => {
-                        // Audio bypasses the jitter buffer (separate sync path).
-                        // handle_audio_frame(chunk.data);
-                    }
-                    TYPE_CONTROL => {
-                        if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
-                            if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
-                                let conn_clone = conn.clone();
-                                tokio::spawn(async move {
-                                    let _ = send_offset_update(&conn_clone, rtt_us).await;
-                                });
-                            }
-                        }
-                    }
-                    _ => log::warn!("Unknown packet type"),
+                None => {
+                    // Буфер пуст, спим фиксированное время, чтобы не забивать CPU
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
         }
-        
+    });
+
+    // 3. Основной сетевой цикл (Hot Path)
+    // Теперь он занимается ТОЛЬКО приемом и сборкой, не отвлекаясь на таймеры
+    loop {
+        let raw = match conn.read_datagram().await {
+            Ok(b)  => b,
+            Err(e) => { log::error!("QUIC READ ERROR: {:?}", e); break; }
+        };
+
+        let chunk = match DatagramChunk::decode(raw) {
+            Some(c) => c,
+            None    => { continue; }
+        };
+
+        match chunk.packet_type {
+            TYPE_VIDEO => {
+                let (assembled, nacks) = assembler.insert(&chunk);
+                
+                // Отправляем NACK немедленно
+                for nack in nacks {
+                    let _ = control_tx.try_send(nack);
+                }
+
+                // Пушим собранные пакеты в джиттер-буфер
+                if !assembled.is_empty() {
+                    let mut lock = jitter_buf.lock().unwrap();
+                    for packet in assembled {
+                        lock.push(packet);
+                    }
+                }
+            }
+            TYPE_CONTROL => {
+                if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
+                    if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
+                        let conn_clone = conn.clone();
+                        tokio::spawn(async move {
+                            let _ = send_offset_update(&conn_clone, rtt_us).await;
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -330,7 +328,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     }
 
     if state.waiting_for_key {
-        log::trace!("[Video] Dropped frame #{} — waiting for IDR", packet.frame_id);
+        log::debug!("[Video] Dropped frame #{} — waiting for IDR", packet.frame_id);
         return;
     }
 
@@ -339,6 +337,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
         if Some(packet.frame_id) < state.expected_frame_id {
             return; // старый кадр
         }
+        log::debug!("[Video] A frame gap detected for frame #{}, expected #{}", packet.frame_id, state.expected_frame_id.unwrap());
         state.record_loss();
         let _ = control_tx.try_send(ControlPacket::LostFrame);
         state.got_zero_slice = false;
@@ -352,6 +351,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
                 return;
             }
             RecoveryState::Concealing => {
+                log::debug!("[Video] Concealing Frame");
                 backend.clear_buffer();
                 if state.loss_rate() > 4 {
                     log::info!("[Video] Too many losses ({}), switching to IDR", state.loss_rate());
@@ -375,13 +375,13 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     }
 
     if !state.got_zero_slice {
-        log::trace!("[Video] Dropping slice {} for frame #{} - no start slice yet", 
+        log::debug!("[Video] Dropping slice {} for frame #{} - no start slice yet", 
             packet.slice_idx, packet.frame_id);
         return; // Пока не увидим 0-й слайс, остальное игнорируем
     }
     // ── Slice order check ─────────────────────────────────────────────────
     if packet.slice_idx < state.expected_slice_idx {
-        log::trace!("[Video] Old slice for frame #{} dropped", packet.frame_id);
+        log::debug!("[Video] Old slice for frame #{} dropped", packet.frame_id);
         return;
     }
 
@@ -415,7 +415,7 @@ pub(crate) fn push_frame_to_backend<B: VideoBackend>(
     let trace    = packet.trace.take();
     let ctrl     = control_tx.clone();
 
-    match backend.push_encoded(&payload, frame_id, trace, packet.is_last) {
+    match backend.push_encoded(&payload, frame_id, trace, packet.is_last, packet.slice_idx, packet.is_concealed) {
         Ok(PushStatus::Dropped { age }) => {
             let _ = ctrl.try_send(ControlPacket::Communication {
                 message: format!("DROPPED ON PUSH#{}, age: {:.1}ms", frame_id, age.unwrap_or(0.0)),

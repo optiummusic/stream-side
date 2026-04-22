@@ -1,4 +1,4 @@
-use crate::{DatagramChunk, fec::builder::GroupRecovery};
+use crate::{DatagramChunk, fec::GroupRecovery};
 
 #[derive(Debug, Default, Clone)]
 pub struct RecoveryStats {
@@ -31,7 +31,9 @@ pub struct RecoveryStats {
     pub fec_failed_groups: u64,
     pub wasted_payload_bytes: u64,
     pub nack_recovered_chunks: u64, // Сколько чанков пришло после отправки NACK на их группу
-    pub total_lost_chunks: u64,     // Общее кол-во шардов, которые не дошли (включая восстановленные через FEC)
+    pub total_lost_chunks: u64,
+    pub partial: u32,     // Общее кол-во шардов, которые не дошли (включая восстановленные через FEC)
+    pub via_parity: u64,
 }
 
 impl RecoveryStats {
@@ -86,15 +88,21 @@ impl RecoveryStats {
         self.hol_skips += 1;
     }
 
+    pub fn note_partial_slicing(&mut self) {
+        self.partial += 1;
+    }
+
     pub fn note_group_recovery(&mut self, recovery: GroupRecovery) {
         match recovery {
             GroupRecovery::Direct => {
                 self.direct_groups += 1;
             }
-            GroupRecovery::Fec { missing_data_shards } => {
-                self.fec_groups += 1;
-                self.fec_missing_data_shards += missing_data_shards as u64;
-                self.total_lost_chunks += missing_data_shards as u64;
+            GroupRecovery::Fec { missing_data_shards, via_parity } => {
+                    self.fec_missing_data_shards += missing_data_shards as u64;
+                    self.total_lost_chunks += missing_data_shards as u64;
+                    self.fec_groups += 1;
+                
+                self.via_parity += 0;
             }
         }
     }
@@ -148,14 +156,14 @@ impl RecoveryStats {
             "[STATS {:.1}s] \n\
              ├─ NET:  {:.2} Mbps | Loss: {} chk ({:.2}%) | NACK Recov: {} | NACKS Sent: {}\n\
              ├─ IN:   Chunks: {} | Zombie Rate: {:.1}% (Data: {}, Parity: {} [{:.1}% overhead])\n\
-             ├─ OUT:  {:.1} FPS  | Frames: {} | Packets: {}\n\
-             ├─ FEC:  Direct: {} | Recovered: {} | Failed: {} (wasted: {} bytes)\n\
+             ├─ OUT:  {:.1} FPS  | Frames: {} | Packets: {} | Partial SLices: {}\n\
+             ├─ FEC:  Direct: {} | Recovered: {} | Prematurely via Parity: {} | Failed: {} (wasted: {} bytes)\n\
              └─ LOSS: Evicted: {} | Timeout: {} | OOW: {} | HOL skips: {}",
             secs,
             mbps, self.total_lost_chunks, loss_pct, self.nack_recovered_chunks, self.nacks_sent,
             self.rx_chunks, zombie_pct, self.rx_data_chunks, self.rx_parity_chunks, parity_pct,
-            fps, self.frames_emitted, self.video_packets_emitted,
-            self.direct_groups, self.fec_groups, self.fec_failed_groups, self.wasted_payload_bytes,
+            fps, self.frames_emitted, self.video_packets_emitted, self.partial,
+            self.direct_groups, self.fec_groups, self.via_parity, self.fec_failed_groups, self.wasted_payload_bytes,
             self.frames_lost_evicted, self.frames_lost_timeout, self.frames_lost_out_of_window, self.hol_skips
         );
 
@@ -180,5 +188,7 @@ impl RecoveryStats {
         self.nack_recovered_chunks = 0;
         self.total_lost_chunks = 0;
         self.zombie_chunks = 0;
+        self.partial = 0;
+        self.via_parity = 0;
     }
 }

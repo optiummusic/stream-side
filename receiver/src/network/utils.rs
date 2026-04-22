@@ -32,7 +32,6 @@ pub(crate) fn process_control_feedback(ctrl: ControlPacket) -> Option<(i64, u64)
         };
 
         CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
-        log::debug!("[Sync] RTT: {}ms, Offset: {}us", rtt as f64 / 1000.0, filtered_offset);
         Some((filtered_offset, rtt))
     } else {
         None

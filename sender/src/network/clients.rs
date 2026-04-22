@@ -168,7 +168,7 @@ pub(crate) async fn run_serialiser_task(
 
         // 4. Сериализация и FEC
         let serialized = postcard::to_allocvec(&video_slice).unwrap_or_default();
-        let encoded_slice = common::fec::encode::FecEncoder::encode(
+        let (encoded_slice, total_groups) = common::fec::encode::FecEncoder::encode(
             slice.frame_id,
             slice.slice_idx,
             slice.total_slices,
@@ -178,8 +178,7 @@ pub(crate) async fn run_serialiser_task(
         );
 
         let mut datagrams = Vec::with_capacity(encoded_slice.chunks_meta.len());
-        let total_groups = (encoded_slice.chunks_meta.last().map(|m| m.group_idx).unwrap_or(0) + 1);
-
+        
         for meta in encoded_slice.chunks_meta {
             // Определяем размер конкретного шарда в буфере
             // Важно: берем данные или паддинг до полного размера шарда

@@ -45,6 +45,7 @@ pub struct VideoPacket {
     pub slice_idx:    u8,
     pub is_key:    bool,
     pub is_last:   bool,
+    pub is_concealed: bool,
     pub trace:     Option<FrameTrace>,
 }
 
@@ -88,6 +89,7 @@ pub struct EncodedSlice {
     pub chunks_meta: Vec<ChunkMeta>,
 }
 
+#[derive(Clone)]
 pub struct ChunkMeta {
     pub offset: usize,
     pub payload_len: u16,

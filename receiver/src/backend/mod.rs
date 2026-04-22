@@ -137,11 +137,11 @@ pub trait VideoBackend: Send + 'static {
     /// На Android:  копирует данные во входной буфер AMediaCodec.
     /// 
     /// Default implementation for bufferizing slices
-    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>, is_last: bool) -> Result<PushStatus, BackendError> {
+    fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>, is_last: bool, slice_idx: u8, conceal: bool) -> Result<PushStatus, BackendError> {
         if trace.is_some() {
             *self.get_current_trace() = trace;
         }
-        
+        log::trace!("[Decoder] Slice extension for frame #{}, slice #{}, concealed: {}", frame_id, slice_idx, conceal);
         self.get_slice_buffer().extend_from_slice(payload);
         
         if !is_last {

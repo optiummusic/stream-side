@@ -60,11 +60,27 @@ impl FecDecoder {
             rs.reconstruct(&mut temp).ok()
         })?;
 
-        let mut out = Vec::with_capacity(payload_lens.iter().map(|&l| l as usize).sum());
+        let total_capacity: usize = (0..k_usize)
+            .map(|i| {
+                let l = payload_lens[i] as usize;
+                if l > 0 { l } else { temp[i].as_ref().map(|s| s.len()).unwrap_or(0) }
+            })
+            .sum();
+
+        let mut out = Vec::with_capacity(total_capacity);
 
         for i in 0..k_usize {
             let shard = temp[i].as_ref()?;
-            let len = (payload_lens[i] as usize).min(shard.len());
+            let meta_len = payload_lens[i] as usize;
+            
+            // Если метаданные (длина) не прилетели, берем всю длину восстановленного шарда.
+            // Для видеопотока это безопасно: лишние нулевые байты в конце NALU декодер проигнорирует,
+            // а вот отсутствие куска данных в середине — фатально.
+            let len = if meta_len > 0 {
+                meta_len.min(shard.len())
+            } else {
+                shard.len()
+            };
             out.extend_from_slice(&shard[..len]);
         }
 
