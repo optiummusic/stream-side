@@ -273,9 +273,9 @@ pub(crate) async fn receive_datagrams(
                     TYPE_VIDEO => { // WE RECEIVE VIDEOSLICE TYPE HERE
                         // Reassemble; if a frame completed, enqueue it in the
                         // jitter buffer instead of pushing to the backend directly.
-                        let (assembled, nack) = assembler.insert(&chunk);
-                        if let Some(nack_pkt) = nack {
-                            if let Err(e) = control_tx.try_send(nack_pkt) {
+                        let (assembled, nacks) = assembler.insert(&chunk);
+                        for nack in nacks {
+                            if let Err(e) = control_tx.try_send(nack) {
                                 log::debug!("[NACK] control_tx full, NACK dropped: {e}");
                             }
                         }

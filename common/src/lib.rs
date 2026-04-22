@@ -79,6 +79,24 @@ pub struct VideoSlice {
 ///   `chunk_idx` and deserialise the result as a `VideoPacket` via postcard.
 /// - If a newer `frame_id` arrives before the current one is complete, evict
 ///   the stale entry (its P-frame data was already dropped by the network).
+
+pub struct EncodedSlice {
+    pub frame_id: u64,
+    /// Весь объем данных (все шарды всех групп лежат подряд)
+    pub all_shards_data: Bytes,
+    /// Метаданные для нарезки: (смещение в буфере, длина данных, индекс в группе, k, m, и т.д.)
+    pub chunks_meta: Vec<ChunkMeta>,
+}
+
+pub struct ChunkMeta {
+    pub offset: usize,
+    pub payload_len: u16,
+    pub group_idx: u8,
+    pub shard_idx: u8,
+    pub k: u8,
+    pub m: u8,
+}
+
 #[derive(Debug, Default)]
 pub struct DatagramChunk {
     pub frame_id:     u64,
@@ -172,6 +190,15 @@ impl DatagramChunk {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NackEntry {
+    pub slice_idx:     u8,
+    pub group_idx:     u8,
+    /// Bitmask: bit `i` is set when shard `i` has been received.
+    /// The sender retransmits shards whose bits are *clear*.
+    pub received_mask: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ControlPacket {
     Identify { 
         model: String, 
@@ -191,6 +218,10 @@ pub enum ControlPacket {
         /// Bitmask: bit `i` is set when shard `i` has been received.
         /// The sender retransmits shards whose bits are *clear*.
         received_mask: u64,
+    },
+    NackBatch {
+        frame_id: u64,
+        entries:  Vec<NackEntry>,
     },
     LostFrame,
 }

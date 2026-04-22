@@ -1,5 +1,6 @@
 
-use common::NaluType;
+use bytes::BytesMut;
+use common::{NaluType, TYPE_VIDEO};
 
 use crate::network::congestion::CongestionController;
 
@@ -167,32 +168,67 @@ pub(crate) async fn run_serialiser_task(
 
         // 4. Сериализация и FEC
         let serialized = postcard::to_allocvec(&video_slice).unwrap_or_default();
-        let chunks = common::fec::encode::FecEncoder::encode(
+        let encoded_slice = common::fec::encode::FecEncoder::encode(
             slice.frame_id,
-            idx,
-            total,
-            &serialized, 
+            slice.slice_idx,
+            slice.total_slices,
+            &serialized,
             max_chunk_data,
             flags
         );
-        let mut datagrams = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            datagrams.push(chunk.to_bytes());
+
+        let mut datagrams = Vec::with_capacity(encoded_slice.chunks_meta.len());
+        let total_groups = (encoded_slice.chunks_meta.last().map(|m| m.group_idx).unwrap_or(0) + 1);
+
+        for meta in encoded_slice.chunks_meta {
+            // Определяем размер конкретного шарда в буфере
+            // Важно: берем данные или паддинг до полного размера шарда
+            let shard_size = if meta.shard_idx < meta.k {
+                // Для данных нам достаточно payload_len, но RS работает блоками. 
+                // Чтобы ресивер не сошел с ума, шлем shard_size (он заложен в смещениях)
+                // Но можно оптимизировать и слать только payload_len
+                meta.payload_len as usize 
+            } else {
+                // Для паритета — всегда полный shard_size. 
+                // Его можно вычислить как разницу смещений или из метаданных (если добавить туда)
+                // Для простоты здесь предположим, что паритет того же размера что и данные
+                meta.payload_len as usize 
+            };
+
+            // Делаем ZERO-COPY срез данных
+            let shard_data = encoded_slice.all_shards_data.slice(meta.offset .. meta.offset + shard_size);
+
+            // Собираем финальную датаграмму (с заголовком)
+            let dgram = DatagramChunk::encode(
+                slice.frame_id,
+                slice.slice_idx,
+                slice.total_slices,
+                meta.shard_idx,
+                meta.k,
+                meta.m,
+                meta.payload_len,
+                TYPE_VIDEO,
+                flags,
+                meta.group_idx,
+                total_groups,
+                &shard_data // Передаем ссылку на срез
+            );
+            datagrams.push(dgram);
         }
         
-        // 5. Broadcast: отправляем СЛАЙС немедленно
+        // 4. Формируем пакет для рассылки
         let shared_part = Arc::new(SerializedFrame {
             frame_id: slice.frame_id,
             is_key: slice.is_key,
-            datagrams,
+            datagrams, // Здесь Vec<Bytes>, где каждый Bytes — это готовый UDP пакет
         });
 
-        // Кэшируем (важно: здесь кэш будет пополняться частями)
+        // Кэшируем для NACK-ов
         shard_cache.insert(shared_part.frame_id, &shared_part.datagrams);
         
+        // Шлем в send_loop
         let _ = broadcast_tx.send(shared_part);
 
-        // 6. Если это был последний слайс в пакете от энкодера — следующий будет новым кадром
         if slice.is_last {
             is_new_frame = true;
         }

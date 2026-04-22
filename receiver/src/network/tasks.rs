@@ -15,7 +15,7 @@ pub(crate) fn spawn_control_writer_task(
         let mut control_stream: Option<quinn::SendStream> = None;
 
         while let Some(packet) = control_rx.recv().await {
-            let is_nack = matches!(packet, ControlPacket::Nack { .. });
+            let is_nack = matches!(packet, ControlPacket::NackBatch { .. });
 
             if let Ok(bytes) = postcard::to_stdvec(&packet) {
                 if is_nack {

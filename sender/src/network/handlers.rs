@@ -124,15 +124,14 @@ pub(crate) async fn handle_uni_stream(
             } => {
                 let label = info.label().await;
                 log::debug!(
-                    "[NACK] {label} requested retransmit \
-                    frame={frame_id} slice={slice_idx} group={group_idx} \
-                    received={received_mask:#066b}"
+                    "[NACK] {label} frame={frame_id} slice={slice_idx} \
+                    group={group_idx} received={received_mask:#066b}"
                 );
             
                 let retransmit = shard_cache.retransmit(
                     frame_id,
                     slice_idx,
-                    group_idx,   // ← pass group through to cache lookup
+                    group_idx,
                     received_mask,
                 );
                 let count = retransmit.len();
@@ -150,10 +149,42 @@ pub(crate) async fn handle_uni_stream(
                         frame={frame_id} slice={slice_idx} group={group_idx} to {label}"
                     );
                 } else {
-                    // Cache miss — frame evicted or IDR was already triggered.
                     log::warn!(
                         "[NACK] frame={frame_id} slice={slice_idx} group={group_idx} \
                         not in cache for {label}."
+                    );
+                }
+            }
+            
+            ControlPacket::NackBatch { frame_id, entries } => {
+                let label = info.label().await;
+                log::debug!(
+                    "[NACK] {label} batch frame={frame_id} groups={}",
+                    entries.len()
+                );
+            
+                // Одна блокировка чтения на весь батч.
+                let retransmit = shard_cache.retransmit_batch(frame_id, &entries);
+                let count = retransmit.len();
+            
+                for dgram in retransmit {
+                    if let Err(e) = conn.send_datagram(dgram) {
+                        log::warn!("[NACK] batch retransmit send failed for {label}: {e}");
+                        break;
+                    }
+                }
+            
+                if count > 0 {
+                    log::debug!(
+                        "[NACK] retransmitted {count} shard(s) for \
+                        frame={frame_id} ({} groups) to {label}",
+                        entries.len()
+                    );
+                } else {
+                    log::warn!(
+                        "[NACK] frame={frame_id} not in cache for {label} \
+                        (batch of {} groups).",
+                        entries.len()
                     );
                 }
             }

@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 
+use bytes::{Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-use crate::{DatagramChunk, TYPE_VIDEO};
+use crate::{ChunkMeta, DatagramChunk, EncodedSlice, TYPE_VIDEO};
 
 use super::*;
 
@@ -31,23 +32,6 @@ thread_local! {
 pub struct FecEncoder;
 
 impl FecEncoder {
-    /// Encode a slice of data into FEC-protected [`DatagramChunk`]s.
-    ///
-    /// # FEC Group design
-    ///
-    /// 1. `data` is divided into raw data shards of at most `max_chunk_data`
-    ///    bytes each.
-    /// 2. Those shards are partitioned into **FEC groups** of at most
-    ///    [`FEC_GROUP_K_MAX`] shards.
-    /// 3. Every group is independently Reed-Solomon encoded, producing `m`
-    ///    parity shards chosen adaptively:
-    ///    - 100 % parity (`m = k`) for critical slices or the first slice of a
-    ///      frame (codec headers that cannot be skipped).
-    ///    - 50 % parity (`m = ⌈k/2⌉`) for all other slices.
-    ///
-    /// Each emitted [`DatagramChunk`] carries `group_idx` / `total_groups` so
-    /// the receiver can reassemble groups independently and begin decoding the
-    /// first completed groups without waiting for later ones.
     pub fn encode(
         frame_id: u64,
         slice_idx: u8,
@@ -55,109 +39,104 @@ impl FecEncoder {
         data: &[u8],
         max_chunk_data: usize,
         flags: u8,
-    ) -> Vec<DatagramChunk> {
+    ) -> EncodedSlice {
+        // Заглушка для пустых данных
         if data.is_empty() || max_chunk_data == 0 {
-            return Vec::new();
+            return EncodedSlice {
+                frame_id,
+                all_shards_data: Bytes::new(),
+                chunks_meta: Vec::new(),
+            };
         }
 
-        let is_critical   = (flags & 2) != 0;
+        let is_critical = (flags & 2) != 0;
         let is_first_slice = slice_idx == 0;
 
-        // Step 1 – split `data` into raw data shards of ≤ max_chunk_data bytes.
         let raw_shards: Vec<&[u8]> = data.chunks(max_chunk_data).collect();
-
-        // Step 2 – partition into FEC groups of ≤ FEC_GROUP_K_MAX shards.
         let fec_groups: Vec<&[&[u8]]> = raw_shards.chunks(FEC_GROUP_K_MAX).collect();
         let total_groups = fec_groups.len() as u8;
 
-        log::trace!(
-            "[FEC] encode frame#{} slice#{}/{} | total_len: {}, groups: {}, k_max: {}",
-            frame_id, slice_idx, total_slices,
-            data.len(), total_groups, FEC_GROUP_K_MAX
-        );
-
-        let mut all_chunks = Vec::with_capacity(raw_shards.len() * 2);
-
-        // Step 3 – encode each group independently.
-        for (group_idx, group) in fec_groups.iter().enumerate() {
-            let k = group.len() as u8;
-
-            // All data shards in a group are padded to the largest shard.
+        // Предварительно рассчитываем общий объем данных, чтобы аллоцировать BytesMut один раз
+        let mut total_buffer_size = 0;
+        for group in &fec_groups {
+            let k = group.len();
             let shard_size = group.iter().map(|s| s.len()).max().unwrap_or(0);
+            let m = Self::calculate_m(k, is_critical, is_first_slice);
+            total_buffer_size += (k + m) * shard_size;
+        }
 
-            // Adaptive parity selection.
-            let m_raw = if is_critical || is_first_slice {
-                k as usize          // 100 % — full redundancy for headers/critical
-            } else {
-                (k as usize + 1) / 2 // 50 %  — standard redundancy for data slices
-            };
-            // k + m must not exceed 255 (GF(2⁸) hard limit).
-            let m = m_raw.min(255usize.saturating_sub(k as usize)) as u8;
+        let mut all_shards_data = BytesMut::with_capacity(total_buffer_size);
+        let mut chunks_meta = Vec::with_capacity(raw_shards.len() * 2);
 
-            log::trace!(
-                "[FEC]   group#{}/{} k={} m={} shard_size={} part_len={}",
-                group_idx, total_groups, k, m, shard_size,
-                group.iter().map(|s| s.len()).sum::<usize>()
-            );
+        for (group_idx, group) in fec_groups.iter().enumerate() {
+            let k = group.len();
+            let shard_size = group.iter().map(|s| s.len()).max().unwrap_or(0);
+            let m = Self::calculate_m(k, is_critical, is_first_slice);
+            let total_shards = k + m;
 
-            // Build padded data shards.
-            let mut shards: Vec<Vec<u8>> = group
-                .iter()
-                .map(|s| {
-                    let mut v = s.to_vec();
-                    v.resize(shard_size, 0);
-                    v
-                })
-                .collect();
+            // 1. Создаем временный плоский буфер для этой группы
+            // Это единственная "тяжелая" аллокация на группу, данные отсюда уйдут в BytesMut
+            let mut group_buffer = vec![0u8; total_shards * shard_size];
 
-            // Append zero-initialised parity shards.
-            for _ in 0..m {
-                shards.push(vec![0u8; shard_size]);
+            // 2. Копируем данные исходных шардов в буфер группы
+            for (i, shard) in group.iter().enumerate() {
+                let start = i * shard_size;
+                group_buffer[start..start + shard.len()].copy_from_slice(shard);
             }
 
-            // Compute parity in-place.
+            // 3. Reed-Solomon кодирование
             if m > 0 {
                 RS_CACHE.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     let rs = cache
-                        .entry((k, m))
-                        .or_insert_with(|| {
-                            ReedSolomon::new(k as usize, m as usize)
-                                .expect("invalid RS parameters")
-                        });
-                    let _ = rs.encode(&mut shards);
+                        .entry((k as u8, m as u8))
+                        .or_insert_with(|| ReedSolomon::new(k, m).expect("RS init failed"));
+
+                    // Нарезаем буфер на мутабельные срезы для RS
+                    let mut shard_ptrs: Vec<&mut [u8]> = group_buffer
+                        .chunks_exact_mut(shard_size)
+                        .collect();
+                    
+                    rs.encode(&mut shard_ptrs).expect("RS encode failed");
                 });
             }
 
-            // Emit one DatagramChunk per shard (data + parity).
-            for (shard_idx, shard_data) in shards.into_iter().enumerate() {
-                // `payload_len` records the *actual* unpadded bytes for data
-                // shards so the receiver can strip padding after reconstruction.
-                // Parity shards record `shard_size` so the receiver knows the
-                // geometry without needing extra metadata.
-                let payload_len = if shard_idx < k as usize {
+            // 4. Фиксируем метаданные и переносим данные в общий буфер
+            let base_offset = all_shards_data.len();
+            for shard_idx in 0..total_shards {
+                let payload_len = if shard_idx < k {
                     group[shard_idx].len() as u16
                 } else {
                     shard_size as u16
                 };
 
-                all_chunks.push(DatagramChunk {
-                    frame_id,
-                    slice_idx,
-                    total_slices,
-                    group_idx: group_idx as u8,
-                    total_groups,
-                    shard_idx: shard_idx as u8,
-                    k,
-                    m,
+                chunks_meta.push(ChunkMeta {
+                    offset: base_offset + (shard_idx * shard_size),
                     payload_len,
-                    packet_type: TYPE_VIDEO,
-                    flags,
-                    data: shard_data.into(),
+                    group_idx: group_idx as u8,
+                    shard_idx: shard_idx as u8,
+                    k: k as u8,
+                    m: m as u8,
                 });
             }
+            
+            all_shards_data.extend_from_slice(&group_buffer);
         }
 
-        all_chunks
+        EncodedSlice {
+            frame_id,
+            all_shards_data: all_shards_data.freeze(),
+            chunks_meta,
+        }
+    }
+
+    /// Вынес логику расчета M в отдельный метод для чистоты
+    fn calculate_m(k: usize, is_critical: bool, is_first: bool) -> usize {
+        let m_raw = if is_critical || is_first {
+            k           // 100%: keyframe / slice_idx == 0
+        } else {
+            (k + 1) / 2 // 50%: обычный слайс
+        };
+        m_raw.min(255usize.saturating_sub(k))
     }
 }

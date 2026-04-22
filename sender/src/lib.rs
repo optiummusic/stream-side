@@ -11,7 +11,7 @@ pub mod network;
 use std::{collections::{HashMap, VecDeque}, sync::atomic::AtomicBool, time::Duration};
 
 use bytes::Bytes;
-use common::DatagramChunk;
+use common::{ChunkMeta, DatagramChunk, NackEntry};
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -53,11 +53,9 @@ impl ConnectionInfo {
     }
 }
 
-#[derive(Clone)]
 pub struct SerializedFrame {
     pub frame_id: u64,
     pub is_key: bool,
-    /// Pre-serialized, FEC-encoded, ready-to-send QUIC datagrams.
     pub datagrams: Vec<Bytes>,
 }
 
@@ -227,6 +225,43 @@ impl ShardCache {
             }
         }
  
+        out
+    }
+
+    pub fn retransmit_batch(
+        &self,
+        frame_id: u64,
+        entries: &[NackEntry],
+    ) -> Vec<Bytes> {
+        let inner = self.inner.read().unwrap();
+        let mut out = Vec::new();
+
+        // 1. Ищем кадр в кеше (один раз на весь батч)
+        let Some(frame_map) = inner.data.get(&frame_id) else {
+            // Если кадра нет (уже вытеснен или еще не дошел), возвращаем пустой список
+            return out;
+        };
+
+        // 2. Проходим по всем записям в батче NACK
+        for entry in entries {
+            // 3. Достаем список шардов для конкретной пары (slice, group)
+            if let Some(shards) = frame_map.get(&(entry.slice_idx, entry.group_idx)) {
+                for dgram in shards {
+                    if dgram.len() < HEADER_LEN {
+                        continue;
+                    }
+
+                    // 4. Проверяем маску. Шард-индекс берем из сырых байт заголовка.
+                    let shard_idx = dgram[HDR_SHARD_IDX];
+                    
+                    // Если в маске бит i == 0, значит чанк потерян — добавляем в список на переотправку
+                    if (entry.received_mask >> shard_idx) & 1 == 0 {
+                        out.push(dgram.clone());
+                    }
+                }
+            }
+        }
+
         out
     }
 }

@@ -9,6 +9,7 @@ pub struct RecoveryStats {
     pub rx_bytes: u64,
     pub rx_data_chunks: u64,
     pub rx_parity_chunks: u64,
+    pub zombie_chunks: u64,
 
     // ── Метрики выдачи (Application TX) ──
     pub frames_emitted: u64,
@@ -34,11 +35,23 @@ pub struct RecoveryStats {
 }
 
 impl RecoveryStats {
-    pub fn note_chunk(&mut self, chunk: &DatagramChunk, was_nacked: bool) {
-        self.rx_chunks += 1;
+    pub fn note_chunk(&mut self, chunk: &DatagramChunk, was_nacked: bool, zombie: bool) {
+        // 1. Считаем байты всегда (это нагрузка на интерфейс)
         self.rx_bytes += chunk.payload_len as u64;
 
+        // 2. Если это зомби — инкрементим только их и выходим.
+        // Они не должны участвовать в расчете Loss, так как это либо дубликаты,
+        // либо пакеты для уже закрытых (удаленных) кадров.
+        if zombie {
+            self.zombie_chunks += 1;
+            return; 
+        }
+
+        // 3. Основная статистика для "живых" кадров
+        self.rx_chunks += 1;
+
         if was_nacked {
+            // Это пакет, пришедший именно по запросу NACK
             self.nack_recovered_chunks += 1;
         }
 
@@ -116,8 +129,17 @@ impl RecoveryStats {
             0.0
         };
 
-        let loss_pct = if self.rx_chunks + self.total_lost_chunks > 0 {
-            (self.total_lost_chunks as f64 / (self.rx_chunks + self.total_lost_chunks) as f64) * 100.0
+        let total_lost = self.total_lost_chunks + self.frames_lost_evicted + self.frames_lost_out_of_window + self.frames_lost_timeout;
+        let loss_pct = if self.rx_chunks + total_lost > 0 {
+            (total_lost as f64 / (self.rx_chunks + total_lost) as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let total_received = self.rx_chunks + self.zombie_chunks;
+
+        let zombie_pct = if total_received > 0 {
+            (self.zombie_chunks as f64 / total_received as f64) * 100.0
         } else {
             0.0
         };
@@ -125,13 +147,13 @@ impl RecoveryStats {
         log::info!(
             "[STATS {:.1}s] \n\
              ├─ NET:  {:.2} Mbps | Loss: {} chk ({:.2}%) | NACK Recov: {} | NACKS Sent: {}\n\
-             ├─ IN:   Chunks: {} (Data: {}, Parity: {} [{:.1}% overhead])\n\
+             ├─ IN:   Chunks: {} | Zombie Rate: {:.1}% (Data: {}, Parity: {} [{:.1}% overhead])\n\
              ├─ OUT:  {:.1} FPS  | Frames: {} | Packets: {}\n\
              ├─ FEC:  Direct: {} | Recovered: {} | Failed: {} (wasted: {} bytes)\n\
              └─ LOSS: Evicted: {} | Timeout: {} | OOW: {} | HOL skips: {}",
             secs,
             mbps, self.total_lost_chunks, loss_pct, self.nack_recovered_chunks, self.nacks_sent,
-            self.rx_chunks, self.rx_data_chunks, self.rx_parity_chunks, parity_pct,
+            self.rx_chunks, zombie_pct, self.rx_data_chunks, self.rx_parity_chunks, parity_pct,
             fps, self.frames_emitted, self.video_packets_emitted,
             self.direct_groups, self.fec_groups, self.fec_failed_groups, self.wasted_payload_bytes,
             self.frames_lost_evicted, self.frames_lost_timeout, self.frames_lost_out_of_window, self.hol_skips
@@ -157,5 +179,6 @@ impl RecoveryStats {
         self.wasted_payload_bytes = 0;
         self.nack_recovered_chunks = 0;
         self.total_lost_chunks = 0;
+        self.zombie_chunks = 0;
     }
 }
