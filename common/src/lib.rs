@@ -1,12 +1,14 @@
 use serde::{Serialize, Deserialize};
 use bytes::{Bytes, BytesMut, BufMut};
-use std::{sync::atomic::AtomicI64, time::{SystemTime, UNIX_EPOCH}};
+
+use crate::clock::START_INSTANT;
 
 pub mod fec;
+pub mod clock;
+
 pub const TYPE_VIDEO: u8 = 0;
 pub const TYPE_AUDIO: u8 = 1;
 pub const TYPE_CONTROL: u8 = 2;
-pub static CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types shared between sender and receiver
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,16 +19,10 @@ pub struct FrameTrace {
     pub serialize_us:   u64,
     pub receive_us:    u64,
     pub reassembled_us: u64,
+    pub jitter_out_us:  u64,
+    pub decoder_submit_us : u64,
     pub decode_us:      u64,
     pub present_us:     u64,
-}
-
-
-use std::time::Instant;
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref START_INSTANT: Instant = Instant::now();
 }
 
 impl FrameTrace {
@@ -214,8 +210,7 @@ pub enum ControlPacket {
     StartStreaming,
     RequestKeyFrame,
     Ping { client_time_us: u64 },
-    Pong { client_time_us: u64, server_time_us: u64 },
-    OffsetUpdate { offset_us: i64, rtt_us: u64 },
+    Pong { offset: i64 },
     FrameFeedback { frame_id: u64, trace: FrameTrace },
     Communication {message: String },
     Nack {

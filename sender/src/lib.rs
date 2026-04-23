@@ -11,7 +11,7 @@ pub mod network;
 use std::{collections::{HashMap, VecDeque}, sync::{Arc, atomic::AtomicBool}, time::Duration};
 
 use bytes::Bytes;
-use common::{AudioFrame, ChunkMeta, DatagramChunk, NackEntry};
+use common::{AudioFrame, ChunkMeta, DatagramChunk, NackEntry, clock::Clock};
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +41,7 @@ pub struct ConnectionInfo {
     remote: String,
     label: RwLock<String>,
     ready: AtomicBool,
+    pub clock: Clock
 }
 
 impl ConnectionInfo {

@@ -238,60 +238,56 @@ pub(crate) async fn receive_datagrams(
         let mut jitter = AvJitterBuffer::new(JITTER_TARGET_MS);
         let mut next_drain_us: u64 = 0;
 
+        // Вспомогательная функция для выгрузки готовых кадров
+        let drain_jitter = |jitter: &mut AvJitterBuffer, now_us: u64| -> u64 {
+            let (video, audio) = jitter.drain_ready_with(now_us);
+            
+            for packet in video {
+                let _ = worker_tx.send(VideoWorkerMsg::Push(packet));
+            }
+
+            for frame in audio {
+                let _ = audio_out_tx.try_send(frame);
+            }
+
+            // Возвращаем время следующей выгрузки или дефолтный таймаут
+            jitter.time_to_next_us().unwrap_or(now_us + 50_000)
+        };
+
         loop {
             let now_us = FrameTrace::now_us();
             let sleep_us = next_drain_us.saturating_sub(now_us);
             let sleep_dur = Duration::from_micros(sleep_us);
 
             tokio::select! {
-                Some(packet) = video_rx.recv() => {
-                    let now_us = FrameTrace::now_us();
-                    jitter.push_video(packet, now_us);
-                    if let Some(next) = jitter.time_to_next_us() {
-                        if next_drain_us == 0 || next < next_drain_us {
-                            next_drain_us = next;
-                        }
+                // Пришло видео: пушим и СРАЗУ пытаемся выгрузить
+                Some(mut packet) = video_rx.recv() => {
+                    let now = FrameTrace::now_us();
+                    if let Some(ref mut trace) = packet.trace {
+                        trace.jitter_out_us = now;
                     }
+                    jitter.push_video(packet, now);
+                    next_drain_us = drain_jitter(&mut jitter, now);
                 }
 
+                // Пришло аудио: пушим и СРАЗУ пытаемся выгрузить
                 Some(frame) = audio_rx.recv() => {
-                    let now_us = FrameTrace::now_us();
-                    jitter.push_audio(frame, now_us);
-                    if let Some(next) = jitter.time_to_next_us() {
-                        if next_drain_us == 0 || next < next_drain_us {
-                            next_drain_us = next;
-                        }
-                    }
+                    let now = FrameTrace::now_us();
+                    jitter.push_audio(frame, now);
+                    next_drain_us = drain_jitter(&mut jitter, now);
                 }
 
+                // Проснулись по таймеру: выгружаем накопленное
                 _ = tokio::time::sleep(sleep_dur), if !sleep_dur.is_zero() => {
-                    let now_us = FrameTrace::now_us();
-                    let (video, audio) = jitter.drain_ready_with(now_us);
-                    for packet in video {
-                        let _ = worker_tx.send(VideoWorkerMsg::Push(packet));
-                    }
-                    for frame in audio {
-                        let _ = audio_out_tx.try_send(frame);
-                    }
-                    let now_us = FrameTrace::now_us();
-                    next_drain_us = jitter.time_to_next_us()
-                        .unwrap_or(now_us + 50_000);
+                    next_drain_us = drain_jitter(&mut jitter, FrameTrace::now_us());
                 }
             }
 
-            // Если sleep_dur == 0 — дрейним сразу не ожидая следующей итерации
-            if sleep_dur.is_zero() {
-                let now_us = FrameTrace::now_us();
-                let (video, audio) = jitter.drain_ready_with(now_us);
-                for packet in video {
-                    let _ = worker_tx.send(VideoWorkerMsg::Push(packet));
-                }
-                for frame in audio {
-                    let _ = audio_out_tx.try_send(frame);
-                }
-                let now_us = FrameTrace::now_us();
-                next_drain_us = jitter.time_to_next_us()
-                    .unwrap_or(now_us + 50_000);
+            // Если джиттер говорит, что пора отдавать прямо сейчас (целевая задержка 0),
+            // делаем это не дожидаясь следующего select!
+            let now = FrameTrace::now_us();
+            if next_drain_us <= now {
+                next_drain_us = drain_jitter(&mut jitter, now);
             }
         }
     });
@@ -335,12 +331,7 @@ pub(crate) async fn receive_datagrams(
             }
             TYPE_CONTROL => {
                 if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
-                    if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
-                        let conn_clone = conn.clone();
-                        tokio::spawn(async move {
-                            let _ = send_offset_update(&conn_clone, rtt_us).await;
-                        });
-                    }
+                    process_control(ctrl);
                 }
             }
             TYPE_AUDIO => {

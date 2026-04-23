@@ -10,7 +10,6 @@ pub(crate) async fn send_loop_to_client(
     conn: Connection,
     mut video_rx: broadcast::Receiver<Arc<SerializedFrame>>,
     info: Arc<ConnectionInfo>,
-    clock_offset: &AtomicI64,
     congestion_ctl: Arc<Mutex<CongestionController>>,
     senders: Senders,
 ) {
@@ -97,7 +96,7 @@ pub(crate) async fn send_loop_to_client(
                 if let Ok(raw_data) = incoming {
                     if let Some(chunk) = DatagramChunk::decode(raw_data) {
                         if chunk.packet_type == TYPE_CONTROL {
-                            handle_control(&conn, chunk.data, &info, clock_offset, congestion_ctl.clone(), senders.clone()).await;
+                            handle_control(&conn, chunk.data, &info, congestion_ctl.clone(), senders.clone()).await;
                         }
                     }
                 } else { break; }

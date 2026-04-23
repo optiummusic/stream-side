@@ -104,13 +104,13 @@ impl CongestionController {
         }
     }
 
-    pub fn on_metrics(&mut self, rtt_ms: f64) -> CongestionAction {
+    pub fn on_metrics(&mut self, rtt_ms: u64) -> CongestionAction {
         let now = Instant::now();
 
         // 1. Оцениваем состояние канала
         let channel_state = if self.lost_frames_acc >= 1 {
             ChannelState::Lossy
-        } else if rtt_ms > self.config.rtt_threshold_ms {
+        } else if rtt_ms as f64 > self.config.rtt_threshold_ms {
             ChannelState::Congested
         } else {
             ChannelState::Healthy

@@ -14,7 +14,7 @@ pub(crate) use std::sync::atomic::{Ordering};
 pub(crate) use socket2::{Domain, Protocol, Socket, Type};
 pub(crate) use tokio::{sync::watch, task::JoinHandle, time::{self, Instant}};
 pub(crate) use tokio::sync::mpsc;
-pub(crate) use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
+pub(crate) use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
 pub(crate) use quinn::{Endpoint, SendStream};
 pub(crate) use quinn::crypto::rustls::QuicClientConfig;
 pub(crate) use rustls::pki_types::{CertificateDer, ServerName};

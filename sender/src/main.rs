@@ -21,7 +21,11 @@ use sender::{
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .filter_module("quinn", log::LevelFilter::Warn) // Quinn в мусор (только ошибки)
+        .filter_module("tracing", log::LevelFilter::Warn) // И сам трейсинг туда же
+        .write_style(env_logger::WriteStyle::Always)
+        .init();
 
     rustls::crypto::ring::default_provider()
         .install_default()

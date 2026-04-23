@@ -1,4 +1,6 @@
 
+use common::clock::Clock;
+
 use super::*;
 
 pub(crate) async fn handle_connection(
@@ -19,17 +21,15 @@ pub(crate) async fn handle_connection(
         remote: remote_addr.to_string(),
         label: RwLock::new(remote_addr.to_string()),
         ready: AtomicBool::new(false),
+        clock: Clock::new()
     });
     
-    let clock_offset = Arc::new(AtomicI64::new(0));
-
     // Клоны для разных задач внутри одного соединения
     let info_bi = info.clone();
     let info_uni = info.clone();
     let info_main = info.clone();
     let idr_tx_uni = senders.idr_tx.clone();
     let send_main = senders.clone();
-    let clock_off_main = clock_offset.clone();
     let conn_bi = conn.clone();
     let conn_uni = conn.clone();
 
@@ -47,7 +47,6 @@ pub(crate) async fn handle_connection(
                 conn_uni.clone(), 
                 recv, 
                 info_uni.clone(), 
-                clock_offset.clone(), 
                 idr_tx_uni.clone(), 
                 shard_cache.clone()
             ).await;
@@ -55,7 +54,7 @@ pub(crate) async fn handle_connection(
     });
 
     // 3. Основной цикл отправки (Datagrams)
-    send_loop_to_client(conn, client_rx, info_main, &clock_off_main,congestion_ctl, send_main).await;
+    send_loop_to_client(conn, client_rx, info_main, congestion_ctl, send_main).await;
 }
 
 pub(crate) async fn run_accept_loop(

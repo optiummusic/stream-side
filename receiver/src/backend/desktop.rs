@@ -255,7 +255,10 @@ impl VideoBackend for DesktopFfmpegBackend {
     fn get_slice_buffer(&mut self) -> &mut BytesMut {
         &mut self.slice_buffer
     }
-    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, mut trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+        if let Some(ref mut trace) = trace {
+            trace.decoder_submit_us = FrameTrace::now_us();
+        }
         log::debug!("[Decoder] Submit frame #{}", frame_id);
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
         if let Some(dst) = pkt.data_mut() {

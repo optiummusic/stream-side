@@ -27,7 +27,7 @@ use bytes::BytesMut;
 use std::time::Instant;
 use std::time::Duration;
 use super::{BackendError, FrameOutput, PushStatus, VideoBackend};
-use common::FrameTrace;
+use common::{FrameTrace, clock::CLIENT_CLOCK};
 // ─────────────────────────────────────────────────────────────────────────────
 // Глобальный синглтон бекенда
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,13 +119,17 @@ const MAX_AGE_POLL: f64 = 220.0; // Pre Poll
 const CRITICAL_AGE_FLUSH: f64 = 500.0;
 
 impl VideoBackend for AndroidMediaCodecBackend {
-    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+    fn submit_to_decoder(&mut self, payload: &[u8], frame_id: u64, mut trace: Option<FrameTrace>) -> Result<PushStatus, BackendError> {
+        let now = FrameTrace::now_us();
+        if let Some(ref mut trace) = trace {
+            trace.decoder_submit_us = now;
+        }
         let Some(state) = self.state.as_ref() else {
                 return Ok(PushStatus::Accumulating); // Surface ещё не пришёл — тихо ждём
         };
         // Drop old chunks
         if let Some(t) = &trace {
-            let age_ms = FrameTrace::ms(t.receive_us, FrameTrace::now_us());
+            let age_ms = FrameTrace::ms(t.receive_us, now);
 
             if age_ms > CRITICAL_AGE_FLUSH {
                 self.flush_decoder();
@@ -444,9 +448,8 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_onVsync(
     // VSYNC просто забирает данные, если их подготовил poll_output
     if let Ok(mut pending_guard) = PENDING_VSYNC_INFO.lock() {
         if let Some((frame_id, mut trace)) = pending_guard.take() {
-            let offset = common::CLOCK_OFFSET.load(Ordering::Relaxed);
             let present_us = FrameTrace::now_us();
-            let capture_local_us = (trace.capture_us as i64).saturating_sub(offset);
+            let capture_local_us = CLIENT_CLOCK.server_to_client(trace.capture_us);
             
             let diff_ms = (present_us as i64 - capture_local_us) as f64 / 1000.0;
             

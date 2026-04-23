@@ -76,8 +76,11 @@ impl VideoBackend for MacosFfmpegBackend {
         &mut self,
         payload:  &[u8],
         frame_id: u64,
-        trace:    Option<FrameTrace>,
+        mut trace:    Option<FrameTrace>,
     ) -> Result<PushStatus, BackendError> {
+        if let Some(ref mut trace) = trace {
+            trace.decoder_submit_us = FrameTrace::now_us();
+        }
         let mut pkt = ffmpeg_next::Packet::new(payload.len());
         if let Some(dst) = pkt.data_mut() {
             dst.copy_from_slice(payload);
