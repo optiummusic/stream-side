@@ -8,7 +8,7 @@ const FAIL_WINDOW: usize = 26;
 #[cfg(not(target_os = "android"))]
 use crate::backend::audio_cpal::CpalAudioOutput;
 
-use crate::{VideoWorkerMsg, backend::{audio_output::{self, AudioOutput}}};
+use crate::{AvJitterBuffer, VideoWorkerMsg, backend::audio_output::{self, AudioOutput}};
 
 #[cfg(target_os = "android")]
 use crate::backend::audio_oboe::OboeAudioOutput;
@@ -228,53 +228,87 @@ pub(crate) async fn receive_datagrams(
     worker_tx: SyncSender<VideoWorkerMsg>,
     control_tx: mpsc::Sender<ControlPacket>,
 ) {
-    let jitter_buf = Arc::new(Mutex::new(JitterBuffer::new(JITTER_TARGET_MS)));
+    let (audio_tx, mut audio_rx) = mpsc::channel::<AudioFrame>(256);
+    let (video_tx, mut video_rx) = mpsc::channel::<VideoPacket>(512);
+    let (audio_out_tx, mut audio_out_rx) = mpsc::channel::<AudioFrame>(256);
+
     let mut assembler = FrameAssembler::new();
     
-    let jitter_clone = Arc::clone(&jitter_buf);
-    let worker_tx_clone = worker_tx.clone();
-
     tokio::spawn(async move {
+        let mut jitter = AvJitterBuffer::new(JITTER_TARGET_MS);
+        let mut next_drain_us: u64 = 0;
+
         loop {
-            let next_sleep = {
-                let mut lock = jitter_clone.lock().unwrap();
-                lock.time_to_next()
-            };
+            let now_us = FrameTrace::now_us();
+            let sleep_us = next_drain_us.saturating_sub(now_us);
+            let sleep_dur = Duration::from_micros(sleep_us);
 
-            match next_sleep {
-                Some(duration) => {
-                    if !duration.is_zero() {
-                        tokio::time::sleep(duration).await;
-                    }
-                    
-                    let ready_packets = {
-                        let mut lock = jitter_clone.lock().unwrap();
-                        lock.drain_ready()
-                    };
-
-                    for packet in ready_packets {
-                        if let Err(_) = worker_tx_clone.send(VideoWorkerMsg::Push(packet)) {
-                            return; // Канал закрыт, выходим
+            tokio::select! {
+                Some(packet) = video_rx.recv() => {
+                    let now_us = FrameTrace::now_us();
+                    jitter.push_video(packet, now_us);
+                    if let Some(next) = jitter.time_to_next_us() {
+                        if next_drain_us == 0 || next < next_drain_us {
+                            next_drain_us = next;
                         }
                     }
                 }
-                None => {
-                    // Буфер пуст, спим фиксированное время, чтобы не забивать CPU
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+
+                Some(frame) = audio_rx.recv() => {
+                    let now_us = FrameTrace::now_us();
+                    jitter.push_audio(frame, now_us);
+                    if let Some(next) = jitter.time_to_next_us() {
+                        if next_drain_us == 0 || next < next_drain_us {
+                            next_drain_us = next;
+                        }
+                    }
+                }
+
+                _ = tokio::time::sleep(sleep_dur), if !sleep_dur.is_zero() => {
+                    let now_us = FrameTrace::now_us();
+                    let (video, audio) = jitter.drain_ready_with(now_us);
+                    for packet in video {
+                        let _ = worker_tx.send(VideoWorkerMsg::Push(packet));
+                    }
+                    for frame in audio {
+                        let _ = audio_out_tx.try_send(frame);
+                    }
+                    let now_us = FrameTrace::now_us();
+                    next_drain_us = jitter.time_to_next_us()
+                        .unwrap_or(now_us + 50_000);
                 }
             }
+
+            // Если sleep_dur == 0 — дрейним сразу не ожидая следующей итерации
+            if sleep_dur.is_zero() {
+                let now_us = FrameTrace::now_us();
+                let (video, audio) = jitter.drain_ready_with(now_us);
+                for packet in video {
+                    let _ = worker_tx.send(VideoWorkerMsg::Push(packet));
+                }
+                for frame in audio {
+                    let _ = audio_out_tx.try_send(frame);
+                }
+                let now_us = FrameTrace::now_us();
+                next_drain_us = jitter.time_to_next_us()
+                    .unwrap_or(now_us + 50_000);
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        #[cfg(not(target_os = "android"))]
+        let mut audio_output = CpalAudioOutput::new();
+        #[cfg(target_os = "android")]
+        let mut audio_output = OboeAudioOutput::new();
+
+        while let Some(frame) = audio_out_rx.recv().await {
+            audio_output.push_opus(&frame.payload);
         }
     });
 
     // 3. Основной сетевой цикл (Hot Path)
     // Теперь он занимается ТОЛЬКО приемом и сборкой, не отвлекаясь на таймеры
-
-    #[cfg(not(target_os = "android"))]
-    let mut audio_output = CpalAudioOutput::new();
-
-    #[cfg(target_os = "android")]
-    let mut audio_output = OboeAudioOutput::new();
-
     loop {
         let raw = match conn.read_datagram().await {
             Ok(b)  => b,
@@ -295,12 +329,8 @@ pub(crate) async fn receive_datagrams(
                     let _ = control_tx.try_send(nack);
                 }
 
-                // Пушим собранные пакеты в джиттер-буфер
-                if !assembled.is_empty() {
-                    let mut lock = jitter_buf.lock().unwrap();
-                    for packet in assembled {
-                        lock.push(packet);
-                    }
+                for packet in assembled {
+                    let _ = video_tx.try_send(packet);
                 }
             }
             TYPE_CONTROL => {
@@ -315,7 +345,19 @@ pub(crate) async fn receive_datagrams(
             }
             TYPE_AUDIO => {
                 if !chunk.data.is_empty() {
-                    audio_output.push_opus(&chunk.data);
+                    log::trace!("[Audio] received chunk, {} bytes", chunk.data.len());
+                    match postcard::from_bytes::<AudioFrame>(&chunk.data) {
+                        Ok(frame) => {
+                            log::trace!("[Audio] deserialized frame capture_us={}", frame.capture_us);
+                            match audio_tx.try_send(frame) {
+                                Ok(_) => log::debug!("[Audio] sent to jitter"),
+                                Err(e) => log::warn!("[Audio] channel send failed: {e}"),
+                            }
+                        }
+                        Err(e) => log::warn!("[Audio] deserialize failed: {e}"),
+                    }
+                } else {
+                    log::warn!("[Audio] empty chunk");
                 }
             }
             _ => {}

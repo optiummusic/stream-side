@@ -106,14 +106,13 @@ pub(crate) async fn send_loop_to_client(
             audio_result = audio_receive.recv() => {
                 match audio_result {
                     Ok(audio_frame) => {
-                        // Если клиент еще не готов (не прошел Identify), скипаем
                         if !info.ready.load(Ordering::Acquire) { continue; }
 
-                        let data_len = audio_frame.payload.len() as u16;
+                        let serialized = postcard::to_allocvec(&*audio_frame).unwrap_or_default();
                         let dgram = DatagramChunk {
-                            payload_len: data_len,
+                            payload_len: serialized.len() as u16,
                             packet_type: TYPE_AUDIO,
-                            data: audio_frame.payload.clone(),
+                            data: serialized.into(),
                             ..Default::default()
                         }.to_bytes();
                         pending_dgrams.push_front(dgram);

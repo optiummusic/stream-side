@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use opus_decoder::OpusDecoder;
 
 use crate::backend::audio_output::AudioOutput;
 
 pub struct CpalAudioOutput {
     buffer:  Arc<Mutex<Vec<f32>>>,
-    decoder: opus::Decoder,
+    decoder: OpusDecoder,
 }
 
 impl AudioOutput for CpalAudioOutput {
@@ -14,7 +15,7 @@ impl AudioOutput for CpalAudioOutput {
         let buffer_clone = buffer.clone();
 
         // Opus декодер
-        let decoder = opus::Decoder::new(48_000, opus::Channels::Stereo)
+        let decoder = OpusDecoder::new(48_000, 2)
             .expect("Opus decoder init failed");
 
         // cpal output stream — запускается один раз и живёт вечно
