@@ -8,10 +8,10 @@ pub mod encode;
 
 
 pub mod network;
-use std::{collections::{HashMap, VecDeque}, sync::atomic::AtomicBool, time::Duration};
+use std::{collections::{HashMap, VecDeque}, sync::{Arc, atomic::AtomicBool}, time::Duration};
 
 use bytes::Bytes;
-use common::{ChunkMeta, DatagramChunk, NackEntry};
+use common::{AudioFrame, ChunkMeta, DatagramChunk, NackEntry};
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -33,6 +33,7 @@ pub struct Senders {
     pub idr_tx: tokio::sync::watch::Sender<bool>, 
     pub bitrate_tx: tokio::sync::watch::Sender<u64>, 
     pub capture_fps_tx: tokio::sync::watch::Sender<Option<u32>>,
+    pub audio_bcast_tx: tokio::sync::broadcast::Sender<Arc<AudioFrame>>,
 }
 
 #[derive(Default)]

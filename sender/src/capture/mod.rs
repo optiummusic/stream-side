@@ -33,6 +33,7 @@
 //! ```
 
 use std::{fmt, future::Future};
+use common::AudioFrame;
 use tokio::sync::mpsc;
 
 #[cfg(target_os = "linux")]
@@ -41,6 +42,9 @@ use crate::encode::EncodedFrame;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "linux")]
+pub mod linux_audio;
 
 #[cfg(target_os = "linux")]
 pub mod wlroots;
@@ -201,5 +205,22 @@ impl VideoSender for LinuxSender {
             LinuxSenderInner::Wlroots(s)  => s.run(sink).await,
             LinuxSenderInner::PipeWire(s) => s.run(sink).await,
         }
+    }
+}
+
+pub trait AudioSender: Send + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn run(
+        self,
+        sink: mpsc::Sender<AudioFrame>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+pub struct LinuxAudioSender;
+
+impl LinuxAudioSender {
+    pub fn new() -> Self {
+        Self
     }
 }

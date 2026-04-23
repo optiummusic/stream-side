@@ -37,10 +37,12 @@ log      = "0.4"
 bytes = "1.11.1"
 reed-solomon-erasure = "6.0.0"
 socket2 = "0.6.3"
+
 # ─────────────────────────────────────────
 # Только для десктопа (Linux / Windows / macOS)
 # ─────────────────────────────────────────
 [target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = "0.17.3"
 ffmpeg-next = "8.1"
 wgpu        = "29"
 winit       = "0.30"
@@ -49,6 +51,7 @@ bytemuck    = { version = "1", features = ["derive"] }
 env_logger  = "0.11"
 libc = "0.2.184"
 ash = "0.38.0"
+opus = "0.3.1"
 
 # ─────────────────────────────────────────
 # Только для Android
@@ -60,6 +63,8 @@ jni = { version = "0.22.4", features = ["invocation"] }
 ndk-sys = "0.6"
 # Логирование в logcat
 android_logger = "0.14"
+oboe = { version = "0.6.1", features = ["shared-stdcxx"] }
+opus-decoder = "0.1.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

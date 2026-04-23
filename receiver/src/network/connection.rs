@@ -1,10 +1,17 @@
 use std::sync::mpsc::{SyncSender, sync_channel};
-use common::fec::assembler::FrameAssembler;
+use common::{AudioFrame, fec::assembler::FrameAssembler};
 
 
 const IDR_INTERVAL_MS: u64 = 50; 
 const FAIL_WINDOW: usize = 26;
-use crate::VideoWorkerMsg;
+
+#[cfg(not(target_os = "android"))]
+use crate::backend::audio_cpal::CpalAudioOutput;
+
+use crate::{VideoWorkerMsg, backend::{audio_output::{self, AudioOutput}}};
+
+#[cfg(target_os = "android")]
+use crate::backend::audio_oboe::OboeAudioOutput;
 
 use super::*;
 
@@ -261,6 +268,13 @@ pub(crate) async fn receive_datagrams(
 
     // 3. Основной сетевой цикл (Hot Path)
     // Теперь он занимается ТОЛЬКО приемом и сборкой, не отвлекаясь на таймеры
+
+    #[cfg(not(target_os = "android"))]
+    let mut audio_output = CpalAudioOutput::new();
+
+    #[cfg(target_os = "android")]
+    let mut audio_output = OboeAudioOutput::new();
+
     loop {
         let raw = match conn.read_datagram().await {
             Ok(b)  => b,
@@ -297,6 +311,11 @@ pub(crate) async fn receive_datagrams(
                             let _ = send_offset_update(&conn_clone, rtt_us).await;
                         });
                     }
+                }
+            }
+            TYPE_AUDIO => {
+                if !chunk.data.is_empty() {
+                    audio_output.push_opus(&chunk.data);
                 }
             }
             _ => {}

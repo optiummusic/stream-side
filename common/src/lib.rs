@@ -289,3 +289,9 @@ pub enum NaluType {
     SliceTrailing,    // Обычный P-кадр (1)
     Other(u8),        // Все остальное
 }
+
+#[derive(Deserialize, Clone)]
+pub struct AudioFrame {
+    pub payload: bytes::Bytes,
+    pub capture_us: u64,
+}
