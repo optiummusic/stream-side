@@ -93,7 +93,7 @@ jobs:
             libssl-dev pkg-config \
             libvulkan-dev \
             nasm yasm cmake ninja-build \
-            libx264-dev libx265-dev
+            libx264-dev libx265-dev libasound2-dev
 
       - name: Restore FFmpeg cache
         id: cache-ffmpeg-receiver
