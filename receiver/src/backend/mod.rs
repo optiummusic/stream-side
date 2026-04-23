@@ -211,3 +211,11 @@ pub mod macos;
 
 #[cfg(target_os = "android")]
 pub mod android;
+
+pub mod audio_output;
+
+#[cfg(not(target_os = "android"))]
+pub mod audio_cpal;
+
+#[cfg(target_os = "android")]
+pub mod audio_oboe;

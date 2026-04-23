@@ -1,6 +1,6 @@
 
 use bytes::BytesMut;
-use common::{NaluType, TYPE_VIDEO};
+use common::{NaluType, TYPE_AUDIO, TYPE_VIDEO};
 
 use crate::network::congestion::CongestionController;
 
@@ -21,6 +21,7 @@ pub(crate) async fn send_loop_to_client(
     // Очередь для плавного выталкивания
     let mut pending_dgrams: std::collections::VecDeque<Bytes> = std::collections::VecDeque::with_capacity(4096);
     let mut pacer = FramePacer::new(1000.0, 4.0); // 100 Mbps baseline
+    let mut audio_receive = senders.audio_bcast_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -100,6 +101,28 @@ pub(crate) async fn send_loop_to_client(
                         }
                     }
                 } else { break; }
+            }
+
+            audio_result = audio_receive.recv() => {
+                match audio_result {
+                    Ok(audio_frame) => {
+                        // Если клиент еще не готов (не прошел Identify), скипаем
+                        if !info.ready.load(Ordering::Acquire) { continue; }
+
+                        let data_len = audio_frame.payload.len() as u16;
+                        let dgram = DatagramChunk {
+                            payload_len: data_len,
+                            packet_type: TYPE_AUDIO,
+                            data: audio_frame.payload.clone(),
+                            ..Default::default()
+                        }.to_bytes();
+                        pending_dgrams.push_front(dgram);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[QUIC] Audio stream lagged by {n} frames for {remote}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     }

@@ -13,9 +13,10 @@
 //! На wlroots-композиторах (Sway, Hyprland) автоматически используется
 //! `zwlr_screencopy_manager_v1`. На остальных — XDG Portal + PipeWire.
 
-use std::{env, net::SocketAddr, sync::{Arc, Mutex}, time::Duration};
+use std::{env, net::SocketAddr, sync::{Arc, Mutex, mpsc}, time::Duration};
+use common::AudioFrame;
 use sender::{
-    Senders, Watchers, capture::{LinuxSender, VideoSender}, network::{CongestionConfig, CongestionController, QuicServer}
+    Senders, Watchers, capture::{AudioSender, LinuxAudioSender, LinuxSender, VideoSender}, network::{CongestionConfig, CongestionController, QuicServer}
 };
 
 #[tokio::main]
@@ -46,6 +47,16 @@ async fn main() {
     let (bitrate_tx, bitrate_rx) = tokio::sync::watch::channel(10_000_000u64);
     let (fps_tx, fps_rx) = tokio::sync::watch::channel(Some(120));
 
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<AudioFrame>(64);
+    let (audio_bcast_tx, _) = tokio::sync::broadcast::channel::<Arc<AudioFrame>>(64);
+
+    let bcast_tx_clone = audio_bcast_tx.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = audio_rx.recv().await {
+            let _ = bcast_tx_clone.send(Arc::new(frame));
+        }
+    });
+
     let watchers = Watchers {
         idr_rx,         // Вместо idr_rx: idr_rx
         bitrate_rx, 
@@ -56,6 +67,7 @@ async fn main() {
         idr_tx,
         bitrate_tx,
         capture_fps_tx: fps_tx,
+        audio_bcast_tx,
     };
 
     let config = CongestionConfig {
@@ -84,17 +96,19 @@ async fn main() {
     //   • wlroots-compositor  → WlrootsSender  (zwlr_screencopy, низкая latency)
     //   • иначе               → LinuxPipeWireSender (XDG Portal + PipeWire)
 
-    let sender = LinuxSender::new(1, 1, watchers);
+    let video_sender = LinuxSender::new(1, 1, watchers);
+    let audio_sender = LinuxAudioSender::new();
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             log::info!("Received Ctrl-C, shutting down");
         }
-        res = sender.run(sink) => {
-            match res {
-                Ok(())   => log::info!("Sender finished cleanly"),
-                Err(e)   => log::error!("Sender error: {e}"),
-            }
+        res = video_sender.run(sink) => {
+        if let Err(e) = res { log::error!("Video Sender error: {e}"); }
+        }
+        // Запуск аудио-потока (передаем audio_mpsc_tx для AudioFrame)
+        res = audio_sender.run(audio_tx) => {
+            if let Err(e) = res { log::error!("Audio Sender error: {e}"); }
         }
     }
 }
