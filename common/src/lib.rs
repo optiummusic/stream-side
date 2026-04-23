@@ -21,12 +21,17 @@ pub struct FrameTrace {
     pub present_us:     u64,
 }
 
+
+use std::time::Instant;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref START_INSTANT: Instant = Instant::now();
+}
+
 impl FrameTrace {
     pub fn now_us() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64
+        START_INSTANT.elapsed().as_micros() as u64
     }
 
     pub fn ms(from: u64, to: u64) -> f64 {
@@ -290,7 +295,7 @@ pub enum NaluType {
     Other(u8),        // Все остальное
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Serialize)]
 pub struct AudioFrame {
     pub payload: bytes::Bytes,
     pub capture_us: u64,

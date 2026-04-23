@@ -676,6 +676,7 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "lazy_static",
  "log",
  "postcard",
  "rayon",
@@ -2966,7 +2967,6 @@ dependencies = [
  "ndk-sys",
  "oboe",
  "once_cell",
- "opus",
  "opus-decoder",
  "pollster",
  "postcard",
