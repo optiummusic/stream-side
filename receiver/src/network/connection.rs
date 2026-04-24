@@ -327,12 +327,15 @@ pub(crate) async fn receive_datagrams(
                     TYPE_VIDEO => {
                         let receive_us = FrameTrace::now_us();
 
-                        let (assembled, nacks) = assembler.insert(&chunk, receive_us);
+                        let (assembled, nacks, stats) = assembler.insert(&chunk, receive_us);
                         for nack in nacks {
                             let _ = control_tx.try_send(nack);
                         }
                         for packet in assembled {
                             let _ = video_tx.try_send(packet);
+                        }
+                        if let Some(stat) = stats {
+                            let _ = control_tx.try_send(stat);
                         }
                     }
                     TYPE_CONTROL => {

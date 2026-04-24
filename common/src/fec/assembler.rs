@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::{
-    ControlPacket, DatagramChunk, FrameTrace, NackEntry, VideoPacket, fec::{
-        decode_task::ComputePool, frame_builder::{FrameBuilder, FrameState}, group_builder::GroupState, slice_builder::SliceState, stats::RecoveryStats
+    ControlPacket, DatagramChunk, FrameTrace, NackEntry, RecoveryStats, VideoPacket, fec::{
+        decode_task::ComputePool, frame_builder::{FrameBuilder, FrameState}, group_builder::GroupState, slice_builder::SliceState,
     }
 };
 
@@ -64,21 +64,19 @@ impl FrameAssembler {
     /// - `Option<ControlPacket>` — a NACK if any group is in a `Stalled` /
     ///   expired-`Requested` state (Lazy NACK: no heavy scan, each
     ///   `FrameBuilder` exposes candidates directly).
-    pub fn insert(&mut self, chunk: &DatagramChunk, receive_us: u64) -> (Vec<VideoPacket>, Vec<ControlPacket>) {
+    pub fn insert(&mut self, chunk: &DatagramChunk, receive_us: u64) -> (Vec<VideoPacket>, Vec<ControlPacket>, Option<ControlPacket>) {
         let frame_id = chunk.frame_id;
 
-        // ── Stats ────────────────────────────────────────────────────────────
 
         // Initialise the HOL pointer on the very first packet ever received.
         self.next_to_push_id.get_or_insert(frame_id);
-
         // Если пакет пришел для кадра, который мы уже отдали на декодер (или скипнули),
         // просто игнорируем его, чтобы не создавать пустой FrameBuilder.
         if let Some(hol_id) = self.next_to_push_id {
             if frame_id < hol_id {
                 // Пакет безнадежно опоздал (или это дубликат)
                 self.stats.note_chunk(chunk, false, true);
-                return (Vec::new(), Vec::new(),);
+                return (Vec::new(), Vec::new(), None);
             }
         }
 
@@ -128,9 +126,12 @@ impl FrameAssembler {
             }
 
             self.stats.note_chunk(chunk, is_nack_recovery, false);
-            self.stats.maybe_log(receive_us, self.stats_every_us);
         }
-
+        let stats_packet = self.stats
+            .maybe_log(receive_us, self.stats_every_us)
+            .map(|bytes| ControlPacket::RecoveryStats { 
+                data: bytes::Bytes::copy_from_slice(bytes) 
+            });
         // ── Apply async FEC results ──────────────────────────────────────────
         // Non-blocking drain: take everything the pool has finished.
         // We pass the data through even on RS failure (None) so apply_decode_result
@@ -155,7 +156,7 @@ impl FrameAssembler {
         let mut output = Vec::new();
         self.flush_ordered(min_frame_id, receive_us, &mut output);
 
-        (output, nacks)
+        (output, nacks, stats_packet)
     }
 
     // ── HOL flush loop ───────────────────────────────────────────────────────

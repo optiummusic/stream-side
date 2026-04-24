@@ -1,6 +1,6 @@
 use std::{sync::Mutex, time::Instant};
 
-use common::clock::FrameStep;
+use common::{RecoveryReport, clock::FrameStep};
 
 use crate::network::congestion::CongestionController;
 
@@ -349,6 +349,27 @@ pub(crate) async fn handle_control(
                 let label = info.label().await;
                 log::info!("[QUIC] Client {label} requested KeyFrame!");
                 let _ = senders.idr_tx.send(true);
+            }
+            ControlPacket::RecoveryStats { data } => {
+                let label = info.label().await;
+                match postcard::from_bytes::<RecoveryReport>(&data) {
+                    Ok(r) => {
+                        log::info!(
+                            "[REMOTE STATS] for {label} \n\
+                            ├─ NET:  {:.2} Mbps | Loss: {:.2}% | NACK Recov: {} | NACK Sent: {}\n\
+                            ├─ PERF: {:.1} FPS  | Partial: {}\n\
+                            ├─ FEC:  Direct: {} | Recovered: {} | Failed: {}\n\
+                            └─ LOSS: Evicted: {} | Timeout: {} | OOW: {} | HOL: {}",
+                            r.mbps, r.loss_pct, r.nack_recovery, r.nack_sent,
+                            r.fps, r.partial_slices,
+                            r.direct, r.recovered, r.failed,
+                            r.evicted, r.timeout, r.oow, r.hol
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("Failed to decode RecoveryStats: {:?}", e);
+                    }
+                }
             }
             _ => ()
         }

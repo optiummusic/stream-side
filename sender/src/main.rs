@@ -73,10 +73,10 @@ async fn main() {
         capture_fps_tx: fps_tx,
         audio_bcast_tx,
     };
-
+    let max_bitrate = 20_000_000;
     let config = CongestionConfig {
-        min_bitrate: 2_000_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
-        max_bitrate: 10_000_000,       // 50 Мбит
+        min_bitrate: 10_000_000,          // 0.1 Мбит (минимум, чтобы не упал канал)
+        max_bitrate: max_bitrate,       // 50 Мбит
         rtt_threshold_ms: 60.0,        // Порог задержки
         step_up: 150_000,              // +0.5 Мбит при хорошей связи
         backoff_congested: 0.8,        // -20% битрейта при высоком RTT
@@ -84,13 +84,13 @@ async fn main() {
         update_interval: Duration::from_millis(500),    // Частота обычных проверок
         recovery_duration: Duration::from_millis(100), // Сколько игнорим RTT после потерь
         base_lock_duration: Duration::from_secs(4),     // Начальный блок повышения
-        min_fps: 20,
+        min_fps: 40,
         max_fps: 140,
         fps_step_down: 2,
         fps_step_up: 10,
     };
 
-    let shared_controller = Arc::new(Mutex::new(CongestionController::new(5_000_000, config)));
+    let shared_controller = Arc::new(Mutex::new(CongestionController::new(max_bitrate / 2, config)));
 
     let server = Arc::new(QuicServer::new(listen_addr,shared_controller, senders).await);
     let sink   = server.frame_sink();

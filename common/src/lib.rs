@@ -12,6 +12,130 @@ pub const TYPE_CONTROL: u8 = 2;
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types shared between sender and receiver
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct RecoveryReport {
+    pub mbps: f32,
+    pub fps: f32,
+    pub loss_pct: f32,
+    pub nack_sent: u64,
+    pub nack_recovery: u64,
+    pub partial_slices: u32,
+    pub direct: u64,
+    pub recovered: u64,
+    pub failed: u64,
+    pub evicted: u64,
+    pub timeout: u64,
+    pub oow: u64,
+    pub hol: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(default)]
+pub struct RecoveryStats {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub window_start_us: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rx_chunks: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rx_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rx_data_chunks: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rx_parity_chunks: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub zombie_chunks: u64,
+
+    // ── Метрики выдачи (Application TX) ──
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frames_emitted: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub video_packets_emitted: u64,
+
+    // ── Потери и задержки (Loss & Stalls) ──
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frames_lost_evicted: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frames_lost_timeout: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frames_lost_out_of_window: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hol_skips: u64,
+
+    // ── Обратная связь (Feedback) ──
+    #[serde(skip_serializing_if = "is_zero")]
+    pub nacks_sent: u64,
+
+    // ── Восстановление (FEC) ──
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fec_groups: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub direct_groups: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fec_missing_data_shards: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fec_failed_groups: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub wasted_payload_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub nack_recovered_chunks: u64, // Сколько чанков пришло после отправки NACK на их группу
+    #[serde(skip_serializing_if = "is_zero")]
+    pub total_lost_chunks: u64,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub partial: u32,     // Общее кол-во шардов, которые не дошли (включая восстановленные через FEC)
+    #[serde(skip)]
+    pub serialization_buffer: [u8; 512],
+}
+
+impl Default for RecoveryStats {
+    fn default() -> Self {
+        Self {
+            window_start_us: 0,
+            rx_chunks: 0,
+            rx_bytes: 0,
+            rx_data_chunks: 0,
+            rx_parity_chunks: 0,
+            zombie_chunks: 0,
+            frames_emitted: 0,
+            video_packets_emitted: 0,
+            frames_lost_evicted: 0,
+            frames_lost_timeout: 0,
+            frames_lost_out_of_window: 0,
+            hol_skips: 0,
+            nacks_sent: 0,
+            fec_groups: 0,
+            direct_groups: 0,
+            fec_missing_data_shards: 0,
+            fec_failed_groups: 0,
+            wasted_payload_bytes: 0,
+            nack_recovered_chunks: 0,
+            total_lost_chunks: 0,
+            partial: 0,
+            serialization_buffer: [0u8; 512],
+        }
+    }
+}
+
+impl RecoveryStats {
+    /// Сериализация в фиксированный буфер (на стеке) для отправки по UDP
+    pub fn to_bytes<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], postcard::Error> {
+        postcard::to_slice(self, buf)
+    }
+
+    /// Быстрая десериализация из полученной датаграммы
+    pub fn from_bytes(data: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(data)
+    }
+
+    /// Если не боитесь аллокаций (Vec), можно сделать проще:
+    pub fn serialize_vec(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+}
+
+fn is_zero(v: &u64) -> bool { *v == 0 }
+fn is_zero_u32(v: &u32) -> bool { *v == 0 }
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
 pub struct FrameTrace {
     pub capture_us:    u64,
@@ -224,6 +348,7 @@ pub enum ControlPacket {
     Ping { client_time_us: u64 },
     Pong { offset: i64 },
     FrameFeedback { frame_id: u64, trace: FrameTrace },
+    RecoveryStats {data: Bytes },
     Communication {message: String },
     Nack {
         frame_id:      u64,

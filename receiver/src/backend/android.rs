@@ -129,16 +129,16 @@ impl VideoBackend for AndroidMediaCodecBackend {
         };
         // Drop old chunks
         if let Some(t) = &trace {
-            let age_ms = FrameTrace::ms(t.receive_us, now);
+            // let age_ms = FrameTrace::ms(t.receive_us, now);
 
-            if age_ms > CRITICAL_AGE_FLUSH {
-                self.flush_decoder();
-                return Ok(PushStatus::Dropped { age: Some(age_ms as f32) });
-            }
+            // if age_ms > CRITICAL_AGE_FLUSH {
+            //     self.flush_decoder();
+            //     return Ok(PushStatus::Dropped { age: Some(age_ms as f32) });
+            // }
 
-            if age_ms > MAX_AGE_PUSH {
-                return Ok(PushStatus::Dropped{age: Some(age_ms as f32)});
-            }
+            // if age_ms > MAX_AGE_PUSH {
+            //     return Ok(PushStatus::Dropped{age: Some(age_ms as f32)});
+            // }
         }
 
         self.fps_counter += 1;
