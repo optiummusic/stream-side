@@ -56,7 +56,7 @@ impl SliceBuilder {
     pub(crate) fn insert(
         &mut self,
         chunk: &DatagramChunk,
-    ) -> (Option<GroupRecovery>, bool, Option<(u8, u8)>) {
+    ) -> (Option<GroupRecovery>, bool, Option<(u8, u8)>, Option<u64>) {
         // Accept updated total_groups from any chunk (all carry the same value).
         if chunk.total_groups > 0 {
             self.total_groups = chunk.total_groups;
@@ -87,6 +87,7 @@ impl SliceBuilder {
         };
 
         // ── Slice state transition: Assembling → Emitting* ───────────────────
+        let mut just_transitioned = false;
         if self.state == SliceState::Assembling && self.ready_groups == self.total_groups {
             let mut any_needs_fec = false;
 
@@ -102,6 +103,7 @@ impl SliceBuilder {
             } else {
                 SliceState::EmittingDirect
             };
+            just_transitioned = true;
         }
 
         let stalled_coords = if newly_stalled_flag {
@@ -109,8 +111,8 @@ impl SliceBuilder {
         } else {
             None
         };
-
-        (recovery, was_nack_recovery, stalled_coords)
+        let collecting_done = if just_transitioned { Some(FrameTrace::now_us()) } else { None };
+        (recovery, was_nack_recovery, stalled_coords, collecting_done)
     }
 
     pub(crate) fn is_ready(&self) -> bool {

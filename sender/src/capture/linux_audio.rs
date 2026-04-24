@@ -176,34 +176,31 @@ fn run_pipewire_audio(sink: mpsc::Sender<AudioFrame>) -> Result<(), SenderError>
                     }
 
                     // Кодируем полными Opus фреймами пока оба буфера достаточно заполнены.
-                    while sys_pending.len() >= frame_len || mic_pending.len() >= frame_len {
+                    while sys_pending.len() >= frame_len && mic_pending.len() >= frame_len {
                         let capture_us = FrameTrace::now_us();
 
-                        // Берем данные из системного буфера или забиваем нулями
-                        let sys_chunk = if sys_pending.len() >= frame_len {
-                            sys_pending.drain(..frame_len).collect::<Vec<f32>>()
-                        } else {
-                            vec![0.0; frame_len]
-                        };
+                        let sys_chunk: Vec<f32> = sys_pending.drain(..frame_len).collect();
+                        let mut mic_chunk: Vec<f32> = mic_pending.drain(..frame_len).collect();
 
-                        // Берем данные из микрофона или забиваем нулями
-                        let mut mic_chunk = if mic_pending.len() >= frame_len {
-                            mic_pending.drain(..frame_len).collect::<Vec<f32>>()
-                        } else {
-                            vec![0.0; frame_len]
-                        };
-
-                        // Теперь фильтр и VAD будут работать всегда
+                        // ── [mic] High-pass фильтр ────────────────────────────
+                        // Убираем DC offset, гул (<80 Hz) до оценки VAD,
+                        // чтобы низкочастотный фон не «включал» микрофон.
                         apply_highpass(&mut mic_chunk, &mut hpf_prev_in, &mut hpf_prev_out);
-                        
+
+                        // ── VAD: пропускаем фрейм если оба источника тихие ────
                         let sys_active = rms_squared(&sys_chunk) > VAD_ENERGY_THRESHOLD;
                         let mic_active = rms_squared(&mic_chunk) > VAD_ENERGY_THRESHOLD;
 
                         if !sys_active && !mic_active {
+                            log::trace!("[VAD] both silent — skipping frame");
                             continue;
                         }
 
-                        // Микшируем уже гарантированно полные чанки
+                        // ── Нормализованный микс (sys + mic) / 2 ─────────────
+                        // Делим на 2 вместо clamp: никогда не клипируем,
+                        // при этом если один источник молчит — он просто
+                        // добавляет нули и итоговая громкость не режется вдвое
+                        // (тихий источник после HPF+VAD ≈ 0).
                         let mixed: Vec<f32> = sys_chunk.iter()
                             .zip(mic_chunk.iter())
                             .map(|(s, m)| (s + m) * 0.5)

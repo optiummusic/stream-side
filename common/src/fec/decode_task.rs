@@ -1,5 +1,6 @@
 
 use crate::fec::decode::FecDecoder;
+use tokio::sync::mpsc;
 
 use super::*;
 
@@ -36,34 +37,34 @@ pub(crate) struct DecodeResult {
 // own `ReedSolomon` instance, so there is no lock contention on the hot path.
 
 pub struct ComputePool {
-    results: Arc<Mutex<Vec<DecodeResult>>>,
+    tx: mpsc::UnboundedSender<DecodeResult>,
+    pub(crate) rx: mpsc::UnboundedReceiver<DecodeResult>,
 }
 
 impl ComputePool {
     pub fn new() -> Self {
-        Self { results: Arc::new(Mutex::new(Vec::new())) }
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self { tx, rx }
     }
 
     pub(crate) fn submit(&self, task: DecodeTask) {
-        let sink = Arc::clone(&self.results);
+        let tx = self.tx.clone();
         rayon::spawn(move || {
             let data = FecDecoder::decode(task.k, task.m, &task.shards, &task.payload_lens);
-            let result = DecodeResult {
+            let _ = tx.send(DecodeResult {
                 frame_id:  task.frame_id,
                 slice_idx: task.slice_idx,
                 data,
-            };
-            if let Ok(mut guard) = sink.lock() {
-                guard.push(result);
-            }
+            });
         });
     }
 
-    /// Non-blocking drain — returns everything the pool has finished so far.
-    pub(crate) fn drain_results(&self) -> Vec<DecodeResult> {
-        self.results
-            .lock()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default()
+    /// Non-blocking drain — забирает всё что готово прямо сейчас.
+    pub(crate) fn drain_results(&mut self) -> Vec<DecodeResult> {
+        let mut out = Vec::new();
+        while let Ok(r) = self.rx.try_recv() {
+            out.push(r);
+        }
+        out
     }
 }

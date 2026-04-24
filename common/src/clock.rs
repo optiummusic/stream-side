@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 use lazy_static::lazy_static;
+use rayon::result;
 
 use crate::FrameTrace;
 
@@ -126,37 +127,46 @@ pub enum FrameStep {
     Encode = 1,
     Serialize = 2,
     Receive = 3,
-    Reassembled = 4,
-    JitterOut = 5,
-    DecoderSubmit = 6,
-    Decode = 7,
-    Present = 8,
+    CollectingShards = 4,
+    FecSubmitted = 5,
+    FecDone = 6,
+    NetworkReady = 7,
+    Reassembled = 8,
+    JitterOut = 9,
+    DecoderSubmit = 10,
+    Decode = 11,
+    Present = 12,
 }
 
 impl FrameTrace {
     pub fn get_local(&self, step: FrameStep, clock: &Clock) -> i64 {
         let step: usize = step as usize;
         let val = self.raw_by_idx(step);
-        
+        if val == 0 {
+            return 0;
+        }
+
+        let current_offset = clock.get_offset();
+        let mut result;
         // Разделяем логику внутри одного метода через cfg
         #[cfg(feature = "sender")]
         {
-            return match step as usize {
+            result = match step as usize {
                 0..=2 => val as i64,
-                3..=8 => clock.client_to_server(val),
+                3..=12 => val as i64 + current_offset,
                 _ => 0,
             }
         }
 
         #[cfg(feature = "receiver")]
-        #[allow(unreachable_code)]
         {
-            return match step as usize {
-                0..=2 => clock.server_to_client(val),
-                3..=8 => val as i64,
+            result = match step as usize {
+                0..=2 => val as i64 - current_offset,
+                3..=12 => val as i64,
                 _ => 0,
             }
         }
+        result
     }
 
     fn raw_by_idx(&self, idx: usize) -> u64 {
@@ -165,11 +175,15 @@ impl FrameTrace {
             1 => self.encode_us,
             2 => self.serialize_us,
             3 => self.receive_us,
-            4 => self.reassembled_us,
-            5 => self.jitter_out_us,
-            6 => self.decoder_submit_us,
-            7 => self.decode_us,
-            8 => self.present_us,
+            4 => self.collecting_done_us,
+            5 => self.fec_submitted_us,
+            6 => self.fec_done_us,
+            7 => self.network_ready_us,
+            8 => self.hol_released_us,
+            9 => self.jitter_out_us,
+            10 => self.decoder_submit_us,
+            11 => self.decode_us,
+            12 => self.present_us,
             _ => 0,
         }
     }

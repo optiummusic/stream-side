@@ -18,7 +18,11 @@ pub struct FrameTrace {
     pub encode_us:     u64,
     pub serialize_us:   u64,
     pub receive_us:    u64,
-    pub reassembled_us: u64,
+    pub collecting_done_us: u64,
+    pub fec_submitted_us: u64,
+    pub fec_done_us: u64,
+    pub network_ready_us: u64,
+    pub hol_released_us: u64,
     pub jitter_out_us:  u64,
     pub decoder_submit_us : u64,
     pub decode_us:      u64,
@@ -31,6 +35,14 @@ impl FrameTrace {
     }
 
     pub fn ms(from: u64, to: u64) -> f64 {
+        if from <= 0 || to <= 0 {
+            return 0.0;
+        }
+
+        if to < from {
+            return 0.0;
+        }
+
         (to.saturating_sub(from) as f64) / 1000.0
     }
 }

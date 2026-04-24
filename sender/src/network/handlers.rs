@@ -91,34 +91,52 @@ pub(crate) async fn handle_uni_stream(
 
                 // ANSI Colors
                 let cy = "\x1b[36m"; // Cyan (Server)
-                let yl = "\x1b[33m"; // Yellow (Network)
-                let gr = "\x1b[32m"; // Green (Client)
+                let yl = "\x1b[33m"; // Yellow (Network / Reassembly)
+                let mg = "\x1b[35m"; // Magenta (HOL / Queue)
+                let gr = "\x1b[32m"; // Green (Client / Hardware)
                 let rd = "\x1b[31m"; // Red (Critical)
                 let rs = "\x1b[0m";  // Reset
 
                 log::info!(
+                    "[TRACE raw] collecting={} fec_submitted={} fec_done={} net_ready={}",
+                    trace.collecting_done_us,
+                    trace.fec_submitted_us,
+                    trace.fec_done_us,
+                    trace.network_ready_us,
+                );
+
+                log::info!(
                     "[QUIC] {} frame feedback. #{}:
-                    {cy}Capture→Encode: {rs}{:>6.1}ms | {cy}Encode→Serial:  {rs}{:>6.1}ms
-                    {yl}Serial→Network: {rs}{:>6.1}ms | {yl}Net→Reassem:    {rs}{:>6.1}ms
-                    {gr}Reassem→Jitter: {rs}{:>6.1}ms | {gr}Jitter→Submit:  {rs}{:>6.1}ms
-                    {gr}Submit→Decode:  {rs}{:>6.1}ms | {gr}Decode→Present: {rs}{:>6.1}ms
-                    ---------------------------------------------------------
-                    TOTAL (G2G):    {rd}{:>6.1}ms{rs}",
+                                    {cy}Capture→Encode: {rs}{:>6.1}ms | {cy}Encode→Serial:  {rs}{:>6.1}ms
+                                    {yl}Serial→Network: {rs}{:>6.1}ms | {yl}Net→Ready:      {rs}{:>6.1}ms
+                                    {yl}  ├ →Collected: {rs}{:>6.1}ms | {yl}  ├ →FecSubmit: {rs}{:>6.1}ms
+                                    {yl}  ├ →FecDone:   {rs}{:>6.1}ms | {yl}  └ →NetReady:  {rs}{:>6.1}ms
+                                    {mg}Ready→Released: {rs}{:>6.1}ms | {mg}Released→Jitter:{rs}{:>6.1}ms
+                                    {gr}Jitter→Submit:  {rs}{:>6.1}ms | {gr}Submit→Decode:  {rs}{:>6.1}ms
+                                    {gr}Decode→Present: {rs}{:>6.1}ms
+                                    ---------------------------------------------------------
+                                    TOTAL (G2G):    \x1b[31m{:>6.1}ms{rs}",
                     label, frame_id,
-                    // Строка 1: Сервер
-                    FrameTrace::ms(get(FrameStep::Capture),      get(FrameStep::Encode)),
-                    FrameTrace::ms(get(FrameStep::Encode),       get(FrameStep::Serialize)),
-                    // Строка 2: Сеть
-                    FrameTrace::ms(get(FrameStep::Serialize),    get(FrameStep::Receive)),
-                    FrameTrace::ms(get(FrameStep::Receive),      get(FrameStep::Reassembled)),
-                    // Строка 3: Клиент (Джиттер и подготовка)
-                    FrameTrace::ms(get(FrameStep::Reassembled),  get(FrameStep::JitterOut)),
-                    FrameTrace::ms(get(FrameStep::JitterOut),    get(FrameStep::DecoderSubmit)),
-                    // Строка 4: Клиент (Железо)
-                    FrameTrace::ms(get(FrameStep::DecoderSubmit),get(FrameStep::Decode)),
-                    FrameTrace::ms(get(FrameStep::Decode),       get(FrameStep::Present)),
+                    // Сервер
+                    FrameTrace::ms(get(FrameStep::Capture),           get(FrameStep::Encode)),
+                    FrameTrace::ms(get(FrameStep::Encode),             get(FrameStep::Serialize)),
+                    // Сеть (суммарно)
+                    FrameTrace::ms(get(FrameStep::Serialize),          get(FrameStep::Receive)),
+                    FrameTrace::ms(get(FrameStep::Receive),            get(FrameStep::NetworkReady)),
+                    // Net→Ready подфазы
+                    FrameTrace::ms(get(FrameStep::Receive),          get(FrameStep::CollectingShards)),
+                    FrameTrace::ms(get(FrameStep::CollectingShards), get(FrameStep::FecSubmitted)),
+                    FrameTrace::ms(get(FrameStep::FecSubmitted),     get(FrameStep::FecDone)),
+                    FrameTrace::ms(get(FrameStep::FecDone),          get(FrameStep::NetworkReady)),
+                    // Очереди и джиттер
+                    FrameTrace::ms(get(FrameStep::NetworkReady),       get(FrameStep::Reassembled)),
+                    FrameTrace::ms(get(FrameStep::Reassembled),        get(FrameStep::JitterOut)),
+                    // Декодинг
+                    FrameTrace::ms(get(FrameStep::JitterOut),          get(FrameStep::DecoderSubmit)),
+                    FrameTrace::ms(get(FrameStep::DecoderSubmit),      get(FrameStep::Decode)),
+                    FrameTrace::ms(get(FrameStep::Decode),             get(FrameStep::Present)),
                     // Итог
-                    FrameTrace::ms(get(FrameStep::Capture),      get(FrameStep::Present)),
+                    FrameTrace::ms(get(FrameStep::Capture),            get(FrameStep::Present)),
                 );
             }
             ControlPacket::Communication { message } => {
@@ -279,36 +297,47 @@ pub(crate) async fn handle_control(
                 // Хелпер для локального времени
                 let get = |step: FrameStep| trace.get_local(step, clock) as u64;
 
+
                 // ANSI Colors
                 let cy = "\x1b[36m"; // Cyan (Server)
-                let yl = "\x1b[33m"; // Yellow (Network)
-                let gr = "\x1b[32m"; // Green (Client)
+                let yl = "\x1b[33m"; // Yellow (Network / Reassembly)
+                let mg = "\x1b[35m"; // Magenta (HOL / Queue)
+                let gr = "\x1b[32m"; // Green (Client / Hardware)
                 let rd = "\x1b[31m"; // Red (Critical)
                 let rs = "\x1b[0m";  // Reset
 
                 log::info!(
                     "[QUIC] {} frame feedback. #{}:
                     {cy}Capture→Encode: {rs}{:>6.1}ms | {cy}Encode→Serial:  {rs}{:>6.1}ms
-                    {yl}Serial→Network: {rs}{:>6.1}ms | {yl}Net→Reassem:    {rs}{:>6.1}ms
-                    {gr}Reassem→Jitter: {rs}{:>6.1}ms | {gr}Jitter→Submit:  {rs}{:>6.1}ms
-                    {gr}Submit→Decode:  {rs}{:>6.1}ms | {gr}Decode→Present: {rs}{:>6.1}ms
+                    {yl}Serial→Network: {rs}{:>6.1}ms | {yl}Net→Ready:      {rs}{:>6.1}ms
+                    {yl}  ├ →Collected: {rs}{:>6.1}ms | {yl}  ├ →FecSubmit: {rs}{:>6.1}ms
+                    {yl}  ├ →FecDone:   {rs}{:>6.1}ms | {yl}  └ →NetReady:  {rs}{:>6.1}ms
+                    {mg}Ready→Released: {rs}{:>6.1}ms | {mg}Released→Jitter:{rs}{:>6.1}ms
+                    {gr}Jitter→Submit:  {rs}{:>6.1}ms | {gr}Submit→Decode:  {rs}{:>6.1}ms
+                    {gr}Decode→Present: {rs}{:>6.1}ms
                     ---------------------------------------------------------
-                    TOTAL (G2G):    {rd}{:>6.1}ms{rs}",
+                    TOTAL (G2G):    \x1b[31m{:>6.1}ms{rs}",
                     label, frame_id,
-                    // Строка 1: Сервер
-                    FrameTrace::ms(get(FrameStep::Capture),      get(FrameStep::Encode)),
-                    FrameTrace::ms(get(FrameStep::Encode),       get(FrameStep::Serialize)),
-                    // Строка 2: Сеть
-                    FrameTrace::ms(get(FrameStep::Serialize),    get(FrameStep::Receive)),
-                    FrameTrace::ms(get(FrameStep::Receive),      get(FrameStep::Reassembled)),
-                    // Строка 3: Клиент (Джиттер и подготовка)
-                    FrameTrace::ms(get(FrameStep::Reassembled),  get(FrameStep::JitterOut)),
-                    FrameTrace::ms(get(FrameStep::JitterOut),    get(FrameStep::DecoderSubmit)),
-                    // Строка 4: Клиент (Железо)
-                    FrameTrace::ms(get(FrameStep::DecoderSubmit),get(FrameStep::Decode)),
-                    FrameTrace::ms(get(FrameStep::Decode),       get(FrameStep::Present)),
+                    // Сервер
+                    FrameTrace::ms(get(FrameStep::Capture),           get(FrameStep::Encode)),
+                    FrameTrace::ms(get(FrameStep::Encode),             get(FrameStep::Serialize)),
+                    // Сеть (суммарно)
+                    FrameTrace::ms(get(FrameStep::Serialize),          get(FrameStep::Receive)),
+                    FrameTrace::ms(get(FrameStep::Receive),            get(FrameStep::NetworkReady)),
+                    // Net→Ready подфазы
+                    FrameTrace::ms(get(FrameStep::Receive),          get(FrameStep::CollectingShards)),
+                    FrameTrace::ms(get(FrameStep::CollectingShards), get(FrameStep::FecSubmitted)),
+                    FrameTrace::ms(get(FrameStep::FecSubmitted),     get(FrameStep::FecDone)),
+                    FrameTrace::ms(get(FrameStep::FecDone),          get(FrameStep::NetworkReady)),
+                    // Очереди и джиттер
+                    FrameTrace::ms(get(FrameStep::NetworkReady),       get(FrameStep::Reassembled)),
+                    FrameTrace::ms(get(FrameStep::Reassembled),        get(FrameStep::JitterOut)),
+                    // Декодинг
+                    FrameTrace::ms(get(FrameStep::JitterOut),          get(FrameStep::DecoderSubmit)),
+                    FrameTrace::ms(get(FrameStep::DecoderSubmit),      get(FrameStep::Decode)),
+                    FrameTrace::ms(get(FrameStep::Decode),             get(FrameStep::Present)),
                     // Итог
-                    FrameTrace::ms(get(FrameStep::Capture),      get(FrameStep::Present)),
+                    FrameTrace::ms(get(FrameStep::Capture),            get(FrameStep::Present)),
                 );
             }
             ControlPacket::Communication { message } => {

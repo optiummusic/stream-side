@@ -683,6 +683,7 @@ dependencies = [
  "reed-solomon-erasure",
  "serde",
  "serde_bytes",
+ "tokio",
  "winreg",
 ]
 

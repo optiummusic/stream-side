@@ -254,6 +254,7 @@ pub(crate) async fn receive_datagrams(
             jitter.time_to_next_us().unwrap_or(now_us + 50_000)
         };
 
+        
         loop {
             let now_us = FrameTrace::now_us();
             let sleep_us = next_drain_us.saturating_sub(now_us);
@@ -305,53 +306,70 @@ pub(crate) async fn receive_datagrams(
 
     // 3. Основной сетевой цикл (Hot Path)
     // Теперь он занимается ТОЛЬКО приемом и сборкой, не отвлекаясь на таймеры
+    
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(1));
+    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        let raw = match conn.read_datagram().await {
-            Ok(b)  => b,
-            Err(e) => { log::error!("QUIC READ ERROR: {:?}", e); break; }
-        };
+        tokio::select! {
+            result = conn.read_datagram() => {
+                let raw = match result {
+                    Ok(b)  => b,
+                    Err(e) => { log::error!("QUIC READ ERROR: {:?}", e); break; }
+                };
 
-        let chunk = match DatagramChunk::decode(raw) {
-            Some(c) => c,
-            None    => { continue; }
-        };
+                let chunk = match DatagramChunk::decode(raw) {
+                    Some(c) => c,
+                    None    => { continue; }
+                };
 
-        match chunk.packet_type {
-            TYPE_VIDEO => {
-                let (assembled, nacks) = assembler.insert(&chunk);
-                
-                // Отправляем NACK немедленно
+                match chunk.packet_type {
+                    TYPE_VIDEO => {
+                        let receive_us = FrameTrace::now_us();
+
+                        let (assembled, nacks) = assembler.insert(&chunk, receive_us);
+                        for nack in nacks {
+                            let _ = control_tx.try_send(nack);
+                        }
+                        for packet in assembled {
+                            let _ = video_tx.try_send(packet);
+                        }
+                    }
+                    TYPE_CONTROL => {
+                        if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
+                            process_control(ctrl);
+                        }
+                    }
+                    TYPE_AUDIO => {
+                        if !chunk.data.is_empty() {
+                            log::trace!("[Audio] received chunk, {} bytes", chunk.data.len());
+                            match postcard::from_bytes::<AudioFrame>(&chunk.data) {
+                                Ok(frame) => {
+                                    log::trace!("[Audio] deserialized frame capture_us={}", frame.capture_us);
+                                    match audio_tx.try_send(frame) {
+                                        Ok(_) => log::debug!("[Audio] sent to jitter"),
+                                        Err(e) => log::warn!("[Audio] channel send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => log::warn!("[Audio] deserialize failed: {e}"),
+                            }
+                        } else {
+                            log::warn!("[Audio] empty chunk");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            _ = poll_interval.tick() => {
+                let (packets, nacks) = assembler.poll();
                 for nack in nacks {
                     let _ = control_tx.try_send(nack);
                 }
-
-                for packet in assembled {
+                for packet in packets {
                     let _ = video_tx.try_send(packet);
                 }
             }
-            TYPE_CONTROL => {
-                if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
-                    process_control(ctrl);
-                }
-            }
-            TYPE_AUDIO => {
-                if !chunk.data.is_empty() {
-                    log::trace!("[Audio] received chunk, {} bytes", chunk.data.len());
-                    match postcard::from_bytes::<AudioFrame>(&chunk.data) {
-                        Ok(frame) => {
-                            log::trace!("[Audio] deserialized frame capture_us={}", frame.capture_us);
-                            match audio_tx.try_send(frame) {
-                                Ok(_) => log::debug!("[Audio] sent to jitter"),
-                                Err(e) => log::warn!("[Audio] channel send failed: {e}"),
-                            }
-                        }
-                        Err(e) => log::warn!("[Audio] deserialize failed: {e}"),
-                    }
-                } else {
-                    log::warn!("[Audio] empty chunk");
-                }
-            }
-            _ => {}
         }
     }
 }

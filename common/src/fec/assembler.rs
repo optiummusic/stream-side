@@ -64,9 +64,8 @@ impl FrameAssembler {
     /// - `Option<ControlPacket>` — a NACK if any group is in a `Stalled` /
     ///   expired-`Requested` state (Lazy NACK: no heavy scan, each
     ///   `FrameBuilder` exposes candidates directly).
-    pub fn insert(&mut self, chunk: &DatagramChunk) -> (Vec<VideoPacket>, Vec<ControlPacket>) {
+    pub fn insert(&mut self, chunk: &DatagramChunk, receive_us: u64) -> (Vec<VideoPacket>, Vec<ControlPacket>) {
         let frame_id = chunk.frame_id;
-        let now_us   = FrameTrace::now_us();
 
         // ── Stats ────────────────────────────────────────────────────────────
 
@@ -90,7 +89,7 @@ impl FrameAssembler {
         let mut to_evict = Vec::new();
         for (&id, builder) in &self.frames {
             let keep = id >= min_frame_id
-                && now_us.saturating_sub(builder.first_us) < STALE_FRAME_US;
+                && receive_us.saturating_sub(builder.first_us) < STALE_FRAME_US;
             if !keep {
                 to_evict.push(id);
                 max_evicted = Some(max_evicted.map_or(id, |m| m.max(id)));
@@ -111,7 +110,7 @@ impl FrameAssembler {
             let builder = self
                 .frames
                 .entry(frame_id)
-                .or_insert_with(|| FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0));
+                .or_insert_with(|| FrameBuilder::new(chunk.total_slices, chunk.flags & 1 != 0, receive_us));
 
             let (recoveries, tasks, is_nack_recovery, newly_stalled) = builder.insert_chunk(chunk);
 
@@ -129,7 +128,7 @@ impl FrameAssembler {
             }
 
             self.stats.note_chunk(chunk, is_nack_recovery, false);
-            self.stats.maybe_log(now_us, self.stats_every_us);
+            self.stats.maybe_log(receive_us, self.stats_every_us);
         }
 
         // ── Apply async FEC results ──────────────────────────────────────────
@@ -150,11 +149,11 @@ impl FrameAssembler {
         // ── Lazy NACK ────────────────────────────────────────────────────────
         // Спрашиваем у каждого FrameBuilder: «есть кандидат на NACK?»
         // Это O(кол-во активных кадров), а не O(кол-во всех групп).
-        let nacks = self.drain_nacks(now_us);
+        let nacks = self.drain_nacks(receive_us);
 
         // ── HOL flush loop ───────────────────────────────────────────────────
         let mut output = Vec::new();
-        self.flush_ordered(min_frame_id, now_us, &mut output);
+        self.flush_ordered(min_frame_id, receive_us, &mut output);
 
         (output, nacks)
     }
@@ -176,7 +175,18 @@ impl FrameAssembler {
             if let Some(builder) = self.frames.get_mut(&next_id) {
                 if builder.is_complete() {
                     // ── Fast path: frame fully assembled ─────────────────────
-                    if let Some(packets) = builder.take_packets() {
+                    let released_us = FrameTrace::now_us();
+                    let ready_us = builder.network_ready_us.unwrap_or_default();
+                    if let Some(mut packets) = builder.take_packets() {
+                        for p in &mut packets {
+                            if let Some(ref mut t) = p.trace {
+                                t.network_ready_us = ready_us;
+                                t.hol_released_us = released_us;
+                                t.collecting_done_us = builder.collecting_done_us;
+                                t.fec_submitted_us   = builder.fec_submitted_us;
+                                t.fec_done_us        = builder.fec_done_us;
+                            }
+                        }
                         self.stats.note_frame_emitted(packets.len());
                         output.extend(packets);
                     }
@@ -198,8 +208,19 @@ impl FrameAssembler {
                         self.stats.note_frame_lost_timeout();
 
                         // ↓ NEW: выплёвываем то, что есть + concealment-пустышки
-                        let partial = builder.take_partial_packets(next_id);
+                        let mut partial = builder.take_partial_packets(next_id);
                         if !partial.is_empty() {
+                            let released_us = FrameTrace::now_us();
+                            let ready_us = builder.network_ready_us.unwrap_or_default();
+                            for p in &mut partial {
+                                if let Some(ref mut t) = p.trace {
+                                    t.network_ready_us = ready_us;
+                                    t.hol_released_us = released_us;
+                                    t.collecting_done_us = builder.collecting_done_us;
+                                    t.fec_submitted_us   = builder.fec_submitted_us;
+                                    t.fec_done_us        = builder.fec_done_us;
+                                }
+                            }
                             self.stats.note_frame_emitted(partial.len());
                             output.extend(partial);
                         }
@@ -313,5 +334,30 @@ impl FrameAssembler {
             }
         }
         result
+    }
+
+    pub fn poll(&mut self) -> (Vec<VideoPacket>, Vec<ControlPacket>) {
+        let now_us = FrameTrace::now_us();
+        let min_frame_id = self.next_to_push_id
+            .unwrap_or(0)
+            .saturating_sub(MAX_BUFFERED_FRAMES);
+
+        // Дренируем FEC результаты
+        for result in self.compute_pool.drain_results() {
+            if let Some(builder) = self.frames.get_mut(&result.frame_id) {
+                if builder.state == FrameState::Receiving {
+                    builder.apply_decode_result(result.slice_idx, result.data.unwrap_or_default());
+                }
+            }
+        }
+
+        // Выталкиваем готовые кадры
+        let mut output = Vec::new();
+        self.flush_ordered(min_frame_id, now_us, &mut output);
+
+        // NACK-и тоже проверяем — вдруг что-то протухло
+        let nacks = self.drain_nacks(now_us);
+
+        (output, nacks)
     }
 }

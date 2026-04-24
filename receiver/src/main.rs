@@ -1044,18 +1044,3 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
-fn log_trace(frame_id: u64, t: &FrameTrace) {
-    log::info!(
-        "\n#{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
-         serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
-         decode→present={:.1}ms  TOTAL={:.1}ms",
-        FrameTrace::ms(t.capture_us,    t.encode_us),
-        FrameTrace::ms(t.encode_us,     t.serialize_us),
-        FrameTrace::ms(t.serialize_us,  t.receive_us),
-        FrameTrace::ms(t.receive_us,    t.reassembled_us),
-        FrameTrace::ms(t.reassembled_us, t.decode_us),
-        FrameTrace::ms(t.decode_us,     t.present_us),
-        FrameTrace::ms(t.capture_us,    t.present_us),
-    );
-}

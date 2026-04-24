@@ -24,10 +24,14 @@ pub(crate) struct FrameBuilder {
     /// Decoded packets waiting for the HOL flush loop to release them.
     ready_packets:          Vec<VideoPacket>,
     pub(crate) state:       FrameState,
+    pub(crate) network_ready_us: Option<u64>,
+    pub(crate) collecting_done_us: u64,
+    pub(crate) fec_submitted_us: u64,
+    pub(crate) fec_done_us: u64,
 }
 
 impl FrameBuilder {
-    pub(crate) fn new(total_slices: u8, _is_key: bool) -> Self {
+    pub(crate) fn new(total_slices: u8, _is_key: bool, receive_us: u64) -> Self {
         let mut decoded_slices = Vec::with_capacity(total_slices as usize);
         decoded_slices.resize_with(total_slices as usize, || None);
 
@@ -35,10 +39,15 @@ impl FrameBuilder {
             slices: HashMap::new(),
             decoded_slices,
             total_slices,
-            first_us: FrameTrace::now_us(),
+            first_us: receive_us,
             next_emit_idx: 0,
             ready_packets: Vec::new(),
             state: FrameState::Receiving,
+            network_ready_us: None,
+            collecting_done_us: 0,
+            fec_submitted_us: 0,
+            fec_done_us: 0,
+
         }
     }
 
@@ -121,7 +130,7 @@ impl FrameBuilder {
         let mut recoveries = Vec::new();
         let mut tasks:  Vec<DecodeTask> = Vec::new();
 
-        let (slice_state_after, is_nack_recovery, newly_stalled) = {
+        let (slice_state_after, is_nack_recovery, newly_stalled, collecting_done) = {
             let sb = self.slices
                 .entry(chunk.slice_idx)
                 .or_insert_with(|| SliceBuilder::new(chunk.total_groups));
@@ -131,14 +140,14 @@ impl FrameBuilder {
                 return (Vec::new(), Vec::new(), false, None);
             }
 
-            let (maybe_recovery, is_nack_recovery, stalled_coords) = sb.insert(chunk);
+            let (maybe_recovery, is_nack_recovery, stalled_coords, collecting_done) = sb.insert(chunk);
 
             if let Some(recovery) = maybe_recovery {
                 recoveries.push(recovery);
             }
 
             let slice_state = sb.state.clone();
-            (slice_state, is_nack_recovery, stalled_coords)
+            (slice_state, is_nack_recovery, stalled_coords, collecting_done)
         };
 
         // ── Slice state transitions ──────────────────────────────────────────
@@ -163,6 +172,9 @@ impl FrameBuilder {
                         }
                     }
                 }
+                if !tasks.is_empty() && self.fec_submitted_us == 0 {
+                    self.fec_submitted_us = FrameTrace::now_us();
+                }
             }
 
             SliceState::EmittingDirect => {
@@ -179,6 +191,9 @@ impl FrameBuilder {
                     self.ready_packets.extend(new_packets);
 
                     self.try_advance_frame_state();
+                    if self.is_complete() {
+                        self.mark_ready();
+                    }
                 }
             }
 
@@ -187,6 +202,11 @@ impl FrameBuilder {
             SliceState::Emitted | SliceState::Abandoned => {}
         }
 
+        if let Some(done_us) = collecting_done {
+            if self.collecting_done_us == 0 {
+                self.collecting_done_us = done_us;
+            }
+        }
         (recoveries, tasks, is_nack_recovery, newly_stalled)
     }
 
@@ -224,6 +244,9 @@ impl FrameBuilder {
         // tasks are submitted, the first result to arrive triggers decode_slice_sync
         // and emits the slice.  Subsequent results hit the
         // `decoded_slices[idx].is_some()` guard above and short-circuit cleanly.
+        if self.fec_done_us == 0 {
+            self.fec_done_us = FrameTrace::now_us();
+        }
         if let Some(video_slice) = self.decode_slice_sync(slice_idx) {
             self.decoded_slices[idx] = Some(video_slice);
 
@@ -235,6 +258,10 @@ impl FrameBuilder {
             self.ready_packets.extend(new_packets);
 
             self.try_advance_frame_state();
+
+            if self.is_complete() {
+                self.mark_ready();
+            }
         }
 
         self.is_complete()
@@ -353,7 +380,6 @@ impl FrameBuilder {
         let mut trace = slice.trace;
         if let Some(ref mut t) = trace {
             t.receive_us    = first_us;
-            t.reassembled_us = FrameTrace::now_us();
         }
         VideoPacket {
             frame_id:  slice.frame_id,
@@ -363,6 +389,11 @@ impl FrameBuilder {
             is_last:   slice.is_last,
             is_concealed: false,
             trace,
+        }
+    }
+    pub fn mark_ready(&mut self) {
+        if self.network_ready_us.is_none() {
+            self.network_ready_us = Some(FrameTrace::now_us());
         }
     }
 }

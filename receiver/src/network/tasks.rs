@@ -60,7 +60,7 @@ pub(crate) fn spawn_trace_feedback_task(
             log::info!("Got some trace");
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        let mut interval = tokio::time::interval(Duration::from_millis(1000));
         let mut last_sent_id = 0u64;
         loop {
             interval.tick().await;
