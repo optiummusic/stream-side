@@ -10,7 +10,7 @@ use super::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const MAX_BUFFERED_FRAMES: u64 = 340;
+const MAX_BUFFERED_FRAMES: u64 = 60;
 const NACK_BATCH_SIZE: u32 = 64;
 /// Drop a FrameBuilder that has been sitting unfinished for this many µs.
 ///
@@ -24,7 +24,7 @@ const NACK_BATCH_SIZE: u32 = 64;
 ///    `retain` cannot evict what doesn't exist.  Instead, `hol_stall_since_us`
 ///    measures how long the HOL pointer has been blocked on the absent frame
 ///    and forces a skip after the same deadline.
-const STALE_FRAME_US: u64 = 200_000;
+const STALE_FRAME_US: u64 = 80_000;
 
 // ── FrameAssembler ───────────────────────────────────────────────────────────
 

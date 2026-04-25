@@ -152,6 +152,9 @@ pub(crate) async fn run_serialiser_task(
     let max_dgram = 1140;
     let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 64;
 
+    let mut fps_count = 0u32;
+    let mut last_fps_check = std::time::Instant::now();
+
     while let Some(mut slice) = slice_rx.recv().await {
         // 1. Управление ID кадра: инкрементим, только когда пришел первый слайс нового кадра
         if is_new_frame {
@@ -251,6 +254,17 @@ pub(crate) async fn run_serialiser_task(
 
         if slice.is_last {
             is_new_frame = true;
+            fps_count += 1;
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_fps_check);
+            
+            if elapsed.as_secs() >= 1 {
+                let actual_fps = fps_count as f64 / elapsed.as_secs_f64();
+                log::debug!("\x1b[32m[SERIALIZER]\x1b[0m Input FPS: {:.1}", actual_fps);
+                
+                fps_count = 0;
+                last_fps_check = now;
+            }
         }
     }
 }

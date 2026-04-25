@@ -558,7 +558,7 @@ impl WgpuState {
             present_mode:                  wgpu::PresentMode::Immediate,
             alpha_mode:                    wgpu::CompositeAlphaMode::Opaque,
             view_formats:                  vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 

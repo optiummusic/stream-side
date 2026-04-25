@@ -164,8 +164,21 @@ impl VaapiEncoder {
 // Вспомогательная обёртка для передачи *mut AVBufferRef через канал
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct SendPtr(*mut AVBufferRef);
-unsafe impl Send for SendPtr {}
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn get(self) -> *mut T { self.0 }
+}
+
+struct SendScaler(scaling::Context);
+unsafe impl Send for SendScaler {}
+
+struct SendFrame(*mut AVFrame);
+unsafe impl Send for SendFrame {}
 
 struct VaapiConvertGraph {
     graph: *mut AVFilterGraph,
@@ -252,302 +265,322 @@ fn create_vaapi_encoder(
     enc_ctx.encoder().video()?.open_with(opts)
 }
 
-fn run_encoder_loop(
+pub fn run_encoder_loop(
     width:    u32,
     height:   u32,
     rx:       mpsc::Receiver<(FrameData, u64)>,
     free_tx:  mpsc::Sender<Vec<u8>>,
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
-    mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    mut idr_rx:     tokio::sync::watch::Receiver<bool>,
     mut bitrate_rx: tokio::sync::watch::Receiver<u64>,
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
-
     let codec = codec::encoder::find_by_name("hevc_vaapi")
-        .expect("hevc_vaapi encoder not found; ensure VA-API is available");
+        .expect("hevc_vaapi encoder not found");
 
     let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) = unsafe {
-        // dummy ctx для получения референсов
         let mut tmp_ctx = codec::context::Context::new_with_codec(codec.clone());
-        (*tmp_ctx.as_mut_ptr()).width = width as i32;
+        (*tmp_ctx.as_mut_ptr()).width  = width  as i32;
         (*tmp_ctx.as_mut_ptr()).height = height as i32;
         init_hw_contexts(tmp_ctx.as_mut_ptr(), width, height)
     };
 
-    let mut current_bitrate = *bitrate_rx.borrow();
-    let mut encoder: codec::encoder::Video = create_vaapi_encoder(&codec, width, height, current_bitrate, hw_enc_ref)
+    let hw_enc_ref    = SendPtr(hw_enc_ref);
+    let hw_import_ref = SendPtr(hw_import_ref);
+    let drm_frames_ref = SendPtr(drm_frames_ref);
+
+    let current_bitrate = *bitrate_rx.borrow();
+    let mut encoder = create_vaapi_encoder(&codec, width, height, current_bitrate, hw_enc_ref.get(),)
         .expect("Initial encoder open failed");
+    let (bitrate_notify_tx, mut bitrate_notify_rx) = tokio::sync::watch::channel(current_bitrate);
 
-    let mut scaler = scaling::Context::get(
-        Pixel::BGRA, width, height,
-        Pixel::NV12, width, height,
-        scaling::Flags::BILINEAR,
-    )
-    .expect("SwsContext init failed");
-
-    // Сигнал о готовности.
     ready_tx.send(()).unwrap();
 
-    unsafe {
-        let mut current_rc_mode: i64 = 0;
-        let rc_mode_str = std::ffi::CString::new("rc_mode").unwrap();
-        
-        // Пытаемся достать текущий режим из приватных данных
-        ffmpeg::ffi::av_opt_get_int((*encoder.as_mut_ptr()).priv_data, rc_mode_str.as_ptr(), 0, &mut current_rc_mode);
-        
-        log::info!("[VAAPI-Check] Current RC Mode: {}", match current_rc_mode {
-            0 => "DEFAULT (Auto)",
-            1 => "CQP (Constant QP)",
-            2 => "CBR (Constant Bit Rate)",
-            3 => "VBR (Variable Bit Rate)",
-            4 => "ICQ (Intelligent Constant Quality)",
-            _ => "OTHER",
-        });
-    }
+    // ── Канал между feeder и drainer ─────────────────────────────────────────
+    // Размер 1: feeder блокируется пока drainer не забрал предыдущий пакет.
+    // Увеличьте до 2 если кодек иногда выдаёт burst из двух пакетов подряд.
+    let (hw_tx, hw_rx) = std::sync::mpsc::sync_channel::<(SendFrame, bool)>(1);
+    let hw_enc_ref_drainer = hw_enc_ref;
 
-    // ── Цикл кадров ──────────────────────────────────────────────────────────
+    // ── ПОТОК 1: FEEDER — захват → hw_frame → кодек ──────────────────────────
+    let feeder = std::thread::Builder::new()
+        .name("enc-feeder".into())
+        .spawn({
+            let free_tx = free_tx.clone();
+            move || {
+                let mut scaler = scaling::Context::get(
+                    Pixel::BGRA, width, height,
+                    Pixel::NV12, width, height,
+                    scaling::Flags::BILINEAR,
+                ).expect("SwsContext init failed (feeder thread)");
+                let mut src_frame  = Video::new(Pixel::BGRA, width, height);
+                let mut nv12_frame = Video::new(Pixel::NV12, width, height);
+                let mut force_idr  = false;
+                let mut last_hw_frame: *mut AVFrame = std::ptr::null_mut();
 
-    let mut started    = false;
-    let mut src_frame  = Video::new(Pixel::BGRA, width, height);
-    let mut nv12_frame = Video::new(Pixel::NV12, width, height);
-    let mut force_idr = false;
+                let mut capture_fps_count = 0u32;
+                let mut capture_last_fps  = std::time::Instant::now();
 
-    // We add this for P-Skip frames
-    let mut last_hw_frame: *mut AVFrame = std::ptr::null_mut();
-    loop {
-        // Получаем VAAPI hw_frame в зависимости от типа входа.
-        let hw_frame_opt: Option<*mut AVFrame> = match rx.recv_timeout(std::time::Duration::from_millis(100)) { // Starvation = give frames at 10 FPS pace
-            Ok((mut frame_data, mut capture_us)) => {
-                // Дренируем канал: берём самый свежий кадр
-                while let Ok(newer) = rx.try_recv() {
-                    match frame_data {
-                        FrameData::Bgra{data: buf, ..} => { let _ = free_tx.send(buf); }
-                        FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
-                    }
-                    frame_data  = newer.0;
-                    capture_us  = newer.1;
-                }
+                loop {
+                    let (frame_data, capture_us) =
+                        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(v)  => v,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                // Watchdog: статичный экран — дублируем последний кадр
+                                if last_hw_frame.is_null() { continue; }
 
-                if bitrate_rx.has_changed().unwrap_or(false) {
-                    let new_bitrate = *bitrate_rx.borrow_and_update();
-                    if new_bitrate != current_bitrate {
-                        match create_vaapi_encoder(&codec, width, height, new_bitrate, hw_enc_ref) {
-                            Ok(new_enc) => {
-                                encoder = new_enc;
-                                current_bitrate = new_bitrate;
+                                if idr_rx.has_changed().unwrap_or(false)
+                                    && *idr_rx.borrow_and_update()
+                                {
+                                    force_idr = true;
+                                }
+
+                                let dup = unsafe { av_frame_clone(last_hw_frame) };
+                                if dup.is_null() { continue; }
+                                unsafe {
+                                    (*dup).pts = FrameTrace::now_us() as i64;
+                                    if !force_idr {
+                                        (*dup).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
+                                        (*dup).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                                    }
+                                }
+                                // Тайм-аут 200 мс: если drainer завис — не копим клоны
+                                let send_result = hw_tx.try_send((SendFrame(dup), force_idr));
+                                match send_result {
+                                    Ok(_) => { force_idr = false; }
+                                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                        // Drainer занят — просто дропаем дубликат, не блокируемся
+                                        unsafe { av_frame_free(&mut { dup }); }
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        unsafe { av_frame_free(&mut { dup }); }
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
-                            Err(e) => log::error!("Failed to switch bitrate: {:?}", e),
-                        }
-                    }
-                }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
 
-                if idr_rx.has_changed().unwrap_or(false) {
-                    if *idr_rx.borrow_and_update() == true {
+                    // Bitrate hot-swap (здесь только флаг; реальная замена энкодера
+                    // происходит в drainer, который владеет `encoder`)
+                    // — сигнал передаём через force_idr=true чтобы не городить ещё
+                    //   один канал; либо используйте Arc<Mutex<Option<u64>>>.
+                    // Ниже — минимальный вариант: feeder просто читает watch.
+                    if bitrate_rx.has_changed().unwrap_or(false) {
+                        let new_bitrate = *bitrate_rx.borrow_and_update();
+                        let _ = bitrate_notify_tx.send(new_bitrate);
+                    }
+
+                    if idr_rx.has_changed().unwrap_or(false)
+                        && *idr_rx.borrow_and_update()
+                    {
                         force_idr = true;
                     }
-                }
 
-                // Получаем VAAPI hw_frame
-                let frame = unsafe {
-                    match frame_data {
-                        FrameData::Bgra{ data: ref bgra, stride} => {
-                            encode_bgra_to_vaapi(
-                                bgra, capture_us,
-                                width, height,
-                                &mut src_frame, &mut nv12_frame,
-                                &mut scaler,
-                                hw_enc_ref,
-                            )
-                        }
-                        FrameData::DmaBuf { fd, stride, offset, modifier } => {
-                            let imported = encode_dmabuf_to_vaapi(
-                                fd, stride, offset, modifier, capture_us,
-                                width, height,
-                                hw_import_ref, // ПЕРЕДАЕМ СЮДА BGRA КОНТЕКСТ
-                                drm_frames_ref,
-                            );
-                            if let Some(mut imported) = imported {
-                                if let Some(ref mut graph) = vaapi_convert_graph {
-                                    vaapi_convert_frame_to_nv12(graph, imported, capture_us)
+                    // Строим hw_frame
+                    let hw_frame_opt = unsafe {
+                        match frame_data {
+                            FrameData::Bgra { data: ref bgra, stride } =>
+                                encode_bgra_to_vaapi(
+                                    bgra, capture_us, width, height,
+                                    &mut src_frame, &mut nv12_frame,
+                                    &mut scaler, hw_enc_ref.get(),
+                                ),
+                            FrameData::DmaBuf { fd, stride, offset, modifier } => {
+                                let imported = encode_dmabuf_to_vaapi(
+                                    fd, stride, offset, modifier, capture_us,
+                                    width, height, hw_import_ref.get(), drm_frames_ref.get(),
+                                );
+                                if let Some(mut imported) = imported {
+                                    if let Some(ref mut graph) = vaapi_convert_graph {
+                                        vaapi_convert_frame_to_nv12(graph, imported, capture_us)
+                                    } else {
+                                        log::warn!("[Feeder] vaapi_convert_graph unavailable; drop");
+                                        av_frame_free(&mut imported);
+                                        None
+                                    }
                                 } else {
-                                    log::warn!("[Encoder] VAAPI conversion graph unavailable; DMA-BUF frame dropped");
-                                    av_frame_free(&mut imported);
                                     None
                                 }
-                            } else {
-                                None
                             }
                         }
+                    };
+
+                    // Возвращаем CPU-буфер в пул
+                    if let FrameData::Bgra { data: buf, .. } = frame_data {
+                        let _ = free_tx.send(buf);
                     }
 
-                };
-
-                // Возвращаем CPU-буфер в пул
-                if let FrameData::Bgra {data: buf, stride: _} = frame_data {
-                    let _ = free_tx.send(buf);
-                }
-
-                // ДОБАВЛЕНО: Сохраняем ссылку на кадр для генерации дубликатов
-                if let Some(f) = frame {
-                    unsafe {
-                        if !last_hw_frame.is_null() {
-                            av_frame_free(&mut last_hw_frame);
+                    if let Some(f) = hw_frame_opt {
+                        unsafe {
+                            if !last_hw_frame.is_null() {
+                                av_frame_free(&mut last_hw_frame);
+                            }
+                            last_hw_frame = av_frame_clone(f);
                         }
-                        // Делаем zero-copy клон (просто инкремент refcount для AVBufferRef)
-                        last_hw_frame = av_frame_clone(f);
-                    }
-                }
 
-                frame
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // ДОБАВЛЕНО: WATCHDOG. Прошло 100мс без кадров (статичный экран Wayland)
-                if last_hw_frame.is_null() {
-                    continue; // Ещё не было ни одного успешного кадра
-                }
-                // Проверяем запрос IDR даже во время простоя!
-                if idr_rx.has_changed().unwrap_or(false) {
-                    if *idr_rx.borrow_and_update() == true {
-                        force_idr = true;
+                        capture_fps_count += 1;
+                        let now = std::time::Instant::now();
+                        if now.duration_since(capture_last_fps).as_secs() >= 1 {
+                            log::debug!("[FFMPEG-capture] FPS: {}", capture_fps_count);
+                            capture_fps_count = 0;
+                            capture_last_fps  = now;
+                        }
+
+                        // Блокируемся пока drainer не освободит слот (back-pressure)
+                        if hw_tx.send((SendFrame(f), force_idr)).is_err() { break; }
+                        force_idr = false;
                     }
                 }
 
                 unsafe {
-                    let dup = av_frame_clone(last_hw_frame);
-                    if dup.is_null() { continue; }
-                    
-                    // Обновляем таймстемп
-                    (*dup).pts = FrameTrace::now_us() as i64;
-                    
-                    // Если нет запроса на IDR, гарантируем, что это будет обычный P-Skip
-                    if !force_idr {
-                        (*dup).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
-                        (*dup).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                    if !last_hw_frame.is_null() {
+                        av_frame_free(&mut last_hw_frame);
                     }
-                    
-                    Some(dup)
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+        })
+        .expect("feeder thread spawn failed");
 
-        // Отправляем hw_frame в кодек.
-        if let Some(mut hw_frame) = hw_frame_opt {
-            unsafe {
-                if force_idr {
-                    log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current hardware frame.");
-                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
-                    (*hw_frame).flags |= AV_FRAME_FLAG_KEY as i32;
-                    force_idr = false;
-                } else {
-                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
-                    (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
-                }
-                if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame) >= 0 {
+    // ── ПОТОК 2: DRAINER — hw_frame → avcodec_send → receive_packet → sink ──
+    let drainer = std::thread::Builder::new()
+        .name("enc-drainer".into())
+        .spawn(move || {
+            let mut started = false;
+            let mut enc_fps_count = 0u32;
+            let mut enc_last_fps  = std::time::Instant::now();
+            let mut current_bitrate = current_bitrate;
 
-                    let mut pkt = ffmpeg::Packet::empty();
-                    while encoder.receive_packet(&mut pkt).is_ok() {
-                        let original_capture_us = pkt.pts().unwrap_or(0) as u64;
-                        let is_key = pkt.is_key();
-
-                        if !started {
-                            if !is_key { 
-                                continue; 
+            while let Ok((SendFrame(mut hw_frame), is_idr)) = hw_rx.recv() {
+                if bitrate_notify_rx.has_changed().unwrap_or(false) {
+                    let new_bitrate = *bitrate_notify_rx.borrow_and_update();
+                    if new_bitrate != current_bitrate {
+                        match create_vaapi_encoder(&codec, width, height, new_bitrate, hw_enc_ref_drainer.get()) {
+                            Ok(new_enc) => {
+                                encoder = new_enc;
+                                current_bitrate = new_bitrate;
+                                log::debug!("[Drainer] Bitrate switched to {}", new_bitrate);
                             }
-                            started = true;
-                            log::info!("[Encoder] First IDR frame produced");
+                            Err(e) => log::error!("[Drainer] Failed to switch bitrate: {:?}", e),
                         }
+                    }
+                }
+                unsafe {
+                    if is_idr {
+                        log::warn!("[Drainer] Forcing IDR frame.");
+                        (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
+                        (*hw_frame).flags    |= AV_FRAME_FLAG_KEY as i32;
+                    } else {
+                        (*hw_frame).pict_type  = AVPictureType::AV_PICTURE_TYPE_NONE;
+                        (*hw_frame).flags     &= !(AV_FRAME_FLAG_KEY as i32);
+                    }
 
-                        if let Some(data) = pkt.data() {
-                            // ── NALU slicing ────────────────────────────────────
-                            let full_data = Bytes::copy_from_slice(data);
-                            
-                            // Поиск границ NALU
-                            let mut boundaries = Vec::new();
-                            let mut pos = 0;
-                            while pos + 3 <= data.len() {
-                                if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 1 {
-                                    boundaries.push(pos);
-                                    pos += 3;
-                                } else if pos + 3 < data.len() && data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 0 && data[pos+3] == 1 {
-                                    boundaries.push(pos);
-                                    pos += 4;
-                                } else {
-                                    pos += 1;
-                                }
+                    if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame) >= 0 {
+                        let mut pkt = ffmpeg::Packet::empty();
+                        while encoder.receive_packet(&mut pkt).is_ok() {
+                            enc_fps_count += 1;
+                            let now = std::time::Instant::now();
+                            if now.duration_since(enc_last_fps).as_secs() >= 1 {
+                                log::debug!("\x1b[33m[FFMPEG-encode]\x1b[0m Output FPS: {}",
+                                    enc_fps_count);
+                                enc_fps_count = 0;
+                                enc_last_fps  = now;
                             }
 
-                            if boundaries.is_empty() && !data.is_empty() {
-                                boundaries.push(0);
+                            let original_capture_us = pkt.pts().unwrap_or(0) as u64;
+                            let is_key = pkt.is_key();
+
+                            if !started {
+                                if !is_key { continue; }
+                                started = true;
+                                log::info!("[Drainer] First IDR produced");
                             }
 
-                            let num_nalus = boundaries.len();
-                            let ends = boundaries.iter().skip(1).copied().chain(std::iter::once(data.len()));
-                            for (idx, (&start, end)) in boundaries.iter().zip(ends).enumerate() {
-                                let slice_data = full_data.slice(start..end);
-                                
-                                // Определяем тип NALU
-                                let sc_len = if slice_data.len() > 2 && slice_data[2] == 1 { 3 } else { 4 };
-                                let nalu_type = if slice_data.len() > sc_len {
-                                    let nal_header = slice_data[sc_len];
-                                    let raw_type = (nal_header >> 1) & 0x3F;
-                                    match raw_type {
-                                        32 => NaluType::VideoParamSet,
-                                        33 => NaluType::SeqParamSet,
-                                        34 => NaluType::PicParamSet,
-                                        38 | 39 => NaluType::Sei,
-                                        19 | 20 => NaluType::SliceIdr,
-                                        1 => NaluType::SliceTrailing,
-                                        other => NaluType::Other(other),
+                            if let Some(data) = pkt.data() {
+                                let full_data = Bytes::copy_from_slice(data);
+
+                                // NALU slicing (без изменений)
+                                let mut boundaries = Vec::new();
+                                let mut pos = 0;
+                                while pos + 3 <= data.len() {
+                                    if data[pos]==0 && data[pos+1]==0 && data[pos+2]==1 {
+                                        boundaries.push(pos); pos += 3;
+                                    } else if pos+3 < data.len()
+                                        && data[pos]==0 && data[pos+1]==0
+                                        && data[pos+2]==0 && data[pos+3]==1
+                                    {
+                                        boundaries.push(pos); pos += 4;
+                                    } else {
+                                        pos += 1;
                                     }
-                                } else {
-                                    NaluType::Other(0)
-                                };
+                                }
+                                if boundaries.is_empty() && !data.is_empty() {
+                                    boundaries.push(0);
+                                }
 
-                                // Трейс цепляем только к ПЕРВОМУ NALU кадра
-                                let trace = if idx == 0 {
-                                    let mut t = FrameTrace::default();
-                                    t.capture_us = original_capture_us;
-                                    t.encode_us = FrameTrace::now_us();
-                                    Some(t)
-                                } else {
-                                    None
-                                };
+                                let num_nalus = boundaries.len();
+                                let ends = boundaries.iter().skip(1).copied()
+                                    .chain(std::iter::once(data.len()));
 
-                                let encoded = EncodedFrame {
-                                    frame_id: 0, // Назначит сериализатор
-                                    data: slice_data,
-                                    nalu_type,
-                                    is_last: idx == num_nalus - 1,
-                                    slice_idx: idx as u8,          // Вот они
-                                    total_slices: num_nalus as u8,
-                                    is_key,
-                                    trace,
-                                };
-
-                                // Отправляем немедленно
-                                if let Err(e) = sink.try_send(encoded) {
-                                    match e {
-                                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                                            log::debug!("[Encoder] sink full, dropping NALU");
+                                for (idx, (&start, end)) in
+                                    boundaries.iter().zip(ends).enumerate()
+                                {
+                                    let slice_data = full_data.slice(start..end);
+                                    let sc_len = if slice_data.len() > 2
+                                        && slice_data[2] == 1 { 3 } else { 4 };
+                                    let nalu_type = if slice_data.len() > sc_len {
+                                        let raw = (slice_data[sc_len] >> 1) & 0x3F;
+                                        match raw {
+                                            32 => NaluType::VideoParamSet,
+                                            33 => NaluType::SeqParamSet,
+                                            34 => NaluType::PicParamSet,
+                                            38|39 => NaluType::Sei,
+                                            19|20 => NaluType::SliceIdr,
+                                            1     => NaluType::SliceTrailing,
+                                            other => NaluType::Other(other),
                                         }
-                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => return,
+                                    } else { NaluType::Other(0) };
+
+                                    let trace = if idx == 0 {
+                                        let mut t = FrameTrace::default();
+                                        t.capture_us = original_capture_us;
+                                        t.encode_us  = FrameTrace::now_us();
+                                        Some(t)
+                                    } else { None };
+
+                                    let encoded = EncodedFrame {
+                                        frame_id:     0,
+                                        data:         slice_data,
+                                        nalu_type,
+                                        is_last:      idx == num_nalus - 1,
+                                        slice_idx:    idx as u8,
+                                        total_slices: num_nalus as u8,
+                                        is_key,
+                                        trace,
+                                    };
+
+                                    if let Err(e) = sink.try_send(encoded) {
+                                        match e {
+                                            tokio::sync::mpsc::error::TrySendError::Full(_) =>
+                                                log::debug!("[Drainer] sink full, drop NALU"),
+                                            tokio::sync::mpsc::error::TrySendError::Closed(_) =>
+                                                return,
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    av_frame_free(&mut hw_frame);
                 }
-                av_frame_free(&mut hw_frame);
             }
-        }
-    }
-    unsafe {
-        if !last_hw_frame.is_null() {
-            av_frame_free(&mut last_hw_frame);
-        }
-    }
+        })
+        .expect("drainer thread spawn failed");
+
+    feeder.join().ok();
+    drainer.join().ok();
 }
 
 
