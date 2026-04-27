@@ -143,56 +143,57 @@ impl FecEncoder {
         // Отключаем интерливинг, если сеть идеальная. 
         // В локальной сети пакеты редко теряются "пачками", а интерливинг 
         // нарушает последовательность декодирования на ресивере.
-        let final_meta = if link_quality == LinkQuality::Excellent {
-            chunks_meta // Возвращаем плоский массив как есть
-        } else {
-            let mut meta_index: HashMap<(u8, u8), usize> = HashMap::with_capacity(chunks_meta.len());
-            for (pos, m) in chunks_meta.iter().enumerate() {
-                meta_index.insert((m.group_idx, m.shard_idx), pos);
-            }
+        // let final_meta = if link_quality == LinkQuality::Excellent {
+        //     chunks_meta // Возвращаем плоский массив как есть
+        // } else {
+        //     let mut meta_index: HashMap<(u8, u8), usize> = HashMap::with_capacity(chunks_meta.len());
+        //     for (pos, m) in chunks_meta.iter().enumerate() {
+        //         meta_index.insert((m.group_idx, m.shard_idx), pos);
+        //     }
 
-            let group_km: Vec<(u8, u8)> = (0..total_groups as usize)
-                .map(|g| {
-                    chunks_meta.iter().find(|m| m.group_idx == g as u8)
-                        .map(|m| (m.k, m.m)).unwrap_or((0, 0))
-                }).collect();
+        //     let group_km: Vec<(u8, u8)> = (0..total_groups as usize)
+        //         .map(|g| {
+        //             chunks_meta.iter().find(|m| m.group_idx == g as u8)
+        //                 .map(|m| (m.k, m.m)).unwrap_or((0, 0))
+        //         }).collect();
 
-            let max_k = group_km.iter().map(|(k, _)| *k as usize).max().unwrap_or(0);
-            let max_m = group_km.iter().map(|(_, m)| *m as usize).max().unwrap_or(0);
+        //     let max_k = group_km.iter().map(|(k, _)| *k as usize).max().unwrap_or(0);
+        //     let max_m = group_km.iter().map(|(_, m)| *m as usize).max().unwrap_or(0);
 
-            let mut interleaved_meta = Vec::with_capacity(chunks_meta.len());
+        //     let mut interleaved_meta = Vec::with_capacity(chunks_meta.len());
 
-            for round in 0..max_k.max(max_m) {
-                for g in 0..total_groups as usize {
-                    let (k, _) = group_km[g];
-                    if round < k as usize {
-                        if let Some(&pos) = meta_index.get(&(g as u8, round as u8)) {
-                            interleaved_meta.push(chunks_meta[pos].clone());
-                        }
-                    }
-                }
-                for g in 0..total_groups as usize {
-                    let (k, m) = group_km[g];
-                    if round < m as usize {
-                        let parity_shard_idx = k + round as u8;
-                        if let Some(&pos) = meta_index.get(&(g as u8, parity_shard_idx)) {
-                            interleaved_meta.push(chunks_meta[pos].clone());
-                        }
-                    }
-                }
-            }
-            interleaved_meta
-        };
-
+        //     for round in 0..max_k.max(max_m) {
+        //         for g in 0..total_groups as usize {
+        //             let (k, _) = group_km[g];
+        //             if round < k as usize {
+        //                 if let Some(&pos) = meta_index.get(&(g as u8, round as u8)) {
+        //                     interleaved_meta.push(chunks_meta[pos].clone());
+        //                 }
+        //             }
+        //         }
+        //         for g in 0..total_groups as usize {
+        //             let (k, m) = group_km[g];
+        //             if round < m as usize {
+        //                 let parity_shard_idx = k + round as u8;
+        //                 if let Some(&pos) = meta_index.get(&(g as u8, parity_shard_idx)) {
+        //                     interleaved_meta.push(chunks_meta[pos].clone());
+        //                 }
+        //             }
+        //         }
+        //     }
+        //     interleaved_meta
+        // };
+        
         (EncodedSlice {
             frame_id,
             all_shards_data: all_shards_data.freeze(),
-            chunks_meta: final_meta,
+            chunks_meta: chunks_meta,
         }, total_groups)
     }
 
     /// Вычисляет M (количество паритета) с учетом состояния сети.
     fn calculate_m(k: usize, is_critical: bool, is_first: bool, link_quality: LinkQuality) -> usize {
+        return 0;
         let base_pct = if is_critical {
             FEC_M_CRITICAL_PCT
         } else if is_first {
