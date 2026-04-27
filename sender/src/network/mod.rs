@@ -45,7 +45,9 @@ impl QuicServer {
         // 1. Задача сериализатора
         let sc_serialiser = shard_cache.clone();
         let bcast_serialiser = bcast_tx.clone();
-        tokio::spawn(run_serialiser_task(frame_rx, bcast_serialiser, sc_serialiser));
+        let (info_tx, info_rx) = tokio::sync::watch::channel::<Option<Arc<ConnectionInfo>>>(None);
+
+        tokio::spawn(run_serialiser_task(frame_rx, bcast_serialiser, sc_serialiser, info_rx));
 
         // 2. Задача приема соединений
         let endpoint = build_server_endpoint(listen_addr);
@@ -53,7 +55,7 @@ impl QuicServer {
         let senders_clone = senders.clone();
         let sc_accept = shard_cache.clone();
         
-        tokio::spawn(run_accept_loop(endpoint, bcast_accept, sc_accept, congestion_ctl, senders_clone, ));
+        tokio::spawn(run_accept_loop(endpoint, bcast_accept, sc_accept, congestion_ctl, senders_clone, info_tx));
 
         Self { frame_tx, senders }
     }

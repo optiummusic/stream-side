@@ -731,6 +731,7 @@ pub fn group_state_label(state: &crate::fec::group_builder::GroupState) -> &'sta
         GroupState::Decoding            => "Decoding",
         GroupState::Ready               => "Ready",
         GroupState::Abandoned           => "Abandoned",
+        GroupState::DecodingInProgress => "Decoding is in process"
     }
 }
 

@@ -50,7 +50,7 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
-
+use std::str::FromStr;
 use stream_receiver::backend::YuvFrame;
 use stream_receiver::network::run_quic_receiver;
 
@@ -976,23 +976,38 @@ impl ApplicationHandler<UserEvent> for App {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let warn = log::LevelFilter::Warn;
-    env_logger::Builder::from_default_env()
-        .filter_module("quinn", log::LevelFilter::Warn) // Quinn в мусор (только ошибки)
-        .filter_module("winit", log::LevelFilter::Warn) // Winit в мусор
-        .filter_module("tracing", log::LevelFilter::Warn) // И сам трейсинг туда же
-        .filter_module("wgpu_core", warn)
-        .filter_module("calloop", warn)
-        .write_style(env_logger::WriteStyle::Always)
-        .init();
-
     let args: Vec<String> = std::env::args().collect();
+
 
     if args.len() < 2 {
         eprintln!("Usage: {} <ip:port>", args[0]);
         eprintln!("Example: {} 192.168.1.5:5000", args[0]);
         std::process::exit(1);
     }
+
+    let fec_level_str = args.iter()
+    .find(|s| s.starts_with("--fec_log="))
+    .and_then(|s| s.split('=').nth(1)) // Берем то, что после знака "="
+    .unwrap_or("info"); // Если не нашли, ставим "info" по умолчанию
+
+    // Превращаем строку в LevelFilter
+    let fec_filter = log::LevelFilter::from_str(fec_level_str).unwrap_or(log::LevelFilter::Info);
+
+
+    let info = log::LevelFilter::Info;
+    let dbg = log::LevelFilter::Debug;
+    let trace = log::LevelFilter::Trace;
+    let warn = log::LevelFilter::Warn;
+    let err = log::LevelFilter::Error;
+    env_logger::Builder::from_default_env()
+        .filter_module("quinn", log::LevelFilter::Warn) // Quinn в мусор (только ошибки)
+        .filter_module("winit", log::LevelFilter::Warn) // Winit в мусор
+        .filter_module("tracing", log::LevelFilter::Warn) // И сам трейсинг туда же
+        .filter_module("wgpu_core", warn)
+        .filter_module("calloop", warn)
+        .filter_module("common::fec", fec_filter)
+        .write_style(env_logger::WriteStyle::Always)
+        .init();
 
     let addr: SocketAddr = args[1]
         .to_socket_addrs()?

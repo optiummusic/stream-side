@@ -8,10 +8,10 @@ pub mod encode;
 
 
 pub mod network;
-use std::{collections::{HashMap, VecDeque}, sync::{Arc, atomic::AtomicBool}, time::Duration};
+use std::{collections::{HashMap, VecDeque}, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, time::Duration};
 
 use bytes::Bytes;
-use common::{AudioFrame, ChunkMeta, DatagramChunk, NackEntry, clock::Clock};
+use common::{AudioFrame, ChunkMeta, DatagramChunk, FrameTrace, NackEntry, clock::Clock};
 use tokio::sync::{RwLock};
 
 #[derive(Debug, Clone, Default)]
@@ -37,11 +37,85 @@ pub struct Senders {
 }
 
 #[derive(Default)]
+pub struct NetworkStats {
+    pub loss_x1000: AtomicU32,
+    last_loss_us: AtomicU64,
+    pub burst_acc: AtomicU32,
+    pub rtt: AtomicU64,
+}
+
+impl NetworkStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Вызывай на каждом событии потери.
+    /// Это даёт и burst, и "pressure" по loss.
+    pub fn report_loss_event(&self, now_us: u64) {
+        // 1. Обработка Burst (всплеска)
+        let last = self.last_loss_us.swap(now_us, Ordering::Relaxed);
+        
+        // Если потери идут кучно (интервал < 5мс), наращиваем burst
+        if now_us.saturating_sub(last) < 5_000 {
+            self.burst_acc.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.burst_acc.store(1, Ordering::Relaxed);
+        }
+
+        // 2. Обновление сглаженного Loss (EWMA)
+        // Формула: Next = Prev * 0.75 + New * 0.25
+        // Используем fetch_update, чтобы избежать Race Condition между load и store
+        self.loss_x1000.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            let next = if prev == 0 {
+                1000 // Первая потеря сразу дает сильный сигнал
+            } else {
+                (prev * 3 + 1000) / 4
+            };
+            Some(next.min(1000))
+        }).ok();
+    }
+
+    /// Плавно снижает показатель потерь. 
+    /// Вызывай, когда пакеты доходят успешно (например, при получении Pong).
+    pub fn decay_loss(&self) {
+        self.loss_x1000.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            if prev == 0 { return None; }
+            // Медленное затухание: убираем только 5% за раз
+            // Это создает эффект "быстрый испуг, медленное успокоение"
+            Some((prev * 19) / 20)
+        }).ok();
+    }
+
+    /// Регистрирует новое значение RTT.
+    /// Использует классический фильтр (alpha = 0.125) для стабильности.
+    pub fn report_rtt(&self, rtt_ms: u64) {
+        self.rtt.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            if prev == 0 {
+                Some(rtt_ms)
+            } else {
+                // SRTT = (SRTT * 7 + RTT) / 8
+                Some((prev * 7 + rtt_ms) / 8)
+            }
+        }).ok();
+    }
+
+    /// Забирает накопленное значение всплеска, обнуляя его.
+    pub fn take_burst(&self) -> u32 {
+        self.burst_acc.swap(0, Ordering::Relaxed)
+    }
+    
+    pub fn get_loss_pct(&self) -> f32 {
+        self.loss_x1000.load(Ordering::Relaxed) as f32 / 10.0
+    }
+}
+
+#[derive(Default)]
 pub struct ConnectionInfo {
     remote: String,
     label: RwLock<String>,
     ready: AtomicBool,
-    pub clock: Clock
+    pub clock: Clock,
+    pub stats: NetworkStats,
 }
 
 impl ConnectionInfo {
@@ -134,7 +208,7 @@ pub const HEADER_LEN:       usize = 19;
 // ── Cache parameters ──────────────────────────────────────────────────────────
  
 /// How many distinct frame IDs to keep in the retransmit cache.
-const SHARD_CACHE_FRAMES: usize = 256;
+const SHARD_CACHE_FRAMES: usize = 512;
  
 // ── ShardCache ────────────────────────────────────────────────────────────────
 //

@@ -1,6 +1,8 @@
 
 use common::clock::Clock;
 
+use crate::NetworkStats;
+
 use super::*;
 
 pub(crate) async fn handle_connection(
@@ -9,6 +11,7 @@ pub(crate) async fn handle_connection(
     shard_cache: Arc<ShardCache>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
     senders: Senders,
+    info_tx: tokio::sync::watch::Sender<Option<Arc<ConnectionInfo>>>,
 ) {
     let remote_addr = conn.remote_address();
     log::info!("[QUIC] Client connected: {}", remote_addr);
@@ -21,9 +24,11 @@ pub(crate) async fn handle_connection(
         remote: remote_addr.to_string(),
         label: RwLock::new(remote_addr.to_string()),
         ready: AtomicBool::new(false),
-        clock: Clock::new()
+        clock: Clock::new(),
+        stats: NetworkStats::new(),
     });
     
+    let _ = info_tx.send(Some(info.clone()));
     // Клоны для разных задач внутри одного соединения
     let info_bi = info.clone();
     let info_uni = info.clone();
@@ -63,16 +68,19 @@ pub(crate) async fn run_accept_loop(
     shard_cache: Arc<ShardCache>,
     congestion_ctl: Arc<Mutex<CongestionController>>,
     senders: Senders,
+    info_tx: tokio::sync::watch::Sender<Option<Arc<ConnectionInfo>>>,
 ) {
     while let Some(connecting) = endpoint.accept().await {
         let bcast_tx = bcast_tx.clone();
         let shard_cache = shard_cache.clone();
         let cong_clone = congestion_ctl.clone();
         let senders_clone = senders.clone();
+        let watcher = info_tx.clone();
+
         tokio::spawn(async move {
             match connecting.await {
                 Ok(conn) => {
-                    handle_connection(conn, bcast_tx, shard_cache, cong_clone, senders_clone).await;
+                    handle_connection(conn, bcast_tx, shard_cache, cong_clone, senders_clone, watcher).await;
                 }
                 Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
             }

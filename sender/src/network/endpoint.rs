@@ -3,6 +3,52 @@
 // ─────────────────────────────────────────────────────────────────────────────
 use super::*;
 
+use quinn::congestion::{Controller, ControllerFactory};
+use std::sync::Arc;
+use std::time::Instant;
+
+/// No-op congestion controller — окно всегда максимальное, pacing отключён.
+/// Подходит для LAN где у нас свой CC на уровне битрейта энкодера.
+#[derive(Debug)]
+struct NoopController {
+    window: u64,
+}
+
+impl Controller for NoopController {
+    fn on_congestion_event(
+        &mut self, _now: Instant, _sent: Instant, _is_persistent_congestion: bool, _lost_bytes: u64,
+    ) {}
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(NoopController { window: self.window })
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct NoopControllerFactory;
+
+impl ControllerFactory for NoopControllerFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(NoopController {
+            window: 32 * 1024 * 1024, // 32MB — фиксированное окно
+        })
+    }
+}
+
 pub(crate) fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
     // ── TLS — self-signed certificate (LAN / development) ────────────────────
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
@@ -25,20 +71,23 @@ pub(crate) fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
 
     // ── Transport tuning ─────────────────────────────────────────────────────
     let mut t = quinn::TransportConfig::default();
+        // Для LAN стриминга — большое фиксированное окно, без агрессивного CC
+    let mut cfg = quinn::congestion::CubicConfig::default();
+    cfg.initial_window(1 * 1024 * 1024);      // 10MB начальное окно
+    t.congestion_controller_factory(Arc::new(NoopControllerFactory));
 
-    t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+
     // Datagram buffers — 16 MB handles burst of ~80 uncompressed HEVC frames
     // before the kernel starts dropping.
     t.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    t.datagram_send_buffer_size(8 * 1024 * 1024);
-    t.send_fairness(true);
+    t.datagram_send_buffer_size(16 * 1024 * 1024);
+    t.send_fairness(false);
     // Initial MTU probe value for Ethernet LAN.
     //
     // Path MTU = 1500 (Ethernet) - 20 (IP) - 8 (UDP) - ~20 (QUIC) = ~1452.
     // We probe at 1400 to stay safe across VPN tunnels and 802.11 frames.
     // Quinn will discover the actual maximum via PMTUD automatically.
-    t.initial_mtu(9000);
-
+    t.initial_mtu(1200);
     // Keep-alive: prevents NAT table expiry and detects dead connections within
     // ~1.5 × keep_alive_interval, long before `max_idle_timeout` fires.
     t.keep_alive_interval(Some(Duration::from_millis(500)));

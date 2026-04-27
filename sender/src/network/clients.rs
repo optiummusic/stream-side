@@ -1,6 +1,6 @@
 
 use bytes::BytesMut;
-use common::{NaluType, TYPE_AUDIO, TYPE_VIDEO};
+use common::{NaluType, TYPE_AUDIO, TYPE_VIDEO, fec::encode::LinkQuality};
 
 use crate::network::congestion::CongestionController;
 
@@ -19,38 +19,25 @@ pub(crate) async fn send_loop_to_client(
     
     // Очередь для плавного выталкивания
     let mut pending_dgrams: std::collections::VecDeque<Bytes> = std::collections::VecDeque::with_capacity(4096);
-    let mut pacer = FramePacer::new(1000.0, 4.0); // 100 Mbps baseline
+    let mut pacer = FramePacer::new(1000.0, 10.0);
     let mut audio_receive = senders.audio_bcast_tx.subscribe();
 
     loop {
         tokio::select! {
             // 1. ПЕЙСЕР: Отправка следующей датаграммы из очереди
-            _ = async {
-                if pending_dgrams.is_empty() {
-                    std::future::pending::<()>().await; // Бесконечно ждем, если очередь пуста
-                }
-                
-                let next_len = pending_dgrams.front().unwrap().len();
-                let wait = pacer.consume(DatagramChunk::HEADER_LEN + next_len);
-                
-                if wait.is_zero() {
-                    return; // Можно слать немедленно
-                } else if wait < std::time::Duration::from_millis(1) {
-                    tokio::task::yield_now().await; // Микро-пауза
-                } else {
-                    tokio::time::sleep(wait).await; // Честный сон
-                }
-            }, if !pending_dgrams.is_empty() => {
-                // Отправляем не 1 пакет, а небольшую пачку (например, 4 пакета), 
-                // чтобы компенсировать задержки планировщика.
-                for _ in 0..4 {
-                    if let Some(dgram) = pending_dgrams.pop_front() {
-                        if let Err(e) = conn.send_datagram(dgram.clone()) {
-                            handle_send_error(e, &conn, &remote);
-                        }
-                    } else { break; }
-                }
-            }
+            // _ = async {
+            // if pending_dgrams.is_empty() {
+            //     std::future::pending::<()>().await;
+            // }
+            // }, if !pending_dgrams.is_empty() => {
+            //     // Дренируем всё что есть — без ограничений
+            //     while let Some(dgram) = pending_dgrams.pop_front() {
+            //         if let Err(e) = conn.send_datagram(dgram) {
+            //             handle_send_error(e, &conn, &remote);
+            //             break;
+            //         }
+            //     }
+            // }
 
             // 2. ПРИЕМ НОВЫХ КАДРОВ: Просто складываем их в очередь
             video_result = video_rx.recv() => {
@@ -73,15 +60,17 @@ pub(crate) async fn send_loop_to_client(
                         // Вместо немедленной отправки — пушим в очередь.
                         // Это и есть "разблокировка" — мы мгновенно освобождаем video_rx.
                         for dgram in &serialized_frame.datagrams {
-                            pending_dgrams.push_back(dgram.clone());
+                            if let Err(e) = conn.send_datagram(dgram.clone()) {
+                                handle_send_error(e, &conn, &remote);
+                            }
                         }
                         
                         // Если очередь стала слишком большой (> 500 пакетов), 
                         // значит мы катастрофически не успеваем. Можно дропнуть старое.
-                        if pending_dgrams.len() > 2048 {
-                            log::warn!("[QUIC] Pacer overflow, current size: {}", pending_dgrams.len());
-                            pending_dgrams.drain(..1024);
-                        }
+                        // if pending_dgrams.len() > 2048 {
+                        //     log::warn!("[QUIC] Pacer overflow, current size: {}", pending_dgrams.len());
+                        //     pending_dgrams.drain(..1024);
+                        // }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("[QUIC] Client {remote} lagged {n} frames");
@@ -143,26 +132,49 @@ pub(crate) async fn run_serialiser_task(
     mut slice_rx: mpsc::Receiver<EncodedFrame>,
     broadcast_tx: broadcast::Sender<Arc<SerializedFrame>>,
     shard_cache: Arc<ShardCache>,
+    info_rx: tokio::sync::watch::Receiver<Option<Arc<ConnectionInfo>>>,
 ) {
     let mut current_frame_id = 0u64;
     let mut is_new_frame = true;
-    
+    let mut current_info: Option<Arc<ConnectionInfo>> = None;
     // Calculate a safe max chunk size for the broadcast.
     // Quinn's initial_mtu is 1200, so we use that as our baseline constraint.
     let max_dgram = 1140;
     let max_chunk_data = max_dgram - DatagramChunk::HEADER_LEN - 64;
 
     let mut fps_count = 0u32;
+    let mut pps_count = 0u64;
+    let mut bytes_count = 0u64;
     let mut last_fps_check = std::time::Instant::now();
 
     while let Some(mut slice) = slice_rx.recv().await {
-        // 1. Управление ID кадра: инкрементим, только когда пришел первый слайс нового кадра
+        if info_rx.has_changed().unwrap_or(false) {
+            if let Some(new_info) = info_rx.borrow().clone() {
+                current_info = Some(new_info);
+            }
+        }
+
+        let info = match &current_info {
+            Some(i) => {
+                i
+            }
+            None => {
+                continue;
+            }
+        };
+        
         if is_new_frame {
             current_frame_id += 1;
             is_new_frame = false;
         }
         slice.frame_id = current_frame_id;
 
+        let rtt_ms = info.stats.rtt.load(std::sync::atomic::Ordering::Relaxed);
+        let loss_pct = info.stats.get_loss_pct(); // Метод, который мы добавили ранее (f32)
+        let burst = info.stats.burst_acc.load(std::sync::atomic::Ordering::Relaxed);
+        
+        let link_quality = LinkQuality::evaluate(rtt_ms, loss_pct, burst);
+        
         if let Some(t) = slice.trace.as_mut() {
             t.serialize_us = FrameTrace::now_us(); 
         }
@@ -198,7 +210,8 @@ pub(crate) async fn run_serialiser_task(
             slice.total_slices,
             &serialized,
             max_chunk_data,
-            flags
+            flags,
+            link_quality
         );
 
         let mut datagrams = Vec::with_capacity(encoded_slice.chunks_meta.len());
@@ -236,6 +249,8 @@ pub(crate) async fn run_serialiser_task(
                 total_groups,
                 &shard_data // Передаем ссылку на срез
             );
+            pps_count += 1;
+            bytes_count += dgram.len() as u64;
             datagrams.push(dgram);
         }
         
@@ -259,10 +274,21 @@ pub(crate) async fn run_serialiser_task(
             let elapsed = now.duration_since(last_fps_check);
             
             if elapsed.as_secs() >= 1 {
-                let actual_fps = fps_count as f64 / elapsed.as_secs_f64();
-                log::debug!("\x1b[32m[SERIALIZER]\x1b[0m Input FPS: {:.1}", actual_fps);
+                let elapsed_f64 = elapsed.as_secs_f64();
+                let actual_fps = fps_count as f64 / elapsed_f64;
+                let actual_pps = pps_count as f64 / elapsed_f64;
+                let mbps = (bytes_count as f64 * 8.0 / 1_000_000.0) / elapsed_f64;
+
+                log::info!(
+                    "\x1b[32m[SERIALIZER]\x1b[0m FPS: {:.1} | PPS: {:.0} | Out: {:.2} Mbps | Quality: {:?} | RTT: {:?}
+                    | Burst: {:?} | Loss: {:?}%", 
+                    actual_fps, actual_pps, mbps, link_quality, rtt_ms, burst, loss_pct
+                );
                 
+                // Сброс всех счетчиков
                 fps_count = 0;
+                pps_count = 0;
+                bytes_count = 0;
                 last_fps_check = now;
             }
         }

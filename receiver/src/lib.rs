@@ -47,7 +47,7 @@ pub extern "C" fn JNI_OnLoad(
     jni::sys::JNI_VERSION_1_6
 }
 
-pub const JITTER_TARGET_MS: u64 = 0;
+pub const JITTER_TARGET_MS: u64 = 40;
  
 /// Maximum number of frames held simultaneously.  When exceeded the oldest
 /// frame is evicted (dropped) to bound memory use.
@@ -325,7 +325,6 @@ impl JitterBuffer {
         let slice_idx = packet.slice_idx;
 
         let release_us = release_us.max(self.last_scheduled_us + self.inter_packet_gap_us);
-        let release_us = 0;
         self.last_scheduled_us = release_us;
 
         self.packets.insert((frame_id, slice_idx), packet);

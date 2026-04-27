@@ -238,58 +238,73 @@ pub(crate) async fn handle_control(
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
             ControlPacket::Ping { client_time_us } => {
-                let rtt = conn.stats().path.rtt.as_micros() as u64;
+                let stats = &info.stats;
+
+                let rtt_us = conn.stats().path.rtt.as_micros() as u64;
+                let rtt_ms = rtt_us / 1000;
+
+                stats.report_rtt(rtt_ms);
+                stats.decay_loss();
+
                 let server_now = FrameTrace::now_us();
-                // Сервер считает оффсет для этого конкретного клиента
-                info.clock.sync(server_now, client_time_us, rtt);
-                
-                // Достаем уже отфильтрованный оффсет
+                info.clock.sync(server_now, client_time_us, rtt_us);
+
                 let current_offset = info.clock.get_offset();
 
                 let pong = ControlPacket::Pong {
-                    // Мы можем даже не слать client_time назад, 
-                    // а сразу слать актуальный оффсет
                     offset: current_offset,
                 };
+
                 if let Ok(bin) = postcard::to_stdvec(&pong) {
-                    // Отправляем ответ как TYPE_CONTROL
-                    let dgram = DatagramChunk{                  
+                    let dgram = DatagramChunk {
                         payload_len: bin.len() as u16,
                         packet_type: TYPE_CONTROL,
                         data: bin.into(),
                         ..Default::default()
-                    }.to_bytes();
+                    }
+                    .to_bytes();
+
                     let _ = conn.send_datagram(dgram);
                 }
 
                 let mut cc = congestion_ctl.lock().unwrap();
-                let rtt = rtt / 1000;
-                // 2. Скармливаем метрики и получаем действие
+
+                let loss_x1000 = stats.loss_x1000.load(Ordering::Relaxed);
+                let burst = stats.take_burst();
+                let rtt = stats.rtt.load(Ordering::Relaxed);
+
+                // пока оставляю старый API, но метрики уже есть
                 let action = cc.on_metrics(rtt);
 
-                // 3. Если контроллер решил сменить битрейт
                 if let Some(new_bitrate) = action.new_bitrate {
                     log::debug!(
-                        "[Congestion] RTT: {:.1}ms. New bitrate: {:.2} Mbps", 
-                        rtt, 
+                        "[Congestion] RTT: {:.1}ms. New bitrate: {:.2} Mbps",
+                        rtt,
                         new_bitrate as f64 / 1e6
                     );
                     let _ = senders.bitrate_tx.send(new_bitrate);
                 }
 
                 if let Some(fps) = action.target_fps {
-                    log::debug!(
-                        "[Congestion] FPS: {}.", 
-                        fps
-                    );
+                    log::debug!("[Congestion] FPS: {}.", fps);
                     let _ = senders.capture_fps_tx.send(Some(fps));
                 }
-            },
+
+                log::trace!(
+                    "[NET-STATS] rtt={}ms loss={}‰ burst={}",
+                    rtt,
+                    loss_x1000,
+                    burst
+                );
+            }
             ControlPacket::Pong{..} => (),
-            ControlPacket::LostFrame {..} => {
+            ControlPacket::LostFrame { .. } => {
+                let stats = &info.stats;
+                stats.report_loss_event(FrameTrace::now_us());
+
                 let mut cc = congestion_ctl.lock().unwrap();
                 cc.report_lost_frame();
-            },
+            }
             ControlPacket::FrameFeedback { frame_id, trace } => {
                 let label = info.label().await;
                 let clock = &info.clock; 

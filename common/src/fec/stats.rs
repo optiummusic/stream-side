@@ -10,7 +10,6 @@ impl RecoveryStats {
         // либо пакеты для уже закрытых (удаленных) кадров.
         if zombie {
             self.zombie_chunks += 1;
-            return; 
         }
 
         // 3. Основная статистика для "живых" кадров
